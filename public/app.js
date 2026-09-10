@@ -89,7 +89,7 @@ async function loadMeta() {
   state.colors = res?.colors || {};
 }
 const stageColor = (s) =>
-  state.colors[s] || { prospecting: "#579bfc", qualification: "#a9bee8", proposal: "#784bd1", negotiation: "#ffcb00", closed_won: "#00ca72", closed_lost: "#d974b9" }[s] || "#999";
+  state.colors[s] || { prospecting: "#4c8dff", qualification: "#8b9cf0", proposal: "#8b7cf6", negotiation: "#f5b83d", closed_won: "#22c07a", closed_lost: "#f06a7a" }[s] || "#999";
 
 async function vDashboard() {
   const k = await GET("/api/kpis");
@@ -102,16 +102,16 @@ async function vDashboard() {
     .slice(0, 6);
   view.innerHTML = `
     <div class="kpis">
-      <div class="kpi" style="border-color:#579bfc"><div class="label">Open pipeline</div>
+      <div class="kpi"><div class="kpi-top"><span class="kpi-dot" style="background:#4c8dff"></span><div class="label">Open pipeline</div></div>
         <div class="value">${money(k.pipeline_value)}</div>
         <div class="sub">${k.open_deals} active deals</div></div>
-      <div class="kpi" style="border-color:#784bd1"><div class="label">Weighted pipeline</div>
+      <div class="kpi"><div class="kpi-top"><span class="kpi-dot" style="background:#8b7cf6"></span><div class="label">Weighted pipeline</div></div>
         <div class="value">${money(k.weighted_value)}</div>
         <div class="sub">probability-adjusted</div></div>
-      <div class="kpi" style="border-color:#00ca72"><div class="label">Won this quarter</div>
+      <div class="kpi"><div class="kpi-top"><span class="kpi-dot" style="background:#22c07a"></span><div class="label">Won this quarter</div></div>
         <div class="value">${money(k.won_this_quarter)}</div>
         <div class="sub">closed won since Jul 1</div></div>
-      <div class="kpi" style="border-color:#ffcb00"><div class="label">Open tasks</div>
+      <div class="kpi"><div class="kpi-top"><span class="kpi-dot" style="background:#f5b83d"></span><div class="label">Open tasks</div></div>
         <div class="value">${k.tasks_open}</div>
         <div class="sub">need attention</div></div>
     </div>
@@ -130,14 +130,14 @@ async function vDashboard() {
           ${closing.length ? closing.map((d) => `
             <div class="activity"><div class="dot" style="background:${stageColor(d.stage)}"></div>
               <div class="text"><b>${esc(d.title)}</b> · ${esc(d.company_name || "")}<br>
-              <span style="color:var(--ink-faint);font-size:12.5px">${money(d.value)} · ${d.probability}% · closes ${esc(d.expected_close)}</span></div>
+              <span style="color:var(--text-3);font-size:12.5px">${money(d.value)} · ${d.probability}% · closes ${esc(d.expected_close)}</span></div>
             </div>`).join("") : `<div class="empty">Nothing on the near horizon.</div>`}
         </div>
       </div>
       <div class="panel"><h2>Recent activity</h2>
         ${acts.map((a) => `
           <div class="activity">
-            <div class="dot" style="background:${a.kind === "deal" ? "#00ca72" : a.kind === "task" ? "#ffcb00" : "#579bfc"}"></div>
+            <div class="dot" style="background:${a.kind === "deal" ? "#22c07a" : a.kind === "task" ? "#f5b83d" : "#4c8dff"}"></div>
             <div class="text">${esc(a.text)}<div class="time">${esc(a.created_at.slice(0, 16).replace("T", " "))}</div></div>
           </div>`).join("")}
       </div>
@@ -152,7 +152,7 @@ async function vPipeline() {
     <div class="toolbar">
       <button class="btn" id="new-deal">+ New deal</button>
       <div class="spacer"></div>
-      <span style="color:var(--ink-soft)">${open.length} open deals · ${money(open.reduce((a, d) => a + d.value, 0))} pipeline</span>
+      <span style="color:var(--text-2)">${open.length} open deals · ${money(open.reduce((a, d) => a + d.value, 0))} pipeline</span>
     </div>
     <div class="board" id="board">
       ${[...state.stages.filter((s) => !closedStages.includes(s)), ...closedStages].map((s) => {
@@ -163,8 +163,8 @@ async function vPipeline() {
             <div class="cname">${esc(state.labels[s])}</div>
             <div class="ctotal">${ds.length} · ${moneyShort(tot)}</div></div>
           ${ds.map((d) => `
-            <div class="deal-card" draggable="true" data-id="${d.id}" style="border-color:${stageColor(s)}">
-              <div class="t">${esc(d.title)}</div>
+            <div class="deal-card" draggable="true" data-id="${d.id}">
+              <div class="trow"><span class="sdot" style="background:${stageColor(s)}"></span><div class="t">${esc(d.title)}</div></div>
               <div class="co">${esc(d.company_name || "—")}${d.contact_name ? " · " + esc(d.contact_name) : ""}</div>
               <div class="row"><div class="val">${money(d.value)}</div><div class="prob">${d.probability}%</div></div>
             </div>`).join("")}
@@ -269,7 +269,7 @@ async function vTasks() {
   const open = tasks.filter((t) => !t.done);
   view.innerHTML = `
     <div class="toolbar">
-      <span style="color:var(--ink-soft)">${open.length} open</span>
+      <span style="color:var(--text-2)">${open.length} open</span>
       <div class="spacer"></div>
       <button class="btn" id="new-task">+ New task</button>
     </div>
@@ -302,8 +302,8 @@ async function vAutomations() {
   const base = location.origin;
   view.innerHTML = `
     <div class="panel">
-      <h2>⚡ Outgoing webhooks <span style="color:var(--ink-faint);font-weight:400;font-size:13px">— CRM → Zapier / Make / n8n</span></h2>
-      <p style="color:var(--ink-soft);margin-top:-6px">POSTs JSON on deal, contact, and task events. Point it at a Zapier Catch Hook, Make webhook, or n8n Webhook node.</p>
+      <h2>Outgoing webhooks <span style="color:var(--text-3);font-weight:400;font-size:13px">— CRM → Zapier / Make / n8n</span></h2>
+      <p style="color:var(--text-2);margin-top:-6px">POSTs JSON on deal, contact, and task events. Point it at a Zapier Catch Hook, Make webhook, or n8n Webhook node.</p>
       <div id="wh-list">
         ${webhooks.map((w) => {
           let ev = [];
@@ -326,8 +326,8 @@ async function vAutomations() {
       </table>
     </div>
     <div class="panel">
-      <h2>📥 Incoming hooks <span style="color:var(--ink-faint);font-weight:400;font-size:13px">— Zapier / Make / n8n → CRM</span></h2>
-      <p style="color:var(--ink-soft);margin-top:-6px">POST JSON to the hook URL from any automation platform. Body: <span class="tag">{"action": "create_deal" | "create_contact" | "create_task", "data": {...}}</span></p>
+      <h2>Incoming hooks <span style="color:var(--text-3);font-weight:400;font-size:13px">— Zapier / Make / n8n → CRM</span></h2>
+      <p style="color:var(--text-2);margin-top:-6px">POST JSON to the hook URL from any automation platform. Body: <span class="tag">{"action": "create_deal" | "create_contact" | "create_task", "data": {...}}</span></p>
       ${hooks.map((h) => `
         <div class="hook"><div class="info"><div class="name">${esc(h.name)}</div>
           <div class="url">${esc(base)}/api/hooks/in/${esc(h.key)}</div></div>
@@ -373,6 +373,104 @@ Content-Type: application/json
       async (d) => { const r = await POST("/api/hooks", d); alert("Hook URL:\n" + location.origin + "/api/hooks/in/" + r.hook.key); route(); }, "Create hook");
 }
 
+/* ---------- command palette (⌘K quick find) ---------- */
+function initPalette() {
+  const root = $("#palette-root");
+  let items = [];
+  let sel = 0;
+  let cache = null;
+
+  async function buildItems() {
+    if (cache) return cache;
+    const NAV = [
+      ["Dashboard", "#/dashboard"], ["Pipeline", "#/pipeline"], ["Contacts", "#/contacts"],
+      ["Companies", "#/companies"], ["Tasks", "#/tasks"], ["Automations", "#/automations"],
+    ];
+    const out = NAV.map(([label, hash]) => ({
+      group: "Go to", kind: "view", label,
+      run: () => { location.hash = hash; },
+    }));
+    try {
+      const [{ deals }, { contacts }, { companies }] = await Promise.all([
+        GET("/api/deals"), GET("/api/contacts"), GET("/api/companies"),
+      ]);
+      deals.forEach((d) => out.push({
+        group: "Deals", kind: "deal",
+        label: d.title, sub: `${money(d.value)} · ${state.labels[d.stage] || d.stage}`,
+        run: () => { location.hash = "#/pipeline"; },
+      }));
+      contacts.forEach((c) => out.push({
+        group: "Contacts", kind: "person",
+        label: c.name, sub: c.company_name || c.title || "",
+        run: () => { location.hash = `#/contacts?q=${encodeURIComponent(c.name)}`; },
+      }));
+      companies.forEach((c) => out.push({
+        group: "Companies", kind: "org",
+        label: c.name, sub: c.industry || "",
+        run: () => { location.hash = "#/companies"; },
+      }));
+    } catch {}
+    cache = out;
+    return out;
+  }
+
+  function render(filter) {
+    const q = filter.trim().toLowerCase();
+    const matched = items.filter((i) =>
+      !q || i.label.toLowerCase().includes(q) || (i.sub || "").toLowerCase().includes(q));
+    sel = Math.min(sel, Math.max(0, matched.length - 1));
+    let html = "";
+    let lastGroup = null;
+    matched.slice(0, 60).forEach((it, idx) => {
+      if (it.group !== lastGroup) { html += `<div class="p-group">${esc(it.group)}</div>`; lastGroup = it.group; }
+      html += `<div class="p-item ${idx === sel ? "sel" : ""}" data-idx="${idx}">
+        <span class="p-kind">${esc(it.kind)}</span><span>${esc(it.label)}</span>
+        ${it.sub ? `<span class="sub">${esc(it.sub)}</span>` : ""}</div>`;
+    });
+    root.querySelector(".p-list").innerHTML =
+      html || `<div class="p-empty">No matches.</div>`;
+    root.querySelectorAll(".p-item").forEach((el) => {
+      el.onclick = () => { const it = matched[Number(el.dataset.idx)]; close(); it.run(); };
+      el.onmousemove = () => {
+        if (Number(el.dataset.idx) !== sel) { sel = Number(el.dataset.idx); render(filter); }
+      };
+    });
+    return matched;
+  }
+
+  function close() { root.innerHTML = ""; document.removeEventListener("keydown", onKey, true); }
+  let current = [];
+  function onKey(e) {
+    const input = root.querySelector("input");
+    if (e.key === "Escape") { e.preventDefault(); close(); }
+    else if (e.key === "ArrowDown") { e.preventDefault(); sel = Math.min(sel + 1, current.length - 1); render(input.value); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); sel = Math.max(sel - 1, 0); render(input.value); }
+    else if (e.key === "Enter") { e.preventDefault(); const it = current[sel]; if (it) { close(); it.run(); } }
+  }
+
+  async function open() {
+    if (root.innerHTML) { close(); return; }
+    sel = 0;
+    root.innerHTML = `<div class="p-overlay" id="p-ovl">
+      <div class="palette">
+        <input id="p-input" placeholder="Search deals, contacts, companies…" autocomplete="off">
+        <div class="p-list"><div class="p-empty">Loading…</div></div>
+      </div></div>`;
+    $("#p-ovl").addEventListener("mousedown", (e) => { if (e.target.id === "p-ovl") close(); });
+    document.addEventListener("keydown", onKey, true);
+    const input = $("#p-input");
+    input.addEventListener("input", () => { current = render(input.value); });
+    input.focus();
+    items = await buildItems();
+    current = render("");
+  }
+
+  $("#cmdk-btn").onclick = open;
+  document.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); open(); }
+  });
+}
+
 /* ---------- router ---------- */
 async function route() {
   const [hash] = location.hash.split("?");
@@ -392,6 +490,7 @@ async function route() {
 
 (async () => {
   await loadMeta();
+  initPalette();
   window.addEventListener("hashchange", route);
   if (!location.hash) location.hash = "#/dashboard";
   route();

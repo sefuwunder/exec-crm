@@ -80,6 +80,8 @@ const select = (name, options, val = "") =>
 
 /* ---------- views ---------- */
 const state = { stages: [], labels: {}, colors: {} };
+let pipeView = "board"; // pipeline tab: "board" | "timeline"
+let ganttZoom = "fit";  // timeline range: "fit" | "3m" | "6m" | "1y"
 
 async function loadMeta() {
   const { stages, labels } = await GET("/api/deals");
@@ -150,11 +152,22 @@ async function vPipeline() {
   const closedStages = ["closed_won", "closed_lost"];
   view.innerHTML = `
     <div class="toolbar">
-      <button class="btn" id="new-deal">+ New deal</button>
+      <div class="seg">
+        <button data-pv="board" class="${pipeView === "board" ? "on" : ""}">Board</button>
+        <button data-pv="timeline" class="${pipeView === "timeline" ? "on" : ""}">Timeline</button>
+      </div>
       <div class="spacer"></div>
-      <span style="color:var(--text-2)">${open.length} open deals · ${money(open.reduce((a, d) => a + d.value, 0))} pipeline</span>
+      ${pipeView === "timeline" ? `
+      <div class="seg small">
+        <button data-gz="fit" class="${ganttZoom === "fit" ? "on" : ""}">Fit</button>
+        <button data-gz="3m" class="${ganttZoom === "3m" ? "on" : ""}">3M</button>
+        <button data-gz="6m" class="${ganttZoom === "6m" ? "on" : ""}">6M</button>
+        <button data-gz="1y" class="${ganttZoom === "1y" ? "on" : ""}">1Y</button>
+      </div>` : `
+      <span style="color:var(--text-2)">${open.length} open deals · ${money(open.reduce((a, d) => a + d.value, 0))} pipeline</span>`}
+      <button class="btn" id="new-deal">+ New deal</button>
     </div>
-    <div class="board" id="board">
+    ${pipeView === "board" ? `<div class="board" id="board">
       ${[...state.stages.filter((s) => !closedStages.includes(s)), ...closedStages].map((s) => {
         const ds = deals.filter((d) => d.stage === s);
         const tot = ds.reduce((a, d) => a + d.value, 0);
@@ -170,10 +183,96 @@ async function vPipeline() {
             </div>`).join("")}
         </div>`;
       }).join("")}
-    </div>`;
+    </div>` : ganttHtml(open)}
 
+  document.querySelectorAll("[data-pv]").forEach((b) =>
+    (b.onclick = () => { pipeView = b.dataset.pv; route(); }));
+  document.querySelectorAll("[data-gz]").forEach((b) =>
+    (b.onclick = () => { ganttZoom = b.dataset.gz; route(); }));
   $("#new-deal").onclick = () => newDealModal();
-  initDealDrag(deals);
+  if (pipeView === "board") initDealDrag(deals);
+  else wireGantt(open);
+}
+
+/* Per-deal Gantt: bar runs from created_at to expected_close.
+   Deals with no close date render as striped bars ending today. */
+function ganttHtml(deals) {
+  const DAY = 86400000;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const t = today.getTime();
+  const dp = (s) => {
+    if (!s) return null;
+    const str = String(s);
+    const iso = /^\d{4}-\d{2}-\d{2}$/.test(str) ? str + "T12:00:00" : str.replace(" ", "T");
+    const ms = new Date(iso).getTime();
+    return isNaN(ms) ? null : ms;
+  };
+  const rows = deals
+    .map((d) => {
+      const s = dp(d.created_at) ?? t;
+      const e = dp(d.expected_close);
+      return { d, s, e: e ?? t, tbd: !e };
+    })
+    .sort((a, b) => (a.tbd ? 1 : 0) - (b.tbd ? 1 : 0) || a.e - b.e || b.d.value - a.d.value);
+
+  if (!rows.length) return `<div class="empty">No open deals to chart.</div>`;
+
+  let start, end;
+  if (ganttZoom === "fit") {
+    start = Math.min(t, ...rows.map((r) => r.s)) - 7 * DAY;
+    end = Math.max(t, ...rows.map((r) => r.e)) + 14 * DAY;
+  } else {
+    start = t - 30 * DAY;
+    end = t + { "3m": 90, "6m": 180, "1y": 365 }[ganttZoom] * DAY;
+  }
+  const ws = new Date(start);
+  ws.setHours(0, 0, 0, 0);
+  ws.setDate(ws.getDate() - ((ws.getDay() + 6) % 7)); // align to Monday
+  const w0 = ws.getTime();
+  const W = Math.max(4, Math.ceil((end - w0) / (7 * DAY)));
+  const range = W * 7 * DAY;
+  const pct = (ms) => Math.max(0, Math.min(100, ((ms - w0) / range) * 100));
+
+  const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  let head = "";
+  for (let i = 0; i < W; i++) {
+    const wd = new Date(w0 + i * 7 * DAY);
+    head += `<div class="g-th">${wd.getDate() <= 7 ? MON[wd.getMonth()] : ""}</div>`;
+  }
+  const body = rows
+    .map(({ d, s, e, tbd }) => {
+      const l = pct(Math.max(s, w0));
+      const wPct = Math.max(pct(Math.min(Math.max(e, s), w0 + range)) - l, 1.2);
+      return `<div class="g-label" data-id="${d.id}">
+          <div class="gl-t">${esc(d.title)}</div>
+          <div class="gl-s">${esc(d.company_name || "—")} · ${moneyShort(d.value)}</div>
+        </div>
+        <div class="g-lane">
+          <div class="g-bar${tbd ? " tentative" : ""}" data-id="${d.id}"
+            title="${esc(d.title)} · ${money(d.value)}${d.expected_close ? " · closes " + esc(d.expected_close) : " · no close date set"}"
+            style="left:${l.toFixed(2)}%;width:${wPct.toFixed(2)}%;background:${stageColor(d.stage)}">${wPct > 14 ? `<span>${moneyShort(d.value)}</span>` : ""}</div>
+        </div>`;
+    })
+    .join("");
+
+  const todayX = 280 + ((t - w0) / DAY) * (34 / 7);
+  const showToday = t >= w0 && t <= w0 + range;
+  return `<div class="g-scroll"><div class="g-wrap">
+    <div class="g-grid" style="grid-template-columns:280px repeat(${W},34px)">
+      <div class="g-corner">Deal</div>${head}${body}
+    </div>
+    ${showToday ? `<div class="g-today" style="left:${todayX.toFixed(1)}px"><span>Today</span></div>` : ""}
+  </div></div>`;
+}
+
+function wireGantt(deals) {
+  document.querySelectorAll(".g-bar, .g-label").forEach((el) => {
+    el.onclick = () => {
+      const d = deals.find((x) => x.id === Number(el.dataset.id));
+      if (d) editDealModal(d);
+    };
+  });
 }
 
 /* Fluid pointer-based drag & drop for the pipeline board.

@@ -164,6 +164,7 @@ th {
 td { padding: 12px; border-bottom: 1px solid var(--border-soft); font-size: 13.5px; }
 tr:last-child td { border-bottom: none; }
 tbody tr:hover td { background: #f8fafd; }
+tr.clickable { cursor: pointer; }
 
 /* ---------- buttons ---------- */
 .btn {

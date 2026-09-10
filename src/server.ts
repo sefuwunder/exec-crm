@@ -232,6 +232,24 @@ const server = Bun.serve({
       return json({ contact }, 201);
     }
 
+    const contactId = path.match(/^\/api\/contacts\/(\d+)$/);
+    if (contactId && method === "PATCH") {
+      const b = await readBody(req);
+      const sets: string[] = [];
+      const vals: unknown[] = [];
+      for (const k of ["company_id", "name", "title", "email", "phone"]) {
+        if (b[k] !== undefined) {
+          sets.push(`${k} = ?`);
+          vals.push(k === "company_id" && b[k] === "" ? null : b[k]);
+        }
+      }
+      if (sets.length) {
+        db.prepare(`UPDATE contacts SET ${sets.join(", ")} WHERE id = ?`)
+          .run(...vals, Number(contactId[1]));
+      }
+      return json({ contact: db.query("SELECT * FROM contacts WHERE id = ?").get(Number(contactId[1])) });
+    }
+
     // ---- companies
     if (path === "/api/companies" && method === "GET") {
       const rows = db
@@ -255,6 +273,24 @@ const server = Bun.serve({
       );
     }
 
+    const companyId = path.match(/^\/api\/companies\/(\d+)$/);
+    if (companyId && method === "PATCH") {
+      const b = await readBody(req);
+      const sets: string[] = [];
+      const vals: unknown[] = [];
+      for (const k of ["name", "industry", "website"]) {
+        if (b[k] !== undefined) {
+          sets.push(`${k} = ?`);
+          vals.push(b[k]);
+        }
+      }
+      if (sets.length) {
+        db.prepare(`UPDATE companies SET ${sets.join(", ")} WHERE id = ?`)
+          .run(...vals, Number(companyId[1]));
+      }
+      return json({ company: db.query("SELECT * FROM companies WHERE id = ?").get(Number(companyId[1])) });
+    }
+
     // ---- tasks
     if (path === "/api/tasks" && method === "GET") {
       const rows = db
@@ -274,6 +310,23 @@ const server = Bun.serve({
       const task = db.query("SELECT * FROM tasks WHERE id = ?").get(Number(r.lastInsertRowid));
       fireWebhooks("task.created", task as any);
       return json({ task }, 201);
+    }
+    const taskId = path.match(/^\/api\/tasks\/(\d+)$/);
+    if (taskId && method === "PATCH") {
+      const b = await readBody(req);
+      const sets: string[] = [];
+      const vals: unknown[] = [];
+      for (const k of ["title", "deal_id", "due_date", "owner"]) {
+        if (b[k] !== undefined) {
+          sets.push(`${k} = ?`);
+          vals.push(k === "deal_id" && b[k] === "" ? null : b[k]);
+        }
+      }
+      if (sets.length) {
+        db.prepare(`UPDATE tasks SET ${sets.join(", ")} WHERE id = ?`)
+          .run(...vals, Number(taskId[1]));
+      }
+      return json({ task: db.query("SELECT * FROM tasks WHERE id = ?").get(Number(taskId[1])) });
     }
     const taskToggle = path.match(/^\/api\/tasks\/(\d+)\/toggle$/);
     if (taskToggle && method === "POST") {

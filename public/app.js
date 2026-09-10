@@ -225,12 +225,18 @@ async function vContacts() {
     </div>
     <div class="panel"><table>
       <tr><th>Name</th><th>Title</th><th>Company</th><th>Email</th><th>Phone</th></tr>
-      ${contacts.map((c) => `<tr><td><b>${esc(c.name)}</b></td><td>${esc(c.title)}</td>
+      ${contacts.map((c) => `<tr class="clickable" data-id="${c.id}"><td><b>${esc(c.name)}</b></td><td>${esc(c.title)}</td>
         <td>${esc(c.company_name || "—")}</td><td>${esc(c.email)}</td><td>${esc(c.phone)}</td></tr>`).join("")}
     </table>${contacts.length ? "" : `<div class="empty">No contacts match.</div>`}</div>`;
   const go = () => location.hash = `#/contacts?q=${encodeURIComponent($("#q").value)}`;
   $("#go").onclick = go;
   $("#q").addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
+  document.querySelectorAll("#view tr.clickable").forEach((tr) => {
+    tr.onclick = () => {
+      const c = contacts.find((x) => x.id === Number(tr.dataset.id));
+      if (c) editContactModal(c);
+    };
+  });
   $("#new-contact").onclick = async () => {
     const { companies } = await GET("/api/companies");
     openModal("New contact", `
@@ -246,6 +252,20 @@ async function vContacts() {
   };
 }
 
+async function editContactModal(c) {
+  const { companies } = await GET("/api/companies");
+  openModal("Edit contact", `
+    <div class="formgrid">
+      ${field("Name", input("name", c.name))}
+      ${field("Title", input("title", c.title))}
+      ${field("Company", select("company_id", [["", "—"]].concat(companies.map((x) => [x.id, x.name])), c.company_id || ""))}
+      ${field("Email", input("email", c.email, "email"))}
+      ${field("Phone", input("phone", c.phone))}
+      ${field("—", `<div></div>`)}
+    </div>`,
+    async (d) => { await PATCH(`/api/contacts/${c.id}`, d); route(); }, "Save changes");
+}
+
 async function vCompanies() {
   const { companies } = await GET("/api/companies");
   view.innerHTML = `
@@ -253,14 +273,27 @@ async function vCompanies() {
       <button class="btn" id="new-company">+ New company</button></div>
     <div class="panel"><table>
       <tr><th>Company</th><th>Industry</th><th>Website</th><th>Deals</th><th>Open pipeline</th></tr>
-      ${companies.map((c) => `<tr><td><b>${esc(c.name)}</b></td><td>${esc(c.industry)}</td>
+      ${companies.map((c) => `<tr class="clickable" data-id="${c.id}"><td><b>${esc(c.name)}</b></td><td>${esc(c.industry)}</td>
         <td>${esc(c.website)}</td><td>${c.deal_count}</td><td><b>${money(c.open_value)}</b></td></tr>`).join("")}
     </table></div>`;
+  document.querySelectorAll("#view tr.clickable").forEach((tr) => {
+    tr.onclick = () => {
+      const c = companies.find((x) => x.id === Number(tr.dataset.id));
+      if (c) editCompanyModal(c);
+    };
+  });
   $("#new-company").onclick = () =>
     openModal("New company", `
       ${field("Name", input("name"))}
       <div class="formgrid">${field("Industry", input("industry"))}${field("Website", input("website"))}</div>`,
       async (d) => { await POST("/api/companies", d); route(); }, "Create company");
+}
+
+function editCompanyModal(c) {
+  openModal("Edit company", `
+    ${field("Name", input("name", c.name))}
+    <div class="formgrid">${field("Industry", input("industry", c.industry))}${field("Website", input("website", c.website))}</div>`,
+    async (d) => { await PATCH(`/api/companies/${c.id}`, d); route(); }, "Save changes");
 }
 
 async function vTasks() {
@@ -279,10 +312,18 @@ async function vTasks() {
           <input type="checkbox" data-id="${t.id}" ${t.done ? "checked" : ""}>
           <div><div class="tt">${esc(t.title)}</div>
             <div class="meta">${t.deal_title ? esc(t.deal_title) + " · " : ""}${t.due_date ? "due " + esc(t.due_date) + " · " : ""}${esc(t.owner)}</div></div>
+          <div class="spacer"></div>
+          <button class="btn ghost small" data-edit="${t.id}">Edit</button>
         </div>`).join("") || `<div class="empty">All clear.</div>`}
     </div>`;
   document.querySelectorAll('.task input[type="checkbox"]').forEach((cb) => {
     cb.onchange = async () => { await POST(`/api/tasks/${cb.dataset.id}/toggle`); route(); };
+  });
+  document.querySelectorAll("[data-edit]").forEach((b) => {
+    b.onclick = () => {
+      const t = tasks.find((x) => x.id === Number(b.dataset.edit));
+      if (t) editTaskModal(t, deals);
+    };
   });
   $("#new-task").onclick = () =>
     openModal("New task", `
@@ -293,6 +334,17 @@ async function vTasks() {
       </div>
       ${field("Owner", input("owner", "You"))}`,
       async (d) => { if (!d.deal_id) delete d.deal_id; await POST("/api/tasks", d); route(); }, "Create task");
+}
+
+function editTaskModal(t, deals) {
+  openModal("Edit task", `
+    ${field("Title", input("title", t.title))}
+    <div class="formgrid">
+      ${field("Related deal", select("deal_id", [["", "—"]].concat(deals.filter((d) => !["closed_won", "closed_lost"].includes(d.stage)).map((d) => [d.id, d.title])), t.deal_id || ""))}
+      ${field("Due date", input("due_date", t.due_date || "", "date"))}
+    </div>
+    ${field("Owner", input("owner", t.owner))}`,
+    async (d) => { await PATCH(`/api/tasks/${t.id}`, d); route(); }, "Save changes");
 }
 
 async function vAutomations() {

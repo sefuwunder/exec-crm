@@ -163,7 +163,7 @@ async function vPipeline() {
             <div class="cname">${esc(state.labels[s])}</div>
             <div class="ctotal">${ds.length} · ${moneyShort(tot)}</div></div>
           ${ds.map((d) => `
-            <div class="deal-card" draggable="true" data-id="${d.id}">
+            <div class="deal-card" data-id="${d.id}">
               <div class="trow"><span class="sdot" style="background:${stageColor(s)}"></span><div class="t">${esc(d.title)}</div></div>
               <div class="co">${esc(d.company_name || "—")}${d.contact_name ? " · " + esc(d.contact_name) : ""}</div>
               <div class="row"><div class="val">${money(d.value)}</div><div class="prob">${d.probability}%</div></div>
@@ -173,27 +173,140 @@ async function vPipeline() {
     </div>`;
 
   $("#new-deal").onclick = () => newDealModal();
-  document.querySelectorAll(".deal-card").forEach((card) => {
-    card.addEventListener("dragstart", (e) => {
-      e.dataTransfer.setData("text/plain", card.dataset.id);
-      card.classList.add("dragging");
-    });
-    card.addEventListener("dragend", () => card.classList.remove("dragging"));
-  });
-  document.querySelectorAll(".column").forEach((col) => {
-    col.addEventListener("dragover", (e) => {
-      e.preventDefault();
-      col.classList.add("dragover");
-    });
-    col.addEventListener("dragleave", () => col.classList.remove("dragover"));
-    col.addEventListener("drop", async (e) => {
-      e.preventDefault();
-      col.classList.remove("dragover");
-      const id = e.dataTransfer.getData("text/plain");
-      await PATCH(`/api/deals/${id}`, { stage: col.dataset.stage });
+  initDealDrag(deals);
+}
+
+/* Fluid pointer-based drag & drop for the pipeline board.
+   Click (no drag) opens the edit window; drag lifts the card,
+   shows a live placeholder, and FLIP-animates the settle. */
+function initDealDrag(deals) {
+  const board = $("#board");
+  if (!board) return;
+  let drag = null;
+
+  const cleanup = (d) => {
+    d.card.classList.remove("dragging");
+    d.card.style.cssText = "";
+    if (d.ph) d.ph.remove();
+    board.querySelectorAll(".column").forEach((c) => c.classList.remove("dragover"));
+  };
+
+  const settle = (card, cancelled) => {
+    const d = drag;
+    if (!d || d.card !== card) return;
+    drag = null;
+    if (!d.active) { // plain click -> edit window
+      const deal = deals.find((x) => x.id === Number(d.id));
+      if (deal) editDealModal(deal);
+      return;
+    }
+    const targetCol = !cancelled && d.ph.isConnected ? d.ph.closest(".column") : null;
+    const dest = targetCol ? d.ph.getBoundingClientRect() : d.rect;
+    const cur = card.getBoundingClientRect();
+    card.style.transition = "transform 0.19s cubic-bezier(0.22, 1, 0.36, 1)";
+    card.style.transform = `translate(${d.x + (dest.left - cur.left)}px, ${d.y + (dest.top - cur.top)}px)`;
+    setTimeout(async () => {
+      const newStage = targetCol ? targetCol.dataset.stage : d.oldStage;
+      cleanup(d);
+      if (targetCol && newStage !== d.oldStage) {
+        await PATCH(`/api/deals/${d.id}`, { stage: newStage });
+      }
       route();
+    }, 200);
+  };
+
+  board.querySelectorAll(".deal-card").forEach((card) => {
+    card.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      drag = {
+        card, id: card.dataset.id, sx: e.clientX, sy: e.clientY,
+        x: 0, y: 0, active: false, ph: null,
+        rect: card.getBoundingClientRect(),
+        oldStage: card.closest(".column").dataset.stage,
+      };
+      try { card.setPointerCapture(e.pointerId); } catch {}
     });
+
+    card.addEventListener("pointermove", (e) => {
+      const d = drag;
+      if (!d || d.card !== card) return;
+      if (!d.active) {
+        if (Math.hypot(e.clientX - d.sx, e.clientY - d.sy) < 7) return;
+        // lift the card
+        const r = d.rect;
+        const ph = document.createElement("div");
+        ph.className = "deal-placeholder";
+        ph.style.height = r.height + "px";
+        card.after(ph);
+        Object.assign(card.style, {
+          position: "fixed", left: r.left + "px", top: r.top + "px",
+          width: r.width + "px", margin: "0", zIndex: 1000,
+          pointerEvents: "none",
+        });
+        d.ph = ph;
+        d.active = true;
+        card.classList.add("dragging");
+      }
+      d.x = e.clientX - d.sx;
+      d.y = e.clientY - d.sy;
+      card.style.transform = `translate(${d.x}px, ${d.y}px) rotate(2deg) scale(1.03)`;
+      // which column is under the cursor?
+      const under = document.elementFromPoint(e.clientX, e.clientY);
+      const col = under ? under.closest(".column") : null;
+      board.querySelectorAll(".column").forEach((c) =>
+        c.classList.toggle("dragover", c === col));
+      if (col && d.ph) {
+        const siblings = [...col.querySelectorAll(".deal-card:not(.dragging)")];
+        const after = siblings.find((c) => {
+          const cr = c.getBoundingClientRect();
+          return e.clientY < cr.top + cr.height / 2;
+        });
+        if (after) col.insertBefore(d.ph, after);
+        else col.appendChild(d.ph);
+      }
+    });
+
+    card.addEventListener("pointerup", () => settle(card, false));
+    card.addEventListener("pointercancel", () => settle(card, true));
   });
+}
+
+async function editDealModal(d) {
+  const { companies } = await GET("/api/companies");
+  const { contacts } = await GET("/api/contacts");
+  const close = openModal("Edit deal", `
+    <div class="formgrid">
+      ${field("Title", input("title", d.title))}
+      ${field("Value ($)", input("value", d.value, "number"))}
+      ${field("Company", select("company_id", [["", "—"]].concat(companies.map((c) => [c.id, c.name])), d.company_id || ""))}
+      ${field("Contact", select("contact_id", [["", "—"]].concat(contacts.map((c) => [c.id, c.name])), d.contact_id || ""))}
+      ${field("Stage", select("stage", state.stages.map((s) => [s, state.labels[s]]), d.stage))}
+      ${field("Probability %", input("probability", d.probability, "number"))}
+      ${field("Expected close", input("expected_close", d.expected_close || "", "date"))}
+      ${field("Owner", input("owner", d.owner || ""))}
+    </div>`,
+    async (data) => {
+      if (data.company_id === "") data.company_id = null;
+      if (data.contact_id === "") data.contact_id = null;
+      await PATCH(`/api/deals/${d.id}`, data);
+      route();
+    }, "Save changes");
+  const actions = document.querySelector("#modal-root .modal .actions");
+  if (actions) {
+    const del = document.createElement("button");
+    del.className = "btn danger";
+    del.textContent = "Delete";
+    del.style.marginRight = "auto";
+    del.onclick = async () => {
+      if (confirm(`Delete "${d.title}"? This can't be undone.`)) {
+        await DEL(`/api/deals/${d.id}`);
+        close();
+        route();
+      }
+    };
+    actions.prepend(del);
+  }
 }
 
 async function newDealModal() {

@@ -81,6 +81,33 @@ async function readBody(req: Request): Promise<any> {
   }
 }
 
+// minimal CSV parser: handles quoted fields, embedded commas/quotes, CRLF
+function parseCsv(text: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += c;
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ",") {
+      row.push(field); field = "";
+    } else if (c === "\n") {
+      row.push(field); rows.push(row); row = []; field = "";
+    } else if (c !== "\r") {
+      field += c;
+    }
+  }
+  if (field !== "" || row.length) { row.push(field); rows.push(row); }
+  return rows.filter((r) => r.some((f) => f.trim() !== ""));
+}
+
 // ---------------------------------------------------------------- server
 const server = Bun.serve({
   port: PORT,
@@ -248,6 +275,88 @@ const server = Bun.serve({
           .run(...vals, Number(contactId[1]));
       }
       return json({ contact: db.query("SELECT * FROM contacts WHERE id = ?").get(Number(contactId[1])) });
+    }
+
+    // ---- CSV import: POST { csv: "..." } with header row
+    // columns: name, title, company, email, phone (case-insensitive)
+    if (path === "/api/contacts/import" && method === "POST") {
+      const b = await readBody(req);
+      const rows = parseCsv(String(b.csv || ""));
+      if (!rows.length) return json({ error: "empty CSV" }, 400);
+      const header = rows[0].map((h) => h.trim().toLowerCase());
+      const col = (...names: string[]) => {
+        for (const n of names) {
+          const i = header.indexOf(n);
+          if (i >= 0) return i;
+        }
+        return -1;
+      };
+      const iName = col("name", "full name", "contact", "contact name");
+      if (iName < 0) return json({ error: 'CSV needs a "name" column' }, 400);
+      const iTitle = col("title", "job title", "role", "position");
+      const iCompany = col("company", "company name", "organization", "organisation");
+      const iEmail = col("email", "e-mail", "email address");
+      const iPhone = col("phone", "phone number", "tel", "mobile");
+
+      const companyCache = new Map<string, number>();
+      const companyIdFor = (name: string): number | null => {
+        const key = name.trim().toLowerCase();
+        if (!key) return null;
+        const hit = companyCache.get(key);
+        if (hit !== undefined) return hit;
+        const existing = db
+          .query("SELECT id FROM companies WHERE lower(name) = ?")
+          .get(key) as any;
+        const id = existing
+          ? existing.id
+          : Number(db.prepare("INSERT INTO companies (name) VALUES (?)").run(name.trim()).lastInsertRowid);
+        companyCache.set(key, id);
+        return id;
+      };
+
+      let imported = 0;
+      let skipped = 0;
+      const errors: string[] = [];
+      rows.slice(1).forEach((r, n) => {
+        const line = n + 2;
+        const name = (r[iName] || "").trim();
+        if (!name) { skipped++; return; }
+        const email = iEmail >= 0 ? (r[iEmail] || "").trim() : "";
+        if (email) {
+          const dup = db
+            .query("SELECT id FROM contacts WHERE lower(email) = ?")
+            .get(email.toLowerCase()) as any;
+          if (dup) { skipped++; return; }
+        }
+        try {
+          db.prepare(
+            "INSERT INTO contacts (company_id, name, title, email, phone) VALUES (?, ?, ?, ?, ?)"
+          ).run(
+            iCompany >= 0 ? companyIdFor(r[iCompany] || "") : null,
+            name,
+            iTitle >= 0 ? (r[iTitle] || "").trim() : "",
+            email,
+            iPhone >= 0 ? (r[iPhone] || "").trim() : ""
+          );
+          imported++;
+        } catch (e) {
+          errors.push(`Row ${line}: ${(e as Error).message}`);
+        }
+      });
+      // bulk imports intentionally don't fire outgoing webhooks
+      logActivity("contact", `Imported ${imported} contact${imported === 1 ? "" : "s"} from CSV`);
+      return json({ imported, skipped, errors: errors.slice(0, 10) });
+    }
+    if (path === "/api/contacts/import/template" && method === "GET") {
+      return new Response(
+        'name,title,company,email,phone\n"Jane Doe","VP Sales","Acme Inc","jane@acme.com","555-0100"\n',
+        {
+          headers: {
+            "Content-Type": "text/csv",
+            "Content-Disposition": 'attachment; filename="contacts-template.csv"',
+          },
+        }
+      );
     }
 
     // ---- companies

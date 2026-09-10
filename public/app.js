@@ -400,6 +400,17 @@ Content-Type: application/json
     "expected_close": "2026-11-30"
   }
 }</div>
+    </div>
+    <div class="panel">
+      <h2>Import contacts <span style="color:var(--text-3);font-weight:400;font-size:13px">— CSV upload</span></h2>
+      <p style="color:var(--text-2);margin-top:-6px">Columns: <span class="tag">name</span> <span class="tag">title</span> <span class="tag">company</span> <span class="tag">email</span> <span class="tag">phone</span> — only <span class="tag">name</span> is required. New companies are created automatically; rows with a duplicate email are skipped. Bulk imports don't fire outgoing webhooks.</p>
+      <div class="toolbar">
+        <label class="btn ghost" for="csv-file" id="csv-label" style="cursor:pointer">Choose CSV…</label>
+        <input type="file" id="csv-file" accept=".csv,text/csv" hidden>
+        <button class="btn" id="do-import">Import contacts</button>
+        <a class="btn ghost" href="/api/contacts/import/template" download="contacts-template.csv" style="text-decoration:none">Download template</a>
+      </div>
+      <div id="import-result"></div>
     </div>`;
 
   $("#add-wh").onclick = () =>
@@ -423,6 +434,30 @@ Content-Type: application/json
   $("#add-hook").onclick = () =>
     openModal("New incoming hook", field("Name", input("name", "n8n deal intake")),
       async (d) => { const r = await POST("/api/hooks", d); alert("Hook URL:\n" + location.origin + "/api/hooks/in/" + r.hook.key); route(); }, "Create hook");
+
+  const csvFile = $("#csv-file");
+  csvFile.onchange = () => {
+    $("#csv-label").textContent = csvFile.files[0] ? csvFile.files[0].name : "Choose CSV…";
+  };
+  $("#do-import").onclick = async () => {
+    const f = csvFile.files[0];
+    if (!f) { alert("Choose a CSV file first."); return; }
+    const btn = $("#do-import");
+    btn.disabled = true;
+    btn.textContent = "Importing…";
+    try {
+      const r = await POST("/api/contacts/import", { csv: await f.text() });
+      $("#import-result").innerHTML = `<div class="hook"><div class="info">
+        <div class="name status-ok">Imported ${r.imported} contact${r.imported === 1 ? "" : "s"}</div>
+        <div class="url">${r.skipped} skipped (blank name or duplicate email)${r.errors.length ? ` · ${r.errors.length} error(s)` : ""}</div>
+        ${r.errors.length ? `<div class="events">${r.errors.map((e) => `<span class="tag">${esc(e)}</span>`).join("")}</div>` : ""}
+      </div></div>`;
+    } catch (e) {
+      $("#import-result").innerHTML = `<div class="empty">Import failed: ${esc(e.message)}</div>`;
+    }
+    btn.disabled = false;
+    btn.textContent = "Import contacts";
+  };
 }
 
 /* ---------- command palette (⌘K quick find) ---------- */

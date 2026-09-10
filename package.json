@@ -1,0 +1,1 @@
+{"description":"C-suite CRM with automation-platform webhooks","name":"exec-crm","scripts":{"start":"bun src/server.ts"},"version":"1.0.0"}

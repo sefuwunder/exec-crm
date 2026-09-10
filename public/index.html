@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>exec-crm</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div id="app">
+  <aside class="sidebar">
+    <div class="brand">exec<span>crm</span></div>
+    <nav class="nav" id="nav">
+      <a href="#/dashboard" data-r="dashboard">📊 Dashboard</a>
+      <a href="#/pipeline" data-r="pipeline">🗂️ Pipeline</a>
+      <a href="#/contacts" data-r="contacts">👥 Contacts</a>
+      <a href="#/companies" data-r="companies">🏢 Companies</a>
+      <a href="#/tasks" data-r="tasks">✅ Tasks</a>
+      <a href="#/automations" data-r="automations">⚡ Automations</a>
+    </nav>
+    <div class="side-foot">exec-crm · Bun + SQLite<br>focused for the C-suite</div>
+  </aside>
+  <div class="main">
+    <div class="topbar">
+      <h1 id="page-title">Dashboard</h1>
+      <div class="date" id="today"></div>
+    </div>
+    <div class="view" id="view"></div>
+  </div>
+</div>
+<div id="modal-root"></div>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -201,17 +201,43 @@ function initDealDrag(deals) {
       return;
     }
     const targetCol = !cancelled && d.ph.isConnected ? d.ph.closest(".column") : null;
+    const newStage = targetCol ? targetCol.dataset.stage : d.oldStage;
+    const moved = !!targetCol && newStage !== d.oldStage;
     const dest = targetCol ? d.ph.getBoundingClientRect() : d.rect;
     const cur = card.getBoundingClientRect();
+    // phase 1: glide the floating card into the placeholder
     card.style.transition = "transform 0.19s cubic-bezier(0.22, 1, 0.36, 1)";
     card.style.transform = `translate(${d.x + (dest.left - cur.left)}px, ${d.y + (dest.top - cur.top)}px)`;
     setTimeout(async () => {
-      const newStage = targetCol ? targetCol.dataset.stage : d.oldStage;
-      cleanup(d);
-      if (targetCol && newStage !== d.oldStage) {
-        await PATCH(`/api/deals/${d.id}`, { stage: newStage });
+      if (!moved) {
+        // same column (or cancelled): glide back to origin and restore in place, no re-render
+        const back = d.rect;
+        const c2 = card.getBoundingClientRect();
+        card.style.transform = `translate(${d.x + (back.left - c2.left)}px, ${d.y + (back.top - c2.top)}px)`;
+        setTimeout(() => cleanup(d), 200);
+        return;
       }
-      route();
+      try {
+        await PATCH(`/api/deals/${d.id}`, { stage: newStage });
+      } catch {}
+      // phase 2: keep the floating card alive as an overlay while the board
+      // re-renders underneath, then crossfade onto the fresh card (no snap)
+      if (d.ph) d.ph.remove();
+      board.querySelectorAll(".column").forEach((c) => c.classList.remove("dragover"));
+      document.body.appendChild(card); // survive the innerHTML wipe in route()
+      card.style.transition = "none";
+      await route();
+      const freshBoard = $("#board");
+      const fresh = freshBoard && freshBoard.querySelector(`.deal-card[data-id="${d.id}"]`);
+      if (!fresh) { card.remove(); return; }
+      fresh.style.visibility = "hidden";
+      const fr = fresh.getBoundingClientRect();
+      card.style.transition = "transform 0.16s cubic-bezier(0.22, 1, 0.36, 1)";
+      card.style.transform = `translate(${fr.left - d.rect.left}px, ${fr.top - d.rect.top}px)`;
+      setTimeout(() => {
+        card.remove();
+        fresh.style.removeProperty("visibility");
+      }, 170);
     }, 200);
   };
 

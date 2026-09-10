@@ -184,6 +184,7 @@ async function vPipeline() {
         </div>`;
       }).join("")}
     </div>` : ganttHtml(open)}
+`;
 
   document.querySelectorAll("[data-pv]").forEach((b) =>
     (b.onclick = () => { pipeView = b.dataset.pv; route(); }));

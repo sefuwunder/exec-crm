@@ -338,3 +338,25 @@ input:focus, select:focus, textarea:focus {
   position: absolute; top: 46px; left: 6px; background: #f04438; color: #fff;
   font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 99px; white-space: nowrap;
 }
+
+/* ---------- daily feed ---------- */
+.feed-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; margin-bottom: 16px; flex-wrap: wrap; }
+.feed-greet { font-size: 22px; font-weight: 800; letter-spacing: -0.3px; }
+.feed-sub { color: var(--text-2); font-size: 13.5px; margin-top: 4px; }
+.feed-sub b { color: var(--text); }
+.feed-add { display: flex; gap: 8px; }
+.feed-add input { width: 280px; }
+.count { font-size: 12px; font-weight: 700; color: var(--text-2); background: var(--bg); border: 1px solid var(--border); border-radius: 99px; padding: 1px 9px; margin-left: 6px; vertical-align: 2px; }
+
+/* ---------- captures ---------- */
+.caps-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px; }
+.cap-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow-sm); transition: transform 0.15s ease, box-shadow 0.15s ease; }
+.cap-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); }
+.cap-card > a { display: block; aspect-ratio: 4 / 3; background: var(--bg); overflow: hidden; }
+.cap-card img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.cap-body { padding: 10px 12px 12px; }
+.cap-note { font-size: 13px; font-weight: 600; margin-bottom: 4px; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.cap-meta { color: var(--text-3); font-size: 12px; }
+.cap-actions { display: flex; gap: 6px; margin-top: 8px; }
+.cap-edit-img { margin-bottom: 12px; border-radius: 8px; overflow: hidden; border: 1px solid var(--border); }
+.cap-edit-img img { width: 100%; max-height: 320px; object-fit: contain; background: var(--bg); display: block; }

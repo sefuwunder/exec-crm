@@ -4,6 +4,24 @@ const PORT = Number(process.env.PORT || 3001);
 const db = openDb(process.env.CRM_DB || "./crm.db");
 seedIfEmpty(db);
 
+// ---- captured photos (business cards, client notes)
+const UPLOAD_DIR = process.env.CRM_UPLOADS || "./uploads";
+await Bun.$`mkdir -p ${UPLOAD_DIR}`.quiet();
+
+const IMAGE_TYPES: Record<string, string> = {
+  ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+  ".webp": "image/webp", ".gif": "image/gif", ".heic": "image/heic",
+  ".heif": "image/heif",
+};
+const MAX_UPLOAD_BYTES = 12 * 1024 * 1024;
+
+function extFor(mime: string, originalName: string): string {
+  const fromMime = Object.keys(IMAGE_TYPES).find((e) => IMAGE_TYPES[e] === mime);
+  if (fromMime) return fromMime;
+  const m = originalName.toLowerCase().match(/\.[a-z0-9]{3,4}$/);
+  return m && IMAGE_TYPES[m[0]] ? m[0] : ".jpg";
+}
+
 // ---------------------------------------------------------------- webhooks
 const ALL_EVENTS = [
   "deal.created",
@@ -115,6 +133,20 @@ const server = Bun.serve({
     const url = new URL(req.url);
     const path = url.pathname;
     const method = req.method;
+
+    // ---- captured photos, served from the uploads dir (not public/)
+    if (path.startsWith("/uploads/")) {
+      const name = path.slice("/uploads/".length);
+      if (!name || name.includes("/") || name.includes("..")) {
+        return new Response("not found", { status: 404 });
+      }
+      const f = Bun.file(`${UPLOAD_DIR}/${name}`);
+      if (!(await f.exists())) return new Response("not found", { status: 404 });
+      const ext = name.toLowerCase().match(/\.[a-z0-9]+$/)?.[0] || "";
+      return new Response(f, {
+        headers: { "Content-Type": IMAGE_TYPES[ext] || "application/octet-stream" },
+      });
+    }
 
     // ---- static files
     if (path === "/" || !path.startsWith("/api/")) {
@@ -447,6 +479,100 @@ const server = Bun.serve({
         fireWebhooks("task.completed", updated as any);
       }
       return json({ task: updated });
+    }
+
+    // ---- captures: business-card / client-note photos
+    if (path === "/api/captures" && method === "GET") {
+      const rows = db
+        .query(
+          `SELECT c.*, ct.name AS contact_name FROM captures c
+           LEFT JOIN contacts ct ON ct.id = c.contact_id
+           ORDER BY c.id DESC`
+        )
+        .all();
+      return json({ captures: rows });
+    }
+    if (path === "/api/captures" && method === "POST") {
+      let form: FormData;
+      try {
+        form = await req.formData();
+      } catch {
+        return json({ error: "expected multipart form data" }, 400);
+      }
+      const files = form.getAll("photos").filter((f) => f instanceof File) as File[];
+      if (!files.length) return json({ error: "no photos uploaded" }, 400);
+      const saved: any[] = [];
+      const errors: string[] = [];
+      for (const file of files) {
+        if (!file.type.startsWith("image/")) {
+          errors.push(`${file.name || "file"}: not an image`);
+          continue;
+        }
+        if (file.size > MAX_UPLOAD_BYTES) {
+          errors.push(`${file.name || "file"}: over 12 MB`);
+          continue;
+        }
+        const filename = `${crypto.randomUUID().replace(/-/g, "")}${extFor(file.type, file.name)}`;
+        try {
+          await Bun.write(`${UPLOAD_DIR}/${filename}`, file);
+        } catch (e) {
+          errors.push(`${file.name || "file"}: ${(e as Error).message}`);
+          continue;
+        }
+        const r = db
+          .prepare(
+            "INSERT INTO captures (filename, original_name, mime, size) VALUES (?, ?, ?, ?)"
+          )
+          .run(filename, file.name || "", file.type, file.size);
+        saved.push(
+          db.query("SELECT * FROM captures WHERE id = ?").get(Number(r.lastInsertRowid))
+        );
+      }
+      if (saved.length) {
+        logActivity(
+          "note",
+          `Captured ${saved.length} photo${saved.length === 1 ? "" : "s"} (business card / notes)`
+        );
+      }
+      return json({ captures: saved, errors }, 201);
+    }
+    const captureId = path.match(/^\/api\/captures\/(\d+)$/);
+    if (captureId && method === "PATCH") {
+      const b = await readBody(req);
+      const sets: string[] = [];
+      const vals: unknown[] = [];
+      if (b.note !== undefined) {
+        sets.push("note = ?");
+        vals.push(b.note);
+      }
+      if (b.contact_id !== undefined) {
+        sets.push("contact_id = ?");
+        vals.push(b.contact_id === "" || b.contact_id === null ? null : Number(b.contact_id));
+      }
+      if (sets.length) {
+        db.prepare(`UPDATE captures SET ${sets.join(", ")} WHERE id = ?`)
+          .run(...vals, Number(captureId[1]));
+      }
+      return json({
+        capture: db
+          .query(
+            `SELECT c.*, ct.name AS contact_name FROM captures c
+             LEFT JOIN contacts ct ON ct.id = c.contact_id WHERE c.id = ?`
+          )
+          .get(Number(captureId[1])),
+      });
+    }
+    if (captureId && method === "DELETE") {
+      const row = db
+        .query("SELECT * FROM captures WHERE id = ?")
+        .get(Number(captureId[1])) as any;
+      if (row) {
+        try {
+          await Bun.$`rm -f ${UPLOAD_DIR}/${row.filename}`.quiet();
+        } catch {}
+        db.prepare("DELETE FROM captures WHERE id = ?").run(row.id);
+      }
+      return json({ ok: true });
     }
 
     // ---- stage colors for the frontend

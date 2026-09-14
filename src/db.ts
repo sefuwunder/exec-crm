@@ -101,6 +101,16 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS captures (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  filename TEXT NOT NULL,
+  original_name TEXT DEFAULT '',
+  mime TEXT DEFAULT '',
+  size INTEGER DEFAULT 0,
+  note TEXT DEFAULT '',
+  contact_id INTEGER REFERENCES contacts(id),
+  created_at TEXT DEFAULT (datetime('now'))
+);
 `;
 
 export function openDb(path: string): Database {

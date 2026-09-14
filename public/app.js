@@ -2,8 +2,8 @@
 const $ = (s, el = document) => el.querySelector(s);
 const view = $("#view");
 const TITLES = {
-  dashboard: "Dashboard", pipeline: "Pipeline", contacts: "Contacts",
-  companies: "Companies", tasks: "Tasks", automations: "Automations",
+  dashboard: "Dashboard", feed: "Daily Feed", pipeline: "Pipeline", contacts: "Contacts",
+  companies: "Companies", tasks: "Tasks", captures: "Captures", automations: "Automations",
 };
 $("#today").textContent = new Date(Date.now()).toLocaleDateString(undefined, {
   weekday: "long", year: "numeric", month: "long", day: "numeric",
@@ -546,24 +546,9 @@ async function vTasks() {
       <button class="btn" id="new-task">+ New task</button>
     </div>
     <div class="panel">
-      ${tasks.map((t) => `
-        <div class="task ${t.done ? "done" : ""}">
-          <input type="checkbox" data-id="${t.id}" ${t.done ? "checked" : ""}>
-          <div><div class="tt">${esc(t.title)}</div>
-            <div class="meta">${t.deal_title ? esc(t.deal_title) + " · " : ""}${t.due_date ? "due " + esc(t.due_date) + " · " : ""}${esc(t.owner)}</div></div>
-          <div class="spacer"></div>
-          <button class="btn ghost small" data-edit="${t.id}">Edit</button>
-        </div>`).join("") || `<div class="empty">All clear.</div>`}
+      ${tasks.map(taskRow).join("") || `<div class="empty">All clear.</div>`}
     </div>`;
-  document.querySelectorAll('.task input[type="checkbox"]').forEach((cb) => {
-    cb.onchange = async () => { await POST(`/api/tasks/${cb.dataset.id}/toggle`); route(); };
-  });
-  document.querySelectorAll("[data-edit]").forEach((b) => {
-    b.onclick = () => {
-      const t = tasks.find((x) => x.id === Number(b.dataset.edit));
-      if (t) editTaskModal(t, deals);
-    };
-  });
+  wireTaskRows(tasks, deals);
   $("#new-task").onclick = () =>
     openModal("New task", `
       ${field("Title", input("title"))}
@@ -573,6 +558,156 @@ async function vTasks() {
       </div>
       ${field("Owner", input("owner", "You"))}`,
       async (d) => { if (!d.deal_id) delete d.deal_id; await POST("/api/tasks", d); route(); }, "Create task");
+}
+
+/* shared task row + wiring (used by Tasks and Daily Feed) */
+function taskRow(t) {
+  return `<div class="task ${t.done ? "done" : ""}">
+    <input type="checkbox" data-id="${t.id}" ${t.done ? "checked" : ""}>
+    <div><div class="tt">${esc(t.title)}</div>
+      <div class="meta">${t.deal_title ? esc(t.deal_title) + " · " : ""}${t.due_date ? "due " + esc(t.due_date) + " · " : ""}${esc(t.owner)}</div></div>
+    <div class="spacer"></div>
+    <button class="btn ghost small" data-edit="${t.id}">Edit</button>
+  </div>`;
+}
+function wireTaskRows(tasks, deals) {
+  document.querySelectorAll('#view .task input[type="checkbox"]').forEach((cb) => {
+    cb.onchange = async () => { await POST(`/api/tasks/${cb.dataset.id}/toggle`); route(); };
+  });
+  document.querySelectorAll("#view [data-edit]").forEach((b) => {
+    b.onclick = () => {
+      const t = tasks.find((x) => x.id === Number(b.dataset.edit));
+      if (t) editTaskModal(t, deals);
+    };
+  });
+}
+
+const toISODate = (d) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+/* ---------- daily feed: what needs you today ---------- */
+async function vFeed() {
+  const [{ tasks }, { deals }] = await Promise.all([GET("/api/tasks"), GET("/api/deals")]);
+  const now = new Date();
+  const today = toISODate(now);
+  const plus7 = toISODate(new Date(now.getTime() + 7 * 86400000));
+  const h = now.getHours();
+  const greet = h < 5 ? "Still up" : h < 12 ? "Good morning" : h < 17 ? "Good afternoon" : "Good evening";
+  const byDue = (a, b) => (a.due_date || "9999").localeCompare(b.due_date || "9999");
+
+  const open = tasks.filter((t) => !t.done);
+  const overdue = open.filter((t) => t.due_date && t.due_date < today).sort(byDue);
+  const todayTasks = open.filter((t) => !t.due_date || t.due_date === today).sort(byDue);
+  const upcoming = open.filter((t) => t.due_date > today && t.due_date <= plus7).sort(byDue);
+  const closing = deals
+    .filter((d) => !["closed_won", "closed_lost"].includes(d.stage) && d.expected_close >= today && d.expected_close <= plus7)
+    .sort((a, b) => a.expected_close.localeCompare(b.expected_close));
+  const needYou = overdue.length + todayTasks.length;
+
+  const section = (title, rows, emptyMsg) => `
+    <div class="panel"><h2>${title} <span class="count">${rows.length}</span></h2>
+      ${rows.length ? rows.map(taskRow).join("") : `<div class="empty">${emptyMsg}</div>`}
+    </div>`;
+
+  view.innerHTML = `
+    <div class="feed-head">
+      <div>
+        <div class="feed-greet">${greet}</div>
+        <div class="feed-sub">${now.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })} ·
+          ${needYou ? `<b>${needYou}</b> thing${needYou === 1 ? "" : "s"} need${needYou === 1 ? "s" : ""} you today` : "nothing due — clear runway"}</div>
+      </div>
+      <div class="feed-add">
+        <input id="qa-title" placeholder="Quick add a task for today…" autocomplete="off">
+        <button class="btn" id="qa-add">Add</button>
+      </div>
+    </div>
+    <div class="cols2">
+      <div>
+        ${section("Overdue", overdue, "Nothing overdue. Nice.")}
+        ${section("Today", todayTasks, "Nothing due today.")}
+        ${section("Coming up", upcoming, "Nothing on the horizon.")}
+      </div>
+      <div class="panel"><h2>Closing this week <span class="count">${closing.length}</span></h2>
+        ${closing.length ? closing.map((d) => `
+          <div class="activity"><div class="dot" style="background:${stageColor(d.stage)}"></div>
+            <div class="text"><b>${esc(d.title)}</b> · ${esc(d.company_name || "")}<br>
+            <span style="color:var(--text-3);font-size:12.5px">${money(d.value)} · ${d.probability}% · closes ${esc(d.expected_close)}</span></div>
+          </div>`).join("") : `<div class="empty">No deals closing in the next 7 days.</div>`}
+      </div>
+    </div>`;
+  wireTaskRows(tasks, deals);
+
+  const add = async () => {
+    const title = $("#qa-title").value.trim();
+    if (!title) return;
+    await POST("/api/tasks", { title, due_date: today, owner: "You" });
+    route();
+  };
+  $("#qa-add").onclick = add;
+  $("#qa-title").addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
+}
+
+/* ---------- captures: business cards & client notes ---------- */
+async function vCaptures() {
+  const [{ captures }, { contacts }] = await Promise.all([GET("/api/captures"), GET("/api/contacts")]);
+  view.innerHTML = `
+    <div class="toolbar">
+      <span style="color:var(--text-2)">${captures.length} captured</span>
+      <div class="spacer"></div>
+      <label class="btn" for="cap-files" style="cursor:pointer">📷 Take photo / Upload</label>
+      <input type="file" id="cap-files" accept="image/*" capture="environment" multiple hidden>
+    </div>
+    <div id="cap-status"></div>
+    <div class="caps-grid">
+      ${captures.map((c) => `
+        <div class="cap-card">
+          <a href="/uploads/${esc(c.filename)}" target="_blank" rel="noopener"><img src="/uploads/${esc(c.filename)}" alt="${esc(c.original_name || "capture")}" loading="lazy"></a>
+          <div class="cap-body">
+            <div class="cap-note">${c.note ? esc(c.note) : `<span style="color:var(--text-3)">No note yet</span>`}</div>
+            <div class="cap-meta">${c.contact_name ? "👤 " + esc(c.contact_name) : "Not linked"} · ${esc((c.created_at || "").slice(0, 16).replace("T", " "))}</div>
+            <div class="cap-actions">
+              <button class="btn ghost small" data-cap-edit="${c.id}">Edit</button>
+              <button class="btn danger small" data-cap-del="${c.id}">Delete</button>
+            </div>
+          </div>
+        </div>`).join("") || `<div class="empty">No captures yet — snap a business card or a page of client notes.</div>`}
+    </div>`;
+
+  $("#cap-files").onchange = async (e) => {
+    const files = [...e.target.files];
+    if (!files.length) return;
+    const fd = new FormData();
+    files.forEach((f) => fd.append("photos", f));
+    $("#cap-status").innerHTML = `<div class="empty">Uploading ${files.length} photo${files.length === 1 ? "" : "s"}…</div>`;
+    try {
+      const res = await fetch("/api/captures", { method: "POST", body: fd });
+      const r = await res.json();
+      if (!res.ok) throw new Error(r.error || "upload failed");
+      if (r.errors && r.errors.length) alert("Some files were skipped:\n" + r.errors.join("\n"));
+      route();
+    } catch (err) {
+      $("#cap-status").innerHTML = `<div class="empty">Upload failed: ${esc(err.message)}</div>`;
+    }
+  };
+  document.querySelectorAll("[data-cap-edit]").forEach((b) => {
+    b.onclick = () => {
+      const c = captures.find((x) => x.id === Number(b.dataset.capEdit));
+      if (c) editCaptureModal(c, contacts);
+    };
+  });
+  document.querySelectorAll("[data-cap-del]").forEach((b) => {
+    b.onclick = async () => {
+      if (confirm("Delete this capture?")) { await DEL(`/api/captures/${b.dataset.capDel}`); route(); }
+    };
+  });
+}
+
+function editCaptureModal(c, contacts) {
+  openModal("Edit capture", `
+    <div class="cap-edit-img"><img src="/uploads/${esc(c.filename)}" alt=""></div>
+    ${field("Note", `<textarea name="note" rows="3">${esc(c.note || "")}</textarea>`)}
+    ${field("Link to contact", select("contact_id", [["", "—"]].concat(contacts.map((x) => [x.id, x.name + (x.company_name ? " · " + x.company_name : "")])), c.contact_id || ""))}`,
+    async (d) => { await PATCH(`/api/captures/${c.id}`, d); route(); }, "Save");
 }
 
 function editTaskModal(t, deals) {
@@ -709,8 +844,8 @@ function initPalette() {
   async function buildItems() {
     if (cache) return cache;
     const NAV = [
-      ["Dashboard", "#/dashboard"], ["Pipeline", "#/pipeline"], ["Contacts", "#/contacts"],
-      ["Companies", "#/companies"], ["Tasks", "#/tasks"], ["Automations", "#/automations"],
+      ["Dashboard", "#/dashboard"], ["Daily Feed", "#/feed"], ["Pipeline", "#/pipeline"], ["Contacts", "#/contacts"],
+      ["Companies", "#/companies"], ["Tasks", "#/tasks"], ["Captures", "#/captures"], ["Automations", "#/automations"],
     ];
     const out = NAV.map(([label, hash]) => ({
       group: "Go to", kind: "view", label,
@@ -807,8 +942,8 @@ async function route() {
   $("#page-title").textContent = TITLES[name];
   view.innerHTML = `<div class="empty">Loading…</div>`;
   try {
-    await { dashboard: vDashboard, pipeline: vPipeline, contacts: vContacts,
-      companies: vCompanies, tasks: vTasks, automations: vAutomations }[name]();
+    await { dashboard: vDashboard, feed: vFeed, pipeline: vPipeline, contacts: vContacts,
+      companies: vCompanies, tasks: vTasks, captures: vCaptures, automations: vAutomations }[name]();
   } catch (e) {
     view.innerHTML = `<div class="empty">Failed to load: ${esc(e.message)}</div>`;
   }

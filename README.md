@@ -21,6 +21,11 @@ Data lives in `./crm.db` (created + seeded on first run). Override with `CRM_DB`
   tasks; pipeline-by-stage bars; deals closing soon; activity feed.
 - **Pipeline** — kanban board, drag cards between stages (fires webhooks).
 - **Contacts / Companies / Tasks** — search, create, complete.
+- **Daily Feed** — overdue, today's, and upcoming todos plus deals closing
+  this week, with quick-add.
+- **Captures** — snap or upload photos of business cards and client notes
+  (`capture="environment"` opens the camera on mobile); add a note and link
+  each photo to a contact.
 - **Automations** — manage both webhook directions, test endpoints, see a
   delivery log.
 
@@ -55,6 +60,11 @@ fan out to outgoing webhooks, so chains compose.
 
 `GET /api/kpis` · `GET|POST /api/deals` · `PATCH|DELETE /api/deals/:id` ·
 `GET|POST /api/contacts` · `GET|POST /api/companies` · `GET|POST /api/tasks` ·
-`POST /api/tasks/:id/toggle` · `GET /api/activities` · `GET|POST|DELETE
-/api/webhooks` · `POST /api/webhooks/:id/test` · `GET /api/deliveries` ·
-`GET|POST /api/hooks` · `DELETE /api/hooks/:id` · `POST /api/hooks/in/:key`
+`POST /api/tasks/:id/toggle` · `GET /api/activities` · `GET /api/webhooks` ·
+`POST /api/webhooks/:id/test` · `GET /api/deliveries` · `GET|POST /api/hooks` ·
+`DELETE /api/hooks/:id` · `POST /api/hooks/in/:key` ·
+`GET|POST /api/captures` (multipart `photos[]`) · `PATCH|DELETE /api/captures/:id` ·
+`GET /uploads/:file`
+
+Captured photos land in `./uploads/` (created on boot; override with
+`CRM_UPLOADS`). Images only, 12 MB max each.

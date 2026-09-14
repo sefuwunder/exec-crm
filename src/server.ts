@@ -514,23 +514,23 @@ const server = Bun.serve({
 
     // ---- tasks
     if (path === "/api/tasks" && method === "GET") {
-      const rows = attachCustom(
-        "task",
-        db
-          .query(
-            `SELECT t.*, d.title AS deal_title FROM tasks t
-             LEFT JOIN deals d ON d.id = t.deal_id
-             ORDER BY t.done, t.due_date`
-          )
-          .all() as any[]
-      );
+      const cid = url.searchParams.get("campaign_id");
+      let q = `SELECT t.*, d.title AS deal_title FROM tasks t
+             LEFT JOIN deals d ON d.id = t.deal_id`;
+      const params: unknown[] = [];
+      if (cid) {
+        q += ` WHERE t.campaign_id = ?`;
+        params.push(Number(cid));
+      }
+      q += ` ORDER BY t.done, t.due_date`;
+      const rows = attachCustom("task", db.query(q).all(...params) as any[]);
       return json({ tasks: rows });
     }
     if (path === "/api/tasks" && method === "POST") {
       const b = await readBody(req);
       const r = db
-        .prepare("INSERT INTO tasks (title, deal_id, due_date, owner) VALUES (?, ?, ?, ?)")
-        .run(b.title || "Untitled task", b.deal_id || null, b.due_date || "", b.owner || "");
+        .prepare("INSERT INTO tasks (title, deal_id, campaign_id, due_date, owner) VALUES (?, ?, ?, ?, ?)")
+        .run(b.title || "Untitled task", b.deal_id || null, b.campaign_id || null, b.due_date || "", b.owner || "");
       const id = Number(r.lastInsertRowid);
       saveCustomValues("task", id, b.custom);
       const task = attachCustom("task", [
@@ -544,10 +544,10 @@ const server = Bun.serve({
       const b = await readBody(req);
       const sets: string[] = [];
       const vals: unknown[] = [];
-      for (const k of ["title", "deal_id", "due_date", "owner"]) {
+      for (const k of ["title", "deal_id", "campaign_id", "due_date", "owner"]) {
         if (b[k] !== undefined) {
           sets.push(`${k} = ?`);
-          vals.push(k === "deal_id" && b[k] === "" ? null : b[k]);
+          vals.push((k === "deal_id" || k === "campaign_id") && b[k] === "" ? null : b[k]);
         }
       }
       if (sets.length) {
@@ -559,6 +559,15 @@ const server = Bun.serve({
         db.query("SELECT * FROM tasks WHERE id = ?").get(Number(taskId[1])) as any,
       ])[0];
       return json({ task: updatedTask });
+    }
+    if (taskId && method === "DELETE") {
+      const t = db.query("SELECT * FROM tasks WHERE id = ?").get(Number(taskId[1])) as any;
+      if (t) {
+        db.prepare("DELETE FROM custom_values WHERE entity = 'task' AND record_id = ?").run(t.id);
+        db.prepare("DELETE FROM tasks WHERE id = ?").run(t.id);
+        fireWebhooks("task.deleted", { id: t.id, title: t.title });
+      }
+      return json({ ok: true });
     }
     const taskToggle = path.match(/^\/api\/tasks\/(\d+)\/toggle$/);
     if (taskToggle && method === "POST") {
@@ -754,6 +763,35 @@ const server = Bun.serve({
           Number(b.budget) || 0, b.notes || "");
       const id = Number(r.lastInsertRowid);
       saveCustomValues("campaign", id, b.custom);
+      // autopopulate the standard sales workflow (beginning -> closing)
+      const base = b.start_date || new Date().toISOString().slice(0, 10);
+      const dueFor = (offset: number) => {
+        const d = new Date(base + "T12:00:00");
+        d.setDate(d.getDate() + offset);
+        return d.toISOString().slice(0, 10);
+      };
+      const WORKFLOW: [string, number][] = [
+        ["Define ICP & target account list", 0],
+        ["Build & enrich prospect list", 2],
+        ["Launch outreach sequence", 4],
+        ["Book discovery calls", 7],
+        ["Run discovery & qualify", 10],
+        ["Deliver tailored demo", 14],
+        ["Send proposal", 17],
+        ["Proposal follow-up", 21],
+        ["Negotiate terms", 25],
+        ["Send contract", 28],
+        ["Contract signed", 32],
+        ["Handoff to onboarding", 35],
+        ["Post-close check-in", 65],
+      ];
+      const insTask = db.prepare(
+        "INSERT INTO tasks (title, campaign_id, due_date, owner) VALUES (?, ?, ?, ?)"
+      );
+      for (const [title, offset] of WORKFLOW) {
+        insTask.run(title, id, dueFor(offset), "");
+      }
+      logActivity("note", `Autopopulated ${WORKFLOW.length} workflow tasks for campaign "${b.name || "Untitled campaign"}"`);
       const campaign = attachCustom("campaign", [db.query("SELECT * FROM campaigns WHERE id = ?").get(id) as any])[0];
       logActivity("note", `Created campaign "${campaign.name}"`);
       fireWebhooks("campaign.created", campaign);
@@ -780,6 +818,7 @@ const server = Bun.serve({
       const c = db.query("SELECT * FROM campaigns WHERE id = ?").get(Number(campaignId[1])) as any;
       if (c) {
         db.prepare("DELETE FROM custom_values WHERE entity = 'campaign' AND record_id = ?").run(c.id);
+        db.prepare("UPDATE tasks SET campaign_id = NULL WHERE campaign_id = ?").run(c.id);
         db.prepare("DELETE FROM campaigns WHERE id = ?").run(c.id);
         fireWebhooks("campaign.deleted", { id: c.id, name: c.name });
       }

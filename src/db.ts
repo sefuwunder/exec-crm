@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   title TEXT NOT NULL,
   deal_id INTEGER REFERENCES deals(id),
+  campaign_id INTEGER REFERENCES campaigns(id),
   due_date TEXT DEFAULT '',
   done INTEGER DEFAULT 0,
   owner TEXT DEFAULT '',
@@ -147,6 +148,13 @@ export function openDb(path: string): Database {
   const db = new Database(path, { create: true });
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec(SCHEMA);
+  // migration: tasks gained campaign_id after the schema-editor release.
+  // The index is created here (not in SCHEMA) so old DBs get the column first.
+  const taskCols = db.query("PRAGMA table_info(tasks)").all() as any[];
+  if (!taskCols.some((c) => c.name === "campaign_id")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN campaign_id INTEGER REFERENCES campaigns(id)");
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_campaign ON tasks(campaign_id)");
   return db;
 }
 

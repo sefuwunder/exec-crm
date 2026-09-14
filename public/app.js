@@ -3,7 +3,7 @@ const $ = (s, el = document) => el.querySelector(s);
 const view = $("#view");
 const TITLES = {
   dashboard: "Dashboard", feed: "Daily Feed", pipeline: "Pipeline", contacts: "Contacts",
-  companies: "Companies", campaigns: "Campaigns", tasks: "Tasks", captures: "Captures",
+  companies: "Companies", campaigns: "Campaigns", captures: "Captures",
   automations: "Automations", schema: "Schema",
 };
 $("#today").textContent = new Date(Date.now()).toLocaleDateString(undefined, {
@@ -147,7 +147,7 @@ function makeEditable(td, kind, opts, onSave) {
     td.innerHTML = "";
     td.appendChild(el);
     el.focus();
-    if (el.select) el.select();
+    if ((kind === "text" || kind === "email") && el.select) el.select();
     let done = false;
     const cancel = () => {
       if (done) return;
@@ -179,7 +179,7 @@ function makeEditable(td, kind, opts, onSave) {
       else if (e.key === "Escape") { e.preventDefault(); cancel(); }
     });
     el.addEventListener("blur", () => commit());
-    if (kind === "select") el.addEventListener("change", () => commit());
+    if (kind === "select" || kind === "date") el.addEventListener("change", () => commit());
   };
 }
 
@@ -725,10 +725,7 @@ async function vCampaigns() {
         <td><b>${money(c.budget)}</b></td></tr>`).join("")}
     </table>${campaigns.length ? "" : `<div class="empty">No campaigns yet — launch your first one.</div>`}</div>`;
   document.querySelectorAll("#view tr.clickable").forEach((tr) => {
-    tr.onclick = () => {
-      const c = campaigns.find((x) => x.id === Number(tr.dataset.id));
-      if (c) editCampaignModal(c);
-    };
+    tr.onclick = () => { location.hash = `#/campaigns/${tr.dataset.id}`; };
   });
   $("#new-campaign").onclick = async () => {
     const fields = await getSchemaFields("campaign");
@@ -742,7 +739,10 @@ async function vCampaigns() {
       </div>
       ${field("Notes", `<textarea name="notes" rows="3"></textarea>`)}
       ${cfFieldsHtml(fields)}`,
-      async (d) => { await POST("/api/campaigns", d); route(); }, "Create campaign");
+      async (d) => {
+        const { campaign } = await POST("/api/campaigns", d);
+        location.hash = `#/campaigns/${campaign.id}`;
+      }, "Create campaign");
   };
 }
 
@@ -761,39 +761,144 @@ async function editCampaignModal(c) {
     <div style="margin-top:14px"><button class="btn danger small" id="m-delete">Delete campaign</button></div>`,
     async (d) => { await PATCH(`/api/campaigns/${c.id}`, d); route(); }, "Save changes");
   $("#m-delete").onclick = async () => {
-    if (confirm(`Delete campaign "${c.name}"?`)) { await DEL(`/api/campaigns/${c.id}`); $("#modal-root").innerHTML = ""; route(); }
+    if (confirm(`Delete campaign "${c.name}"?`)) {
+      await DEL(`/api/campaigns/${c.id}`);
+      $("#modal-root").innerHTML = "";
+      location.hash = "#/campaigns";
+    }
   };
 }
 
-async function vTasks() {
-  const { tasks } = await GET("/api/tasks");
-  const { deals } = await GET("/api/deals");
+/* ---------- campaign detail: workflow task spreadsheet + widgets ---------- */
+async function vCampaignDetail(id) {
+  const [{ campaigns }, { tasks }, { deals }] = await Promise.all([
+    GET("/api/campaigns"),
+    GET(`/api/tasks?campaign_id=${id}`),
+    GET("/api/deals"),
+  ]);
+  const c = campaigns.find((x) => x.id === id);
+  if (!c) {
+    view.innerHTML = `<div class="empty">Campaign not found. <a href="#/campaigns">Back to campaigns</a>.</div>`;
+    return;
+  }
+  renderCampaignDetail(c, tasks, deals);
+}
+
+async function refreshCampaignDetail(c, deals) {
+  const { tasks } = await GET(`/api/tasks?campaign_id=${c.id}`);
+  renderCampaignDetail(c, tasks, deals);
+}
+
+function renderCampaignDetail(c, tasks, deals) {
+  const today = toISODate(new Date());
   const open = tasks.filter((t) => !t.done);
+  const done = tasks.filter((t) => t.done);
+  const overdue = open.filter((t) => t.due_date && t.due_date < today);
+  const pct = tasks.length ? Math.round((done.length / tasks.length) * 100) : 0;
+  const next = open.filter((t) => t.due_date).sort((a, b) => a.due_date.localeCompare(b.due_date))[0];
+  const sorted = [...tasks].sort((a, b) =>
+    (a.done - b.done) || (a.due_date || "9999").localeCompare(b.due_date || "9999") || (a.id - b.id));
+  const R = 26, CIRC = 2 * Math.PI * R;
   view.innerHTML = `
     <div class="toolbar">
-      <span style="color:var(--text-2)">${open.length} open</span>
+      <a href="#/campaigns" class="btn ghost small">← Campaigns</a>
       <div class="spacer"></div>
-      <button class="btn" id="new-task">+ New task</button>
+      <button class="btn ghost" id="edit-campaign">Edit campaign</button>
     </div>
-    <div class="panel">
-      ${tasks.map(taskRow).join("") || `<div class="empty">All clear.</div>`}
-    </div>`;
-  wireTaskRows(tasks, deals);
-  $("#new-task").onclick = async () => {
-    const fields = await getSchemaFields("task");
-    openModal("New task", `
-      ${field("Title", input("title"))}
-      <div class="formgrid">
-        ${field("Related deal", select("deal_id", [["", "—"]].concat(deals.filter((d) => !["closed_won", "closed_lost"].includes(d.stage)).map((d) => [d.id, d.title]))))}
-        ${field("Due date", input("due_date", "", "date"))}
+    <div class="panel camp-head">
+      <div>
+        <h2 style="margin:0 0 8px">${esc(c.name)}</h2>
+        <div class="camp-meta">${statusPill(c.status)}
+          <span>📅 ${esc(c.start_date) || "—"} → ${esc(c.end_date) || "—"}</span>
+          <span>💰 <b>${money(c.budget)}</b></span>
+        </div>
+        ${c.notes ? `<p class="camp-notes">${esc(c.notes)}</p>` : ""}
       </div>
-      ${field("Owner", input("owner", "You"))}
-      ${cfFieldsHtml(fields)}`,
-      async (d) => { if (!d.deal_id) delete d.deal_id; await POST("/api/tasks", d); route(); }, "Create task");
+    </div>
+    <div class="widgets">
+      <div class="widget">
+        <svg viewBox="0 0 64 64" class="ring" aria-label="${pct}% complete">
+          <circle cx="32" cy="32" r="${R}" class="ring-bg"></circle>
+          <circle cx="32" cy="32" r="${R}" class="ring-fg"
+            stroke-dasharray="${(pct / 100 * CIRC).toFixed(1)} ${CIRC.toFixed(1)}"></circle>
+        </svg>
+        <div><div class="w-num">${pct}%</div><div class="w-label">complete</div></div>
+      </div>
+      <div class="widget"><div><div class="w-num">${open.length}</div><div class="w-label">open</div></div></div>
+      <div class="widget"><div><div class="w-num" style="color:#e5484d">${overdue.length}</div><div class="w-label">overdue</div></div></div>
+      <div class="widget"><div><div class="w-num" style="color:#18a058">${done.length}</div><div class="w-label">done</div></div></div>
+      ${next ? `<div class="widget wide"><div><div class="w-label">next up</div>
+        <div class="w-next">${esc(next.title)}</div><div class="w-due">due ${esc(next.due_date)}</div></div></div>` : ""}
+    </div>
+    <div class="panel sheet-wrap">
+      <div class="sheet-head">
+        <h3 style="margin:0">Workflow tasks</h3>
+        <button class="btn small" id="add-task">+ Add task</button>
+      </div>
+      <table class="sheet">
+        <thead><tr>
+          <th class="c-done"></th><th>Task</th><th>Owner</th><th>Due</th><th></th><th></th>
+        </tr></thead>
+        <tbody>
+          ${sorted.map((t) => `<tr class="${t.done ? "is-done" : ""}">
+            <td class="c-done"><input type="checkbox" data-toggle="${t.id}" ${t.done ? "checked" : ""} aria-label="Done"></td>
+            <td data-tid="${t.id}" data-f="title">${esc(t.title)}</td>
+            <td data-tid="${t.id}" data-f="owner">${esc(t.owner) || "—"}</td>
+            <td data-tid="${t.id}" data-f="due_date">${esc(t.due_date) || "—"}</td>
+            <td class="rowact"><button class="btn ghost small" data-edit="${t.id}">Edit</button></td>
+            <td class="rowact"><button class="btn ghost small danger-text" data-del="${t.id}" aria-label="Delete task">✕</button></td>
+          </tr>`).join("")}
+        </tbody>
+      </table>
+      ${tasks.length ? "" : `<div class="empty">No tasks yet — add the first step.</div>`}
+    </div>`;
+  $("#edit-campaign").onclick = () => editCampaignModal(c);
+  // inline cell editing
+  document.querySelectorAll("#view td[data-f]").forEach((td) => {
+    const t = tasks.find((x) => x.id === Number(td.dataset.tid));
+    const f = td.dataset.f;
+    if (!t) return;
+    makeEditable(td, f === "due_date" ? "date" : "text", { value: t[f] || "" }, async (v) => {
+      if (f === "title" && !v) return false;
+      await PATCH(`/api/tasks/${t.id}`, { [f]: v });
+      t[f] = v;
+      return esc(v) || "—";
+    });
+  });
+  // done toggles
+  document.querySelectorAll('#view input[data-toggle]').forEach((cb) => {
+    cb.onchange = async () => {
+      await POST(`/api/tasks/${cb.dataset.toggle}/toggle`);
+      refreshCampaignDetail(c, deals);
+    };
+  });
+  // full edit (custom fields)
+  document.querySelectorAll("#view [data-edit]").forEach((b) => {
+    b.onclick = () => {
+      const t = tasks.find((x) => x.id === Number(b.dataset.edit));
+      if (t) editTaskModal(t, deals);
+    };
+  });
+  // delete row
+  document.querySelectorAll("#view [data-del]").forEach((b) => {
+    b.onclick = async () => {
+      const t = tasks.find((x) => x.id === Number(b.dataset.del));
+      if (t && confirm(`Delete task "${t.title}"?`)) {
+        await DEL(`/api/tasks/${t.id}`);
+        refreshCampaignDetail(c, deals);
+      }
+    };
+  });
+  // add row
+  $("#add-task").onclick = async () => {
+    const { task } = await POST("/api/tasks", { title: "New task", campaign_id: c.id });
+    await refreshCampaignDetail(c, deals);
+    const td = document.querySelector(`#view td[data-tid="${task.id}"][data-f="title"]`);
+    if (td) td.click();
   };
 }
 
-/* shared task row + wiring (used by Tasks and Daily Feed) */
+/* shared task row + wiring (used by Daily Feed and campaign detail) */
 function taskRow(t) {
   return `<div class="task ${t.done ? "done" : ""}">
     <input type="checkbox" data-id="${t.id}" ${t.done ? "checked" : ""}>
@@ -1184,7 +1289,7 @@ function initPalette() {
     if (cache) return cache;
     const NAV = [
       ["Dashboard", "#/dashboard"], ["Daily Feed", "#/feed"], ["Pipeline", "#/pipeline"], ["Contacts", "#/contacts"],
-      ["Companies", "#/companies"], ["Campaigns", "#/campaigns"], ["Tasks", "#/tasks"], ["Captures", "#/captures"],
+      ["Companies", "#/companies"], ["Campaigns", "#/campaigns"], ["Captures", "#/captures"],
       ["Automations", "#/automations"], ["Schema", "#/schema"],
     ];
     const out = NAV.map(([label, hash]) => ({
@@ -1275,18 +1380,24 @@ function initPalette() {
 /* ---------- router ---------- */
 async function route() {
   const [hash] = location.hash.split("?");
-  const r = (hash.replace("#/", "") || "dashboard").split("/")[0];
+  const parts = (hash.replace("#/", "") || "dashboard").split("/");
+  const r = parts[0];
   const name = TITLES[r] ? r : "dashboard";
   document.querySelectorAll("#nav a").forEach((a) =>
     a.classList.toggle("active", a.dataset.r === name));
-  $("#page-title").textContent = TITLES[name];
   view.innerHTML = `<div class="skel" style="height:34px;max-width:300px;margin-bottom:18px"></div>
     <div class="skel" style="height:120px;margin-bottom:16px"></div>
     <div class="skel" style="height:220px"></div>`;
   try {
-    await { dashboard: vDashboard, feed: vFeed, pipeline: vPipeline, contacts: vContacts,
-      companies: vCompanies, campaigns: vCampaigns, tasks: vTasks, captures: vCaptures,
-      automations: vAutomations, schema: vSchema }[name]();
+    if (name === "campaigns" && parts[1]) {
+      $("#page-title").textContent = "Campaign";
+      await vCampaignDetail(Number(parts[1]));
+    } else {
+      $("#page-title").textContent = TITLES[name];
+      await { dashboard: vDashboard, feed: vFeed, pipeline: vPipeline, contacts: vContacts,
+        companies: vCompanies, campaigns: vCampaigns, captures: vCaptures,
+        automations: vAutomations, schema: vSchema }[name]();
+    }
   } catch (e) {
     view.innerHTML = `<div class="empty">Failed to load: ${esc(e.message)}</div>`;
   }

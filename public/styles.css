@@ -175,6 +175,16 @@ tr:last-child td { border-bottom: none; }
 tbody tr:hover td { background: #f8fafd; }
 tr.clickable { cursor: pointer; }
 
+/* click-to-edit table cells */
+td.editable { cursor: text; }
+tbody tr:hover td.editable { background: #eaf0fd; }
+.cell-edit { box-sizing: border-box; width: 100%; padding: 6px 8px; font-size: 13.5px; }
+@keyframes cellFlash { 0% { background: #dbe7ff; } 100% { background: transparent; } }
+td.flash { animation: cellFlash 0.6s ease; }
+td.saving { opacity: 0.55; }
+.hint { color: var(--muted); font-size: 12.5px; margin: 4px 2px 10px; }
+.rowact { width: 1%; white-space: nowrap; text-align: right; }
+
 /* ---------- buttons ---------- */
 .btn {
   background: var(--brand); color: #fff; border: none; border-radius: 8px;

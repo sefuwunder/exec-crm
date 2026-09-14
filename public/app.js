@@ -117,6 +117,129 @@ const statusPill = (s) => {
   return `<span class="pill" style="background:${colors[s] || "#9aa1b3"}22;color:${colors[s] || "#9aa1b3"}">${esc(s)}</span>`;
 };
 
+/* ---------- click-to-edit table cells ----------
+   makeEditable(td, kind, opts, onSave)
+   kind: "text" | "email" | "select"; opts: { value, options? }
+   onSave(newValue) -> PATCHes; returns display HTML string, or false to reject. */
+function makeEditable(td, kind, opts, onSave) {
+  td.classList.add("editable");
+  td.title = "Click to edit";
+  td.onclick = () => {
+    if (td.dataset.editing) return;
+    td.dataset.editing = "1";
+    const orig = td.innerHTML;
+    let el;
+    if (kind === "select") {
+      el = document.createElement("select");
+      for (const [v, l] of opts.options) {
+        const o = document.createElement("option");
+        o.value = v;
+        o.textContent = l;
+        if (String(v) === String(opts.value)) o.selected = true;
+        el.appendChild(o);
+      }
+    } else {
+      el = document.createElement("input");
+      el.type = kind;
+      el.value = opts.value || "";
+    }
+    el.className = "cell-edit";
+    td.innerHTML = "";
+    td.appendChild(el);
+    el.focus();
+    if (el.select) el.select();
+    let done = false;
+    const cancel = () => {
+      if (done) return;
+      done = true;
+      td.innerHTML = orig;
+      delete td.dataset.editing;
+    };
+    const commit = async () => {
+      if (done) return;
+      done = true;
+      const val = kind === "select" ? el.value : el.value.trim();
+      td.innerHTML = orig;
+      delete td.dataset.editing;
+      if (String(val) === String(opts.value ?? "")) return;
+      td.classList.add("saving");
+      try {
+        const html = await onSave(val);
+        if (typeof html === "string") td.innerHTML = html;
+        td.classList.add("flash");
+        setTimeout(() => td.classList.remove("flash"), 650);
+      } catch (e) {
+        alert("Save failed: " + (e.message || e));
+      } finally {
+        td.classList.remove("saving");
+      }
+    };
+    el.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); commit(); }
+      else if (e.key === "Escape") { e.preventDefault(); cancel(); }
+    });
+    el.addEventListener("blur", () => commit());
+    if (kind === "select") el.addEventListener("change", () => commit());
+  };
+}
+
+function wireEditButtons(onEdit) {
+  document.querySelectorAll("#view [data-edit]").forEach((b) => {
+    b.onclick = () => onEdit(Number(b.dataset.edit));
+  });
+}
+
+function wireContactCells(contacts, companies) {
+  document.querySelectorAll("#view td[data-f]").forEach((td) => {
+    const id = Number(td.dataset.cid);
+    const c = contacts.find((x) => x.id === id);
+    const f = td.dataset.f;
+    if (!c) return;
+    if (f === "company_id") {
+      makeEditable(td, "select",
+        { value: c.company_id || "", options: [["", "—"]].concat(companies.map((x) => [x.id, x.name])) },
+        async (v) => {
+          await PATCH(`/api/contacts/${id}`, { company_id: v });
+          const found = companies.find((x) => String(x.id) === String(v));
+          const label = v ? (found ? found.name : "?") : "—";
+          c.company_id = v || null;
+          c.company_name = v ? label : null;
+          return esc(label);
+        });
+    } else {
+      makeEditable(td, f === "email" ? "email" : "text", { value: c[f] || "" }, async (v) => {
+        if (f === "name" && !v) return false;
+        await PATCH(`/api/contacts/${id}`, { [f]: v });
+        c[f] = v;
+        return f === "name" ? `<b>${esc(v)}</b>` : (esc(v) || "—");
+      });
+    }
+  });
+  wireEditButtons((id) => {
+    const c = contacts.find((x) => x.id === id);
+    if (c) editContactModal(c);
+  });
+}
+
+function wireCompanyCells(companies) {
+  document.querySelectorAll("#view td[data-f]").forEach((td) => {
+    const id = Number(td.dataset.cid);
+    const c = companies.find((x) => x.id === id);
+    const f = td.dataset.f;
+    if (!c) return;
+    makeEditable(td, "text", { value: c[f] || "" }, async (v) => {
+      if (f === "name" && !v) return false;
+      await PATCH(`/api/companies/${id}`, { [f]: v });
+      c[f] = v;
+      return f === "name" ? `<b>${esc(v)}</b>` : (esc(v) || "—");
+    });
+  });
+  wireEditButtons((id) => {
+    const c = companies.find((x) => x.id === id);
+    if (c) editCompanyModal(c);
+  });
+}
+
 /* ---------- views ---------- */
 const state = { stages: [], labels: {}, colors: {} };
 let pipeView = "board"; // pipeline tab: "board" | "timeline"
@@ -493,7 +616,10 @@ async function newDealModal() {
 
 async function vContacts() {
   const q = new URLSearchParams(location.hash.split("?")[1] || "").get("q") || "";
-  const { contacts } = await GET(`/api/contacts?q=${encodeURIComponent(q)}`);
+  const [{ contacts }, { companies }] = await Promise.all([
+    GET(`/api/contacts?q=${encodeURIComponent(q)}`),
+    GET("/api/companies"),
+  ]);
   view.innerHTML = `
     <div class="toolbar">
       <input class="search" id="q" placeholder="Search name or email…" value="${esc(q)}">
@@ -501,20 +627,22 @@ async function vContacts() {
       <div class="spacer"></div>
       <button class="btn" id="new-contact">+ New contact</button>
     </div>
+    <p class="hint">Tip: click any cell to edit it in place — Enter saves, Esc cancels.</p>
     <div class="panel"><table>
-      <tr><th>Name</th><th>Title</th><th>Company</th><th>Email</th><th>Phone</th></tr>
-      ${contacts.map((c) => `<tr class="clickable" data-id="${c.id}"><td><b>${esc(c.name)}</b></td><td>${esc(c.title)}</td>
-        <td>${esc(c.company_name || "—")}</td><td>${esc(c.email)}</td><td>${esc(c.phone)}</td></tr>`).join("")}
+      <tr><th>Name</th><th>Title</th><th>Company</th><th>Email</th><th>Phone</th><th></th></tr>
+      ${contacts.map((c) => `<tr>
+        <td data-cid="${c.id}" data-f="name"><b>${esc(c.name)}</b></td>
+        <td data-cid="${c.id}" data-f="title">${esc(c.title) || "—"}</td>
+        <td data-cid="${c.id}" data-f="company_id">${esc(c.company_name || "—")}</td>
+        <td data-cid="${c.id}" data-f="email">${esc(c.email) || "—"}</td>
+        <td data-cid="${c.id}" data-f="phone">${esc(c.phone) || "—"}</td>
+        <td class="rowact"><button class="btn ghost small" data-edit="${c.id}">Edit</button></td>
+      </tr>`).join("")}
     </table>${contacts.length ? "" : `<div class="empty">No contacts match.</div>`}</div>`;
   const go = () => location.hash = `#/contacts?q=${encodeURIComponent($("#q").value)}`;
   $("#go").onclick = go;
   $("#q").addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
-  document.querySelectorAll("#view tr.clickable").forEach((tr) => {
-    tr.onclick = () => {
-      const c = contacts.find((x) => x.id === Number(tr.dataset.id));
-      if (c) editContactModal(c);
-    };
-  });
+  wireContactCells(contacts, companies);
   $("#new-contact").onclick = async () => {
     const [{ companies }, { fields }] = await Promise.all([GET("/api/companies"), getSchemaFields("contact")]);
     openModal("New contact", `
@@ -551,17 +679,18 @@ async function vCompanies() {
   view.innerHTML = `
     <div class="toolbar"><div class="spacer"></div>
       <button class="btn" id="new-company">+ New company</button></div>
+    <p class="hint">Tip: click any cell to edit it in place — Enter saves, Esc cancels.</p>
     <div class="panel"><table>
-      <tr><th>Company</th><th>Industry</th><th>Website</th><th>Deals</th><th>Open pipeline</th></tr>
-      ${companies.map((c) => `<tr class="clickable" data-id="${c.id}"><td><b>${esc(c.name)}</b></td><td>${esc(c.industry)}</td>
-        <td>${esc(c.website)}</td><td>${c.deal_count}</td><td><b>${money(c.open_value)}</b></td></tr>`).join("")}
+      <tr><th>Company</th><th>Industry</th><th>Website</th><th>Deals</th><th>Open pipeline</th><th></th></tr>
+      ${companies.map((c) => `<tr>
+        <td data-cid="${c.id}" data-f="name"><b>${esc(c.name)}</b></td>
+        <td data-cid="${c.id}" data-f="industry">${esc(c.industry) || "—"}</td>
+        <td data-cid="${c.id}" data-f="website">${esc(c.website) || "—"}</td>
+        <td>${c.deal_count}</td><td><b>${money(c.open_value)}</b></td>
+        <td class="rowact"><button class="btn ghost small" data-edit="${c.id}">Edit</button></td>
+      </tr>`).join("")}
     </table></div>`;
-  document.querySelectorAll("#view tr.clickable").forEach((tr) => {
-    tr.onclick = () => {
-      const c = companies.find((x) => x.id === Number(tr.dataset.id));
-      if (c) editCompanyModal(c);
-    };
-  });
+  wireCompanyCells(companies);
   $("#new-company").onclick = async () => {
     const fields = await getSchemaFields("company");
     openModal("New company", `

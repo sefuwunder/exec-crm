@@ -940,7 +940,9 @@ async function route() {
   document.querySelectorAll("#nav a").forEach((a) =>
     a.classList.toggle("active", a.dataset.r === name));
   $("#page-title").textContent = TITLES[name];
-  view.innerHTML = `<div class="empty">Loading…</div>`;
+  view.innerHTML = `<div class="skel" style="height:34px;max-width:300px;margin-bottom:18px"></div>
+    <div class="skel" style="height:120px;margin-bottom:16px"></div>
+    <div class="skel" style="height:220px"></div>`;
   try {
     await { dashboard: vDashboard, feed: vFeed, pipeline: vPipeline, contacts: vContacts,
       companies: vCompanies, tasks: vTasks, captures: vCaptures, automations: vAutomations }[name]();

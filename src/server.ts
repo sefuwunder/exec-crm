@@ -22,12 +22,72 @@ function extFor(mime: string, originalName: string): string {
   return m && IMAGE_TYPES[m[0]] ? m[0] : ".jpg";
 }
 
+// ---------------------------------------------------------------- custom fields
+const CUSTOM_ENTITIES = ["contact", "company", "campaign", "task"];
+const CORE_COLUMNS: Record<string, string[]> = {
+  contact: ["id", "company_id", "name", "title", "email", "phone", "notes", "created_at", "company_name"],
+  company: ["id", "name", "industry", "website", "size", "created_at", "deal_count", "open_value"],
+  campaign: ["id", "name", "status", "start_date", "end_date", "budget", "notes", "created_at"],
+  task: ["id", "title", "deal_id", "due_date", "done", "owner", "created_at", "deal_title"],
+};
+const FIELD_TYPES = ["text", "textarea", "number", "date", "select", "checkbox", "url"];
+
+function getCustomFields(entity: string) {
+  return db
+    .query("SELECT * FROM custom_fields WHERE entity = ? ORDER BY position, id")
+    .all(entity) as any[];
+}
+function attachCustom(entity: string, rows: any[]) {
+  if (!rows.length) return rows;
+  const vals = db
+    .query(
+      `SELECT record_id, field_id, value FROM custom_values
+       WHERE entity = ? AND record_id IN (${rows.map(() => "?").join(",")})`
+    )
+    .all(entity, ...rows.map((r) => r.id)) as any[];
+  const byRecord = new Map<number, Record<string, string>>();
+  for (const v of vals) {
+    if (!byRecord.has(v.record_id)) byRecord.set(v.record_id, {});
+    byRecord.get(v.record_id)![v.field_id] = v.value;
+  }
+  for (const r of rows) r.custom = byRecord.get(r.id) || {};
+  return rows;
+}
+function saveCustomValues(entity: string, recordId: number, custom: unknown) {
+  if (!custom || typeof custom !== "object") return;
+  const byId = new Map(getCustomFields(entity).map((f: any) => [String(f.id), f]));
+  for (const [fid, raw] of Object.entries(custom as Record<string, unknown>)) {
+    const f = byId.get(String(fid));
+    if (!f) continue;
+    let v = raw == null ? "" : String(raw);
+    if (f.type === "checkbox") v = v === "1" || v === "true" ? "1" : "0";
+    if (v === "") {
+      db.prepare("DELETE FROM custom_values WHERE entity = ? AND record_id = ? AND field_id = ?")
+        .run(entity, recordId, f.id);
+    } else {
+      db.prepare(
+        `INSERT INTO custom_values (entity, record_id, field_id, value) VALUES (?, ?, ?, ?)
+         ON CONFLICT(entity, record_id, field_id) DO UPDATE SET value = excluded.value`
+      ).run(entity, recordId, f.id, v);
+    }
+  }
+}
+function slugify(label: string) {
+  return (
+    label.toLowerCase().trim().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40) ||
+    "field"
+  );
+}
+
 // ---------------------------------------------------------------- webhooks
 const ALL_EVENTS = [
   "deal.created",
   "deal.stage_changed",
   "deal.updated",
   "contact.created",
+  "campaign.created",
+  "campaign.updated",
+  "campaign.deleted",
   "task.created",
   "task.completed",
 ];
@@ -269,14 +329,17 @@ const server = Bun.serve({
     // ---- contacts
     if (path === "/api/contacts" && method === "GET") {
       const q = url.searchParams.get("q") || "";
-      const rows = db
-        .query(
-          `SELECT ct.*, c.name AS company_name FROM contacts ct
-           LEFT JOIN companies c ON c.id = ct.company_id
-           WHERE ct.name LIKE ? OR ct.email LIKE ?
-           ORDER BY ct.name`
-        )
-        .all(`%${q}%`, `%${q}%`);
+      const rows = attachCustom(
+        "contact",
+        db
+          .query(
+            `SELECT ct.*, c.name AS company_name FROM contacts ct
+             LEFT JOIN companies c ON c.id = ct.company_id
+             WHERE ct.name LIKE ? OR ct.email LIKE ?
+             ORDER BY ct.name`
+          )
+          .all(`%${q}%`, `%${q}%`) as any[]
+      );
       return json({ contacts: rows });
     }
     if (path === "/api/contacts" && method === "POST") {
@@ -286,7 +349,11 @@ const server = Bun.serve({
           "INSERT INTO contacts (company_id, name, title, email, phone) VALUES (?, ?, ?, ?, ?)"
         )
         .run(b.company_id || null, b.name || "Unnamed", b.title || "", b.email || "", b.phone || "");
-      const contact = db.query("SELECT * FROM contacts WHERE id = ?").get(Number(r.lastInsertRowid));
+      const id = Number(r.lastInsertRowid);
+      saveCustomValues("contact", id, b.custom);
+      const contact = attachCustom("contact", [
+        db.query("SELECT * FROM contacts WHERE id = ?").get(id) as any,
+      ])[0];
       fireWebhooks("contact.created", contact as any);
       return json({ contact }, 201);
     }
@@ -306,7 +373,11 @@ const server = Bun.serve({
         db.prepare(`UPDATE contacts SET ${sets.join(", ")} WHERE id = ?`)
           .run(...vals, Number(contactId[1]));
       }
-      return json({ contact: db.query("SELECT * FROM contacts WHERE id = ?").get(Number(contactId[1])) });
+      saveCustomValues("contact", Number(contactId[1]), b.custom);
+      const updatedContact = attachCustom("contact", [
+        db.query("SELECT * FROM contacts WHERE id = ?").get(Number(contactId[1])) as any,
+      ])[0];
+      return json({ contact: updatedContact });
     }
 
     // ---- CSV import: POST { csv: "..." } with header row
@@ -393,14 +464,17 @@ const server = Bun.serve({
 
     // ---- companies
     if (path === "/api/companies" && method === "GET") {
-      const rows = db
-        .query(
-          `SELECT c.*, COUNT(d.id) AS deal_count,
-                  COALESCE(SUM(CASE WHEN d.stage NOT IN ('closed_won','closed_lost') THEN d.value ELSE 0 END),0) AS open_value
-           FROM companies c LEFT JOIN deals d ON d.company_id = c.id
-           GROUP BY c.id ORDER BY open_value DESC`
-        )
-        .all();
+      const rows = attachCustom(
+        "company",
+        db
+          .query(
+            `SELECT c.*, COUNT(d.id) AS deal_count,
+                    COALESCE(SUM(CASE WHEN d.stage NOT IN ('closed_won','closed_lost') THEN d.value ELSE 0 END),0) AS open_value
+             FROM companies c LEFT JOIN deals d ON d.company_id = c.id
+             GROUP BY c.id ORDER BY open_value DESC`
+          )
+          .all() as any[]
+      );
       return json({ companies: rows });
     }
     if (path === "/api/companies" && method === "POST") {
@@ -408,10 +482,12 @@ const server = Bun.serve({
       const r = db
         .prepare("INSERT INTO companies (name, industry, website) VALUES (?, ?, ?)")
         .run(b.name || "Unnamed", b.industry || "", b.website || "");
-      return json(
-        { company: db.query("SELECT * FROM companies WHERE id = ?").get(Number(r.lastInsertRowid)) },
-        201
-      );
+      const id = Number(r.lastInsertRowid);
+      saveCustomValues("company", id, b.custom);
+      const company = attachCustom("company", [
+        db.query("SELECT * FROM companies WHERE id = ?").get(id) as any,
+      ])[0];
+      return json({ company }, 201);
     }
 
     const companyId = path.match(/^\/api\/companies\/(\d+)$/);
@@ -429,18 +505,25 @@ const server = Bun.serve({
         db.prepare(`UPDATE companies SET ${sets.join(", ")} WHERE id = ?`)
           .run(...vals, Number(companyId[1]));
       }
-      return json({ company: db.query("SELECT * FROM companies WHERE id = ?").get(Number(companyId[1])) });
+      saveCustomValues("company", Number(companyId[1]), b.custom);
+      const updatedCompany = attachCustom("company", [
+        db.query("SELECT * FROM companies WHERE id = ?").get(Number(companyId[1])) as any,
+      ])[0];
+      return json({ company: updatedCompany });
     }
 
     // ---- tasks
     if (path === "/api/tasks" && method === "GET") {
-      const rows = db
-        .query(
-          `SELECT t.*, d.title AS deal_title FROM tasks t
-           LEFT JOIN deals d ON d.id = t.deal_id
-           ORDER BY t.done, t.due_date`
-        )
-        .all();
+      const rows = attachCustom(
+        "task",
+        db
+          .query(
+            `SELECT t.*, d.title AS deal_title FROM tasks t
+             LEFT JOIN deals d ON d.id = t.deal_id
+             ORDER BY t.done, t.due_date`
+          )
+          .all() as any[]
+      );
       return json({ tasks: rows });
     }
     if (path === "/api/tasks" && method === "POST") {
@@ -448,7 +531,11 @@ const server = Bun.serve({
       const r = db
         .prepare("INSERT INTO tasks (title, deal_id, due_date, owner) VALUES (?, ?, ?, ?)")
         .run(b.title || "Untitled task", b.deal_id || null, b.due_date || "", b.owner || "");
-      const task = db.query("SELECT * FROM tasks WHERE id = ?").get(Number(r.lastInsertRowid));
+      const id = Number(r.lastInsertRowid);
+      saveCustomValues("task", id, b.custom);
+      const task = attachCustom("task", [
+        db.query("SELECT * FROM tasks WHERE id = ?").get(id) as any,
+      ])[0];
       fireWebhooks("task.created", task as any);
       return json({ task }, 201);
     }
@@ -467,7 +554,11 @@ const server = Bun.serve({
         db.prepare(`UPDATE tasks SET ${sets.join(", ")} WHERE id = ?`)
           .run(...vals, Number(taskId[1]));
       }
-      return json({ task: db.query("SELECT * FROM tasks WHERE id = ?").get(Number(taskId[1])) });
+      saveCustomValues("task", Number(taskId[1]), b.custom);
+      const updatedTask = attachCustom("task", [
+        db.query("SELECT * FROM tasks WHERE id = ?").get(Number(taskId[1])) as any,
+      ])[0];
+      return json({ task: updatedTask });
     }
     const taskToggle = path.match(/^\/api\/tasks\/(\d+)\/toggle$/);
     if (taskToggle && method === "POST") {
@@ -571,6 +662,126 @@ const server = Bun.serve({
           await Bun.$`rm -f ${UPLOAD_DIR}/${row.filename}`.quiet();
         } catch {}
         db.prepare("DELETE FROM captures WHERE id = ?").run(row.id);
+      }
+      return json({ ok: true });
+    }
+
+    // ---- custom fields (schema editor)
+    const schemaEntity = path.match(/^\/api\/schema\/([a-z]+)$/);
+    if (schemaEntity && CUSTOM_ENTITIES.includes(schemaEntity[1]) && method === "GET") {
+      return json({ fields: getCustomFields(schemaEntity[1]) });
+    }
+    if (schemaEntity && CUSTOM_ENTITIES.includes(schemaEntity[1]) && method === "POST") {
+      const b = await readBody(req);
+      const entity = schemaEntity[1];
+      const label = String(b.label || "").trim();
+      const type = FIELD_TYPES.includes(b.type) ? b.type : "text";
+      if (!label) return json({ error: "label is required" }, 400);
+      let name = slugify(label);
+      if (CORE_COLUMNS[entity].includes(name)) return json({ error: `"${name}" is a built-in field` }, 400);
+      let n = 2;
+      while (db.query("SELECT id FROM custom_fields WHERE entity = ? AND name = ?").get(entity, name)) {
+        name = `${slugify(label)}_${n++}`;
+      }
+      let options = "[]";
+      if (type === "select") {
+        const opts = String(b.options || "").split(",").map((s: string) => s.trim()).filter(Boolean).slice(0, 30);
+        if (!opts.length) return json({ error: "dropdown fields need at least one option" }, 400);
+        options = JSON.stringify(opts);
+      }
+      const pos = (db.query("SELECT COALESCE(MAX(position), -1) + 1 AS p FROM custom_fields WHERE entity = ?").get(entity) as any).p;
+      const r = db
+        .prepare(
+          "INSERT INTO custom_fields (entity, name, label, type, options, required, position) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        )
+        .run(entity, name, label, type, options, b.required ? 1 : 0, pos);
+      logActivity("note", `Added custom field "${label}" to ${entity}s`);
+      return json({ field: db.query("SELECT * FROM custom_fields WHERE id = ?").get(Number(r.lastInsertRowid)) }, 201);
+    }
+    const schemaFieldId = path.match(/^\/api\/schema\/fields\/(\d+)$/);
+    if (schemaFieldId && method === "PATCH") {
+      const b = await readBody(req);
+      const sets: string[] = [];
+      const vals: unknown[] = [];
+      if (b.label !== undefined && String(b.label).trim()) {
+        sets.push("label = ?");
+        vals.push(String(b.label).trim());
+      }
+      if (b.type !== undefined && FIELD_TYPES.includes(b.type)) {
+        sets.push("type = ?");
+        vals.push(b.type);
+        if (b.type !== "select") { sets.push("options = '[]'"); }
+      }
+      if (b.options !== undefined) {
+        const opts = String(b.options).split(",").map((s: string) => s.trim()).filter(Boolean).slice(0, 30);
+        sets.push("options = ?");
+        vals.push(JSON.stringify(opts));
+      }
+      if (b.required !== undefined) {
+        sets.push("required = ?");
+        vals.push(b.required ? 1 : 0);
+      }
+      if (b.position !== undefined) {
+        sets.push("position = ?");
+        vals.push(Number(b.position));
+      }
+      if (sets.length) {
+        db.prepare(`UPDATE custom_fields SET ${sets.join(", ")} WHERE id = ?`)
+          .run(...vals, Number(schemaFieldId[1]));
+      }
+      return json({ field: db.query("SELECT * FROM custom_fields WHERE id = ?").get(Number(schemaFieldId[1])) });
+    }
+    if (schemaFieldId && method === "DELETE") {
+      const f = db.query("SELECT * FROM custom_fields WHERE id = ?").get(Number(schemaFieldId[1])) as any;
+      if (f) {
+        db.prepare("DELETE FROM custom_values WHERE field_id = ?").run(f.id);
+        db.prepare("DELETE FROM custom_fields WHERE id = ?").run(f.id);
+        logActivity("note", `Removed custom field "${f.label}" from ${f.entity}s`);
+      }
+      return json({ ok: true });
+    }
+
+    // ---- campaigns
+    if (path === "/api/campaigns" && method === "GET") {
+      const rows = attachCustom("campaign", db.query("SELECT * FROM campaigns ORDER BY created_at DESC").all() as any[]);
+      return json({ campaigns: rows });
+    }
+    if (path === "/api/campaigns" && method === "POST") {
+      const b = await readBody(req);
+      const r = db
+        .prepare("INSERT INTO campaigns (name, status, start_date, end_date, budget, notes) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(b.name || "Untitled campaign", b.status || "draft", b.start_date || "", b.end_date || "",
+          Number(b.budget) || 0, b.notes || "");
+      const id = Number(r.lastInsertRowid);
+      saveCustomValues("campaign", id, b.custom);
+      const campaign = attachCustom("campaign", [db.query("SELECT * FROM campaigns WHERE id = ?").get(id) as any])[0];
+      logActivity("note", `Created campaign "${campaign.name}"`);
+      fireWebhooks("campaign.created", campaign);
+      return json({ campaign }, 201);
+    }
+    const campaignId = path.match(/^\/api\/campaigns\/(\d+)$/);
+    if (campaignId && method === "PATCH") {
+      const b = await readBody(req);
+      const sets: string[] = [];
+      const vals: unknown[] = [];
+      for (const k of ["name", "status", "start_date", "end_date", "notes"]) {
+        if (b[k] !== undefined) { sets.push(`${k} = ?`); vals.push(b[k]); }
+      }
+      if (b.budget !== undefined) { sets.push("budget = ?"); vals.push(Number(b.budget) || 0); }
+      if (sets.length) {
+        db.prepare(`UPDATE campaigns SET ${sets.join(", ")} WHERE id = ?`).run(...vals, Number(campaignId[1]));
+      }
+      saveCustomValues("campaign", Number(campaignId[1]), b.custom);
+      const campaign = attachCustom("campaign", [db.query("SELECT * FROM campaigns WHERE id = ?").get(Number(campaignId[1])) as any])[0];
+      fireWebhooks("campaign.updated", campaign);
+      return json({ campaign });
+    }
+    if (campaignId && method === "DELETE") {
+      const c = db.query("SELECT * FROM campaigns WHERE id = ?").get(Number(campaignId[1])) as any;
+      if (c) {
+        db.prepare("DELETE FROM custom_values WHERE entity = 'campaign' AND record_id = ?").run(c.id);
+        db.prepare("DELETE FROM campaigns WHERE id = ?").run(c.id);
+        fireWebhooks("campaign.deleted", { id: c.id, name: c.name });
       }
       return json({ ok: true });
     }

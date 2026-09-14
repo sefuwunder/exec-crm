@@ -111,6 +111,36 @@ CREATE TABLE IF NOT EXISTS captures (
   contact_id INTEGER REFERENCES contacts(id),
   created_at TEXT DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS campaigns (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  status TEXT DEFAULT 'draft',
+  start_date TEXT DEFAULT '',
+  end_date TEXT DEFAULT '',
+  budget REAL DEFAULT 0,
+  notes TEXT DEFAULT '',
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS custom_fields (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity TEXT NOT NULL,
+  name TEXT NOT NULL,
+  label TEXT NOT NULL,
+  type TEXT NOT NULL DEFAULT 'text',
+  options TEXT DEFAULT '[]',
+  required INTEGER DEFAULT 0,
+  position INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now')),
+  UNIQUE(entity, name)
+);
+CREATE TABLE IF NOT EXISTS custom_values (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity TEXT NOT NULL,
+  record_id INTEGER NOT NULL,
+  field_id INTEGER NOT NULL REFERENCES custom_fields(id) ON DELETE CASCADE,
+  value TEXT DEFAULT '',
+  UNIQUE(entity, record_id, field_id)
+);
 `;
 
 export function openDb(path: string): Database {

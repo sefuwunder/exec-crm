@@ -20,7 +20,10 @@ Data lives in `./crm.db` (created + seeded on first run). Override with `CRM_DB`
 - **Dashboard** — open pipeline, weighted pipeline, won this quarter, open
   tasks; pipeline-by-stage bars; deals closing soon; activity feed.
 - **Pipeline** — kanban board, drag cards between stages (fires webhooks).
-- **Contacts / Companies / Tasks** — search, create, complete.
+- **Contacts / Companies / Campaigns / Tasks** — search, create, complete.
+- **Schema editor** — add your own custom fields (text, long text, number,
+  date, dropdown, checkbox, URL) to contacts, companies, campaigns, and
+  tasks; fields show up on every form automatically.
 - **Daily Feed** — overdue, today's, and upcoming todos plus deals closing
   this week, with quick-add.
 - **Captures** — snap or upload photos of business cards and client notes
@@ -64,7 +67,9 @@ fan out to outgoing webhooks, so chains compose.
 `POST /api/webhooks/:id/test` · `GET /api/deliveries` · `GET|POST /api/hooks` ·
 `DELETE /api/hooks/:id` · `POST /api/hooks/in/:key` ·
 `GET|POST /api/captures` (multipart `photos[]`) · `PATCH|DELETE /api/captures/:id` ·
-`GET /uploads/:file`
+`GET /uploads/:file` ·
+`GET /api/schema/:entity` · `POST /api/schema/:entity` · `PATCH|DELETE /api/schema/fields/:id` ·
+`GET|POST /api/campaigns` · `PATCH|DELETE /api/campaigns/:id`
 
 Captured photos land in `./uploads/` (created on boot; override with
 `CRM_UPLOADS`). Images only, 12 MB max each.

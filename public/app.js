@@ -3,7 +3,8 @@ const $ = (s, el = document) => el.querySelector(s);
 const view = $("#view");
 const TITLES = {
   dashboard: "Dashboard", feed: "Daily Feed", pipeline: "Pipeline", contacts: "Contacts",
-  companies: "Companies", tasks: "Tasks", captures: "Captures", automations: "Automations",
+  companies: "Companies", campaigns: "Campaigns", tasks: "Tasks", captures: "Captures",
+  automations: "Automations", schema: "Schema",
 };
 $("#today").textContent = new Date(Date.now()).toLocaleDateString(undefined, {
   weekday: "long", year: "numeric", month: "long", day: "numeric",
@@ -64,6 +65,11 @@ function openModal(title, bodyHtml, onSubmit, submitLabel = "Save") {
         }
       } else data[el.name] = el.value;
     });
+    // custom schema fields (data-cf="<field id>")
+    root.querySelectorAll("[data-cf]").forEach((el) => {
+      (data.custom = data.custom || {})[el.dataset.cf] =
+        el.type === "checkbox" ? (el.checked ? "1" : "0") : el.value;
+    });
     await onSubmit(data);
     close();
   };
@@ -77,6 +83,39 @@ const select = (name, options, val = "") =>
   `<select name="${name}">${options
     .map(([v, l]) => `<option value="${esc(v)}" ${String(v) === String(val) ? "selected" : ""}>${esc(l)}</option>`)
     .join("")}</select>`;
+
+/* ---------- custom schema fields ---------- */
+const FIELD_TYPES = [
+  ["text", "Text"], ["textarea", "Long text"], ["number", "Number"],
+  ["date", "Date"], ["select", "Dropdown"], ["checkbox", "Checkbox"], ["url", "URL"],
+];
+const cfInput = (f, val = "") => {
+  const attr = `data-cf="${f.id}"`;
+  const v = val ?? "";
+  if (f.type === "textarea") return `<textarea ${attr} rows="2">${esc(v)}</textarea>`;
+  if (f.type === "select") {
+    let opts = [];
+    try { opts = JSON.parse(f.options || "[]"); } catch {}
+    return `<select ${attr}>${opts
+      .map((o) => `<option value="${esc(o)}" ${o === v ? "selected" : ""}>${esc(o)}</option>`)
+      .join("")}</select>`;
+  }
+  if (f.type === "checkbox")
+    return `<input type="checkbox" ${attr} ${v === "1" ? "checked" : ""} style="width:18px;height:18px;margin-top:4px">`;
+  const t = f.type === "number" ? "number" : f.type === "date" ? "date" : f.type === "url" ? "url" : "text";
+  return `<input type="${t}" ${attr} value="${esc(v)}"${f.required ? " required" : ""}>`;
+};
+const cfFieldsHtml = (fields, values = {}) => {
+  if (!fields.length) return "";
+  return `<div class="cf-section"><div class="cf-title">Custom fields</div><div class="formgrid">` +
+    fields.map((f) => field(f.label + (f.required ? " *" : ""), cfInput(f, values[f.id]))).join("") +
+    `</div></div>`;
+};
+const getSchemaFields = async (entity) => (await GET(`/api/schema/${entity}`)).fields;
+const statusPill = (s) => {
+  const colors = { draft: "#9aa1b3", active: "#18a058", paused: "#e6a23c", completed: "#2f62f0" };
+  return `<span class="pill" style="background:${colors[s] || "#9aa1b3"}22;color:${colors[s] || "#9aa1b3"}">${esc(s)}</span>`;
+};
 
 /* ---------- views ---------- */
 const state = { stages: [], labels: {}, colors: {} };
@@ -477,7 +516,7 @@ async function vContacts() {
     };
   });
   $("#new-contact").onclick = async () => {
-    const { companies } = await GET("/api/companies");
+    const [{ companies }, { fields }] = await Promise.all([GET("/api/companies"), getSchemaFields("contact")]);
     openModal("New contact", `
       <div class="formgrid">
         ${field("Name", input("name"))}
@@ -486,13 +525,14 @@ async function vContacts() {
         ${field("Email", input("email", "", "email"))}
         ${field("Phone", input("phone"))}
         ${field("—", `<div></div>`)}
-      </div>`,
+      </div>
+      ${cfFieldsHtml(fields)}`,
       async (d) => { await POST("/api/contacts", d); route(); }, "Create contact");
   };
 }
 
 async function editContactModal(c) {
-  const { companies } = await GET("/api/companies");
+  const [{ companies }, { fields }] = await Promise.all([GET("/api/companies"), getSchemaFields("contact")]);
   openModal("Edit contact", `
     <div class="formgrid">
       ${field("Name", input("name", c.name))}
@@ -501,7 +541,8 @@ async function editContactModal(c) {
       ${field("Email", input("email", c.email, "email"))}
       ${field("Phone", input("phone", c.phone))}
       ${field("—", `<div></div>`)}
-    </div>`,
+    </div>
+    ${cfFieldsHtml(fields, c.custom)}`,
     async (d) => { await PATCH(`/api/contacts/${c.id}`, d); route(); }, "Save changes");
 }
 
@@ -521,18 +562,78 @@ async function vCompanies() {
       if (c) editCompanyModal(c);
     };
   });
-  $("#new-company").onclick = () =>
+  $("#new-company").onclick = async () => {
+    const fields = await getSchemaFields("company");
     openModal("New company", `
       ${field("Name", input("name"))}
-      <div class="formgrid">${field("Industry", input("industry"))}${field("Website", input("website"))}</div>`,
+      <div class="formgrid">${field("Industry", input("industry"))}${field("Website", input("website"))}</div>
+      ${cfFieldsHtml(fields)}`,
       async (d) => { await POST("/api/companies", d); route(); }, "Create company");
+  };
 }
 
-function editCompanyModal(c) {
+async function editCompanyModal(c) {
+  const fields = await getSchemaFields("company");
   openModal("Edit company", `
     ${field("Name", input("name", c.name))}
-    <div class="formgrid">${field("Industry", input("industry", c.industry))}${field("Website", input("website", c.website))}</div>`,
+    <div class="formgrid">${field("Industry", input("industry", c.industry))}${field("Website", input("website", c.website))}</div>
+    ${cfFieldsHtml(fields, c.custom)}`,
     async (d) => { await PATCH(`/api/companies/${c.id}`, d); route(); }, "Save changes");
+}
+
+/* ---------- campaigns ---------- */
+const CAMPAIGN_STATUSES = ["draft", "active", "paused", "completed"];
+
+async function vCampaigns() {
+  const { campaigns } = await GET("/api/campaigns");
+  view.innerHTML = `
+    <div class="toolbar"><div class="spacer"></div>
+      <button class="btn" id="new-campaign">+ New campaign</button></div>
+    <div class="panel"><table>
+      <tr><th>Campaign</th><th>Status</th><th>Start</th><th>End</th><th>Budget</th></tr>
+      ${campaigns.map((c) => `<tr class="clickable" data-id="${c.id}"><td><b>${esc(c.name)}</b></td>
+        <td>${statusPill(c.status)}</td><td>${esc(c.start_date) || "—"}</td><td>${esc(c.end_date) || "—"}</td>
+        <td><b>${money(c.budget)}</b></td></tr>`).join("")}
+    </table>${campaigns.length ? "" : `<div class="empty">No campaigns yet — launch your first one.</div>`}</div>`;
+  document.querySelectorAll("#view tr.clickable").forEach((tr) => {
+    tr.onclick = () => {
+      const c = campaigns.find((x) => x.id === Number(tr.dataset.id));
+      if (c) editCampaignModal(c);
+    };
+  });
+  $("#new-campaign").onclick = async () => {
+    const fields = await getSchemaFields("campaign");
+    openModal("New campaign", `
+      ${field("Name", input("name"))}
+      <div class="formgrid">
+        ${field("Status", select("status", CAMPAIGN_STATUSES.map((s) => [s, s[0].toUpperCase() + s.slice(1)]), "draft"))}
+        ${field("Budget ($)", input("budget", "0", "number"))}
+        ${field("Start date", input("start_date", "", "date"))}
+        ${field("End date", input("end_date", "", "date"))}
+      </div>
+      ${field("Notes", `<textarea name="notes" rows="3"></textarea>`)}
+      ${cfFieldsHtml(fields)}`,
+      async (d) => { await POST("/api/campaigns", d); route(); }, "Create campaign");
+  };
+}
+
+async function editCampaignModal(c) {
+  const fields = await getSchemaFields("campaign");
+  openModal("Edit campaign", `
+    ${field("Name", input("name", c.name))}
+    <div class="formgrid">
+      ${field("Status", select("status", CAMPAIGN_STATUSES.map((s) => [s, s[0].toUpperCase() + s.slice(1)]), c.status || "draft"))}
+      ${field("Budget ($)", input("budget", c.budget || 0, "number"))}
+      ${field("Start date", input("start_date", c.start_date || "", "date"))}
+      ${field("End date", input("end_date", c.end_date || "", "date"))}
+    </div>
+    ${field("Notes", `<textarea name="notes" rows="3">${esc(c.notes || "")}</textarea>`)}
+    ${cfFieldsHtml(fields, c.custom)}
+    <div style="margin-top:14px"><button class="btn danger small" id="m-delete">Delete campaign</button></div>`,
+    async (d) => { await PATCH(`/api/campaigns/${c.id}`, d); route(); }, "Save changes");
+  $("#m-delete").onclick = async () => {
+    if (confirm(`Delete campaign "${c.name}"?`)) { await DEL(`/api/campaigns/${c.id}`); $("#modal-root").innerHTML = ""; route(); }
+  };
 }
 
 async function vTasks() {
@@ -549,15 +650,18 @@ async function vTasks() {
       ${tasks.map(taskRow).join("") || `<div class="empty">All clear.</div>`}
     </div>`;
   wireTaskRows(tasks, deals);
-  $("#new-task").onclick = () =>
+  $("#new-task").onclick = async () => {
+    const fields = await getSchemaFields("task");
     openModal("New task", `
       ${field("Title", input("title"))}
       <div class="formgrid">
         ${field("Related deal", select("deal_id", [["", "—"]].concat(deals.filter((d) => !["closed_won", "closed_lost"].includes(d.stage)).map((d) => [d.id, d.title]))))}
         ${field("Due date", input("due_date", "", "date"))}
       </div>
-      ${field("Owner", input("owner", "You"))}`,
+      ${field("Owner", input("owner", "You"))}
+      ${cfFieldsHtml(fields)}`,
       async (d) => { if (!d.deal_id) delete d.deal_id; await POST("/api/tasks", d); route(); }, "Create task");
+  };
 }
 
 /* shared task row + wiring (used by Tasks and Daily Feed) */
@@ -710,14 +814,16 @@ function editCaptureModal(c, contacts) {
     async (d) => { await PATCH(`/api/captures/${c.id}`, d); route(); }, "Save");
 }
 
-function editTaskModal(t, deals) {
+async function editTaskModal(t, deals) {
+  const fields = await getSchemaFields("task");
   openModal("Edit task", `
     ${field("Title", input("title", t.title))}
     <div class="formgrid">
       ${field("Related deal", select("deal_id", [["", "—"]].concat(deals.filter((d) => !["closed_won", "closed_lost"].includes(d.stage)).map((d) => [d.id, d.title])), t.deal_id || ""))}
       ${field("Due date", input("due_date", t.due_date || "", "date"))}
     </div>
-    ${field("Owner", input("owner", t.owner))}`,
+    ${field("Owner", input("owner", t.owner))}
+    ${cfFieldsHtml(fields, t.custom)}`,
     async (d) => { await PATCH(`/api/tasks/${t.id}`, d); route(); }, "Save changes");
 }
 
@@ -729,7 +835,7 @@ async function vAutomations() {
   view.innerHTML = `
     <div class="panel">
       <h2>Outgoing webhooks <span style="color:var(--text-3);font-weight:400;font-size:13px">— CRM → Zapier / Make / n8n</span></h2>
-      <p style="color:var(--text-2);margin-top:-6px">POSTs JSON on deal, contact, and task events. Point it at a Zapier Catch Hook, Make webhook, or n8n Webhook node.</p>
+      <p style="color:var(--text-2);margin-top:-6px">POSTs JSON on deal, contact, campaign, and task events. Point it at a Zapier Catch Hook, Make webhook, or n8n Webhook node.</p>
       <div id="wh-list">
         ${webhooks.map((w) => {
           let ev = [];
@@ -834,6 +940,110 @@ Content-Type: application/json
   };
 }
 
+/* ---------- schema editor: custom fields per entity ---------- */
+const SCHEMA_ENTITIES = [
+  ["contact", "Contacts"], ["company", "Companies"],
+  ["campaign", "Campaigns"], ["task", "Tasks"],
+];
+let schemaEntity = "contact";
+
+async function vSchema() {
+  const { fields } = await GET(`/api/schema/${schemaEntity}`);
+  const entLabel = SCHEMA_ENTITIES.find(([e]) => e === schemaEntity)[1];
+  view.innerHTML = `
+    <div class="toolbar">
+      <div class="seg" id="schema-seg">
+        ${SCHEMA_ENTITIES.map(([e, l]) => `<button data-ent="${e}" class="${e === schemaEntity ? "on" : ""}">${l}</button>`).join("")}
+      </div>
+      <div class="spacer"></div>
+      <button class="btn" id="new-field">+ New field</button>
+    </div>
+    <div class="panel">
+      <h2>${entLabel} — custom fields <span class="count">${fields.length}</span></h2>
+      <p style="color:var(--text-2);margin-top:-8px">These fields appear on every ${entLabel.toLowerCase().slice(0, -1)} form. Built-in fields can't be edited here.</p>
+      ${fields.map((f, i) => {
+        let opts = [];
+        try { opts = JSON.parse(f.options || "[]"); } catch {}
+        return `<div class="schema-field">
+          <div class="info">
+            <div class="name">${esc(f.label)} ${f.required ? `<span class="pill" style="background:#e5484d22;color:#e5484d">required</span>` : ""}</div>
+            <div class="url">${esc(f.name)} · ${FIELD_TYPES.find(([t]) => t === f.type)?.[1] || f.type}${opts.length ? ` · ${esc(opts.join(", "))}` : ""}</div>
+          </div>
+          <div class="schema-actions">
+            <button class="btn ghost small" data-move="-1" data-id="${f.id}" ${i === 0 ? "disabled" : ""}>↑</button>
+            <button class="btn ghost small" data-move="1" data-id="${f.id}" ${i === fields.length - 1 ? "disabled" : ""}>↓</button>
+            <button class="btn ghost small" data-edit="${f.id}">Edit</button>
+            <button class="btn danger small" data-del="${f.id}">Delete</button>
+          </div>
+        </div>`;
+      }).join("") || `<div class="empty">No custom fields yet — add one to start tracking what matters.</div>`}
+    </div>`;
+  document.querySelectorAll("#schema-seg button").forEach((b) => {
+    b.onclick = () => { schemaEntity = b.dataset.ent; route(); };
+  });
+  document.querySelectorAll("[data-move]").forEach((b) => {
+    b.onclick = async () => {
+      const i = fields.findIndex((f) => f.id === Number(b.dataset.id));
+      const j = i + Number(b.dataset.move);
+      if (j < 0 || j >= fields.length) return;
+      await PATCH(`/api/schema/fields/${fields[i].id}`, { position: fields[j].position });
+      await PATCH(`/api/schema/fields/${fields[j].id}`, { position: fields[i].position });
+      route();
+    };
+  });
+  document.querySelectorAll("[data-edit]").forEach((b) => {
+    b.onclick = () => {
+      const f = fields.find((x) => x.id === Number(b.dataset.edit));
+      if (f) fieldModal(f);
+    };
+  });
+  document.querySelectorAll("[data-del]").forEach((b) => {
+    b.onclick = async () => {
+      const f = fields.find((x) => x.id === Number(b.dataset.del));
+      if (f && confirm(`Delete the "${f.label}" field and all its values?`)) {
+        await DEL(`/api/schema/fields/${f.id}`);
+        route();
+      }
+    };
+  });
+  $("#new-field").onclick = () => fieldModal(null);
+}
+
+function fieldModal(f) {
+  const isNew = !f;
+  const typeOpts = FIELD_TYPES.map(([t, l]) => [t, l]);
+  let opts = [];
+  try { opts = JSON.parse((f && f.options) || "[]"); } catch {}
+  openModal(isNew ? "New custom field" : "Edit field", `
+    ${field("Label", input("label", f ? f.label : "", "text", "required"))}
+    <div class="formgrid">
+      ${field("Type", select("type", typeOpts, f ? f.type : "text"))}
+      ${field("Required", `<input type="checkbox" name="required" value="1" ${f && f.required ? "checked" : ""} style="width:18px;height:18px;margin-top:4px">`)}
+    </div>
+    <div id="cf-opts">${field("Dropdown options (comma-separated)", input("options", opts.join(", ")))}</div>
+    ${isNew ? `<p style="color:var(--text-3);font-size:12.5px">The field key is generated from the label (e.g. "Customer tier" → customer_tier).</p>` : ""}`,
+    async (d) => {
+      const payload = {
+        label: d.label,
+        type: d.type,
+        options: d.options || "",
+        required: !!(d.required && d.required.length),
+      };
+      if (isNew) {
+        const r = await POST(`/api/schema/${schemaEntity}`, payload);
+        if (r.error) throw new Error(r.error);
+      } else {
+        await PATCH(`/api/schema/fields/${f.id}`, payload);
+      }
+      route();
+    }, isNew ? "Add field" : "Save");
+  const syncOpts = () => {
+    $("#cf-opts").style.display = $('[name="type"]').value === "select" ? "" : "none";
+  };
+  $('[name="type"]').onchange = syncOpts;
+  syncOpts();
+}
+
 /* ---------- command palette (⌘K quick find) ---------- */
 function initPalette() {
   const root = $("#palette-root");
@@ -845,7 +1055,8 @@ function initPalette() {
     if (cache) return cache;
     const NAV = [
       ["Dashboard", "#/dashboard"], ["Daily Feed", "#/feed"], ["Pipeline", "#/pipeline"], ["Contacts", "#/contacts"],
-      ["Companies", "#/companies"], ["Tasks", "#/tasks"], ["Captures", "#/captures"], ["Automations", "#/automations"],
+      ["Companies", "#/companies"], ["Campaigns", "#/campaigns"], ["Tasks", "#/tasks"], ["Captures", "#/captures"],
+      ["Automations", "#/automations"], ["Schema", "#/schema"],
     ];
     const out = NAV.map(([label, hash]) => ({
       group: "Go to", kind: "view", label,
@@ -945,7 +1156,8 @@ async function route() {
     <div class="skel" style="height:220px"></div>`;
   try {
     await { dashboard: vDashboard, feed: vFeed, pipeline: vPipeline, contacts: vContacts,
-      companies: vCompanies, tasks: vTasks, captures: vCaptures, automations: vAutomations }[name]();
+      companies: vCompanies, campaigns: vCampaigns, tasks: vTasks, captures: vCaptures,
+      automations: vAutomations, schema: vSchema }[name]();
   } catch (e) {
     view.innerHTML = `<div class="empty">Failed to load: ${esc(e.message)}</div>`;
   }

@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS captures (
 CREATE TABLE IF NOT EXISTS campaigns (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
+  company_id INTEGER REFERENCES companies(id),
   status TEXT DEFAULT 'draft',
   start_date TEXT DEFAULT '',
   end_date TEXT DEFAULT '',
@@ -155,6 +156,11 @@ export function openDb(path: string): Database {
     db.exec("ALTER TABLE tasks ADD COLUMN campaign_id INTEGER REFERENCES campaigns(id)");
   }
   db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_campaign ON tasks(campaign_id)");
+  // migration: campaigns are now connected to a company
+  const campCols = db.query("PRAGMA table_info(campaigns)").all() as any[];
+  if (!campCols.some((c) => c.name === "company_id")) {
+    db.exec("ALTER TABLE campaigns ADD COLUMN company_id INTEGER REFERENCES companies(id)");
+  }
   return db;
 }
 

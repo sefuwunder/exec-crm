@@ -752,14 +752,23 @@ const server = Bun.serve({
 
     // ---- campaigns
     if (path === "/api/campaigns" && method === "GET") {
-      const rows = attachCustom("campaign", db.query("SELECT * FROM campaigns ORDER BY created_at DESC").all() as any[]);
+      const rows = attachCustom("campaign", db.query(
+        `SELECT c.*, co.name AS company_name FROM campaigns c
+         LEFT JOIN companies co ON co.id = c.company_id
+         ORDER BY c.created_at DESC`
+      ).all() as any[]);
       return json({ campaigns: rows });
     }
     if (path === "/api/campaigns" && method === "POST") {
       const b = await readBody(req);
+      const companyId = Number(b.company_id) || null;
+      const company = companyId
+        ? (db.query("SELECT id FROM companies WHERE id = ?").get(companyId) as any)
+        : null;
+      if (!company) return json({ error: "a valid company_id is required" }, 400);
       const r = db
-        .prepare("INSERT INTO campaigns (name, status, start_date, end_date, budget, notes) VALUES (?, ?, ?, ?, ?, ?)")
-        .run(b.name || "Untitled campaign", b.status || "draft", b.start_date || "", b.end_date || "",
+        .prepare("INSERT INTO campaigns (name, company_id, status, start_date, end_date, budget, notes) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .run(b.name || "Untitled campaign", companyId, b.status || "draft", b.start_date || "", b.end_date || "",
           Number(b.budget) || 0, b.notes || "");
       const id = Number(r.lastInsertRowid);
       saveCustomValues("campaign", id, b.custom);
@@ -804,6 +813,14 @@ const server = Bun.serve({
       const vals: unknown[] = [];
       for (const k of ["name", "status", "start_date", "end_date", "notes"]) {
         if (b[k] !== undefined) { sets.push(`${k} = ?`); vals.push(b[k]); }
+      }
+      if (b.company_id !== undefined) {
+        const cid = b.company_id === "" ? null : Number(b.company_id);
+        if (cid && !(db.query("SELECT id FROM companies WHERE id = ?").get(cid) as any)) {
+          return json({ error: "unknown company_id" }, 400);
+        }
+        sets.push("company_id = ?");
+        vals.push(cid);
       }
       if (b.budget !== undefined) { sets.push("budget = ?"); vals.push(Number(b.budget) || 0); }
       if (sets.length) {

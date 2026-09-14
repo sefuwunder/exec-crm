@@ -714,13 +714,14 @@ async function editCompanyModal(c) {
 const CAMPAIGN_STATUSES = ["draft", "active", "paused", "completed"];
 
 async function vCampaigns() {
-  const { campaigns } = await GET("/api/campaigns");
+  const [{ campaigns }, { companies }] = await Promise.all([GET("/api/campaigns"), GET("/api/companies")]);
   view.innerHTML = `
     <div class="toolbar"><div class="spacer"></div>
       <button class="btn" id="new-campaign">+ New campaign</button></div>
     <div class="panel"><table>
-      <tr><th>Campaign</th><th>Status</th><th>Start</th><th>End</th><th>Budget</th></tr>
+      <tr><th>Campaign</th><th>Company</th><th>Status</th><th>Start</th><th>End</th><th>Budget</th></tr>
       ${campaigns.map((c) => `<tr class="clickable" data-id="${c.id}"><td><b>${esc(c.name)}</b></td>
+        <td>${esc(c.company_name) || "—"}</td>
         <td>${statusPill(c.status)}</td><td>${esc(c.start_date) || "—"}</td><td>${esc(c.end_date) || "—"}</td>
         <td><b>${money(c.budget)}</b></td></tr>`).join("")}
     </table>${campaigns.length ? "" : `<div class="empty">No campaigns yet — launch your first one.</div>`}</div>`;
@@ -731,6 +732,7 @@ async function vCampaigns() {
     const fields = await getSchemaFields("campaign");
     openModal("New campaign", `
       ${field("Name", input("name"))}
+      ${field("Company *", select("company_id", [["", "— Select company —"]].concat(companies.map((x) => [x.id, x.name]))))}
       <div class="formgrid">
         ${field("Status", select("status", CAMPAIGN_STATUSES.map((s) => [s, s[0].toUpperCase() + s.slice(1)]), "draft"))}
         ${field("Budget ($)", input("budget", "0", "number"))}
@@ -740,6 +742,7 @@ async function vCampaigns() {
       ${field("Notes", `<textarea name="notes" rows="3"></textarea>`)}
       ${cfFieldsHtml(fields)}`,
       async (d) => {
+        if (!d.company_id) { alert("Please choose a company for this campaign."); return; }
         const { campaign } = await POST("/api/campaigns", d);
         location.hash = `#/campaigns/${campaign.id}`;
       }, "Create campaign");
@@ -747,9 +750,10 @@ async function vCampaigns() {
 }
 
 async function editCampaignModal(c) {
-  const fields = await getSchemaFields("campaign");
+  const [fields, { companies }] = await Promise.all([getSchemaFields("campaign"), GET("/api/companies")]);
   openModal("Edit campaign", `
     ${field("Name", input("name", c.name))}
+    ${field("Company *", select("company_id", [["", "— Select company —"]].concat(companies.map((x) => [x.id, x.name])), c.company_id || ""))}
     <div class="formgrid">
       ${field("Status", select("status", CAMPAIGN_STATUSES.map((s) => [s, s[0].toUpperCase() + s.slice(1)]), c.status || "draft"))}
       ${field("Budget ($)", input("budget", c.budget || 0, "number"))}
@@ -759,7 +763,11 @@ async function editCampaignModal(c) {
     ${field("Notes", `<textarea name="notes" rows="3">${esc(c.notes || "")}</textarea>`)}
     ${cfFieldsHtml(fields, c.custom)}
     <div style="margin-top:14px"><button class="btn danger small" id="m-delete">Delete campaign</button></div>`,
-    async (d) => { await PATCH(`/api/campaigns/${c.id}`, d); route(); }, "Save changes");
+    async (d) => {
+      if (!d.company_id) { alert("Please choose a company for this campaign."); return; }
+      await PATCH(`/api/campaigns/${c.id}`, d);
+      route();
+    }, "Save changes");
   $("#m-delete").onclick = async () => {
     if (confirm(`Delete campaign "${c.name}"?`)) {
       await DEL(`/api/campaigns/${c.id}`);
@@ -809,6 +817,7 @@ function renderCampaignDetail(c, tasks, deals) {
       <div>
         <h2 style="margin:0 0 8px">${esc(c.name)}</h2>
         <div class="camp-meta">${statusPill(c.status)}
+          <span>🏢 ${esc(c.company_name) || "—"}</span>
           <span>📅 ${esc(c.start_date) || "—"} → ${esc(c.end_date) || "—"}</span>
           <span>💰 <b>${money(c.budget)}</b></span>
         </div>

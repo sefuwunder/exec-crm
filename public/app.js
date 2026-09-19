@@ -18,7 +18,7 @@ const wsParam = (p) => {
   return p + (p.includes("?") ? "&" : "?") + "workspace=" + encodeURIComponent(wsId);
 };
 const TITLES = {
-  dashboard: "Dashboard", feed: "Daily Feed", pipeline: "Pipeline", contacts: "Contacts",
+  dashboard: "Dashboard", feed: "Daily Feed",
   companies: "Companies", campaigns: "Campaigns", captures: "Captures",
   automations: "Automations", schema: "Schema",
 };
@@ -973,17 +973,44 @@ function collectDrafts() {
   return drafts;
 }
 
+/* compact per-campaign pipeline summary for the campaigns overview */
+function campaignPipelineStrip(deals) {
+  if (!deals.length) return `<span style="color:var(--text-3);font-size:12.5px">No deals</span>`;
+  const totals = new Map();
+  for (const d of deals) totals.set(d.stage, (totals.get(d.stage) || 0) + (Number(d.value) || 0));
+  const ordered = state.stages
+    .filter((s) => totals.has(s))
+    .concat([...totals.keys()].filter((s) => !state.stages.includes(s)));
+  const total = [...totals.values()].reduce((a, v) => a + v, 0);
+  const segs = ordered.map((s) => {
+    const v = totals.get(s) || 0;
+    return `<span title="${esc(state.labels[s] || s)}: ${money(v)}" style="display:block;height:100%;width:${total ? ((v / total) * 100).toFixed(1) : 0}%;background:${stageColor(s)}"></span>`;
+  }).join("");
+  return `<div style="display:flex;align-items:center;gap:8px;min-width:170px;max-width:260px">
+    <div style="display:flex;height:8px;flex:1;border-radius:99px;overflow:hidden;background:var(--border-soft)">${segs}</div>
+    <span style="font-size:12.5px;color:var(--text-2);white-space:nowrap">${deals.length} · <b>${moneyShort(total)}</b></span></div>`;
+}
+
 async function vCampaigns() {
-  const [{ campaigns }, { companies }] = await Promise.all([GET("/api/campaigns"), GET("/api/companies")]);
+  const [{ campaigns }, { companies }, { deals }] = await Promise.all([
+    GET("/api/campaigns"), GET("/api/companies"), GET("/api/deals"),
+  ]);
+  const dealsByCamp = new Map();
+  for (const d of deals || []) {
+    if (d.campaign_id == null) continue;
+    if (!dealsByCamp.has(d.campaign_id)) dealsByCamp.set(d.campaign_id, []);
+    dealsByCamp.get(d.campaign_id).push(d);
+  }
   view.innerHTML = `
     <div class="toolbar"><div class="spacer"></div>
       <button class="btn" id="new-campaign">+ New campaign</button></div>
     <div class="panel"><table>
-      <tr><th>Campaign</th><th>Company</th><th>Status</th><th>Start</th><th>End</th><th>Budget</th></tr>
+      <tr><th>Campaign</th><th>Company</th><th>Status</th><th>Start</th><th>End</th><th>Budget</th><th>Pipeline</th></tr>
       ${campaigns.map((c) => `<tr class="clickable" data-id="${c.id}"><td><b>${esc(c.name)}</b></td>
         <td>${esc(c.company_name) || "—"}</td>
         <td>${statusPill(c.status)}</td><td>${esc(c.start_date) || "—"}</td><td>${esc(c.end_date) || "—"}</td>
-        <td><b>${money(c.budget)}</b></td></tr>`).join("")}
+        <td><b>${money(c.budget)}</b></td>
+        <td>${campaignPipelineStrip(dealsByCamp.get(c.id) || [])}</td></tr>`).join("")}
     </table>${campaigns.length ? "" : `<div class="empty">No campaigns yet — launch your first one.</div>`}</div>`;
   document.querySelectorAll("#view tr.clickable").forEach((tr) => {
     tr.onclick = () => { location.hash = `#/campaigns/${tr.dataset.id}`; };
@@ -1090,39 +1117,6 @@ async function refreshCampaignDetail(c, deals) {
   renderCampaignDetail(c, tasks, deals, camp);
 }
 
-function campaignPipelineHtml(campDeals) {
-  const stageTotals = new Map();
-  for (const d of campDeals) {
-    stageTotals.set(d.stage, (stageTotals.get(d.stage) || 0) + (Number(d.value) || 0));
-  }
-  const maxV = Math.max(1, ...stageTotals.values());
-  const ordered = state.stages
-    .filter((s) => stageTotals.has(s))
-    .concat([...stageTotals.keys()].filter((s) => !state.stages.includes(s)));
-  const total = campDeals.reduce((a, d) => a + (Number(d.value) || 0), 0);
-  let body = `<div class="panel"><div class="sheet-head"><h3 style="margin:0">Pipeline</h3>
-    <span style="color:var(--text-3)">${campDeals.length} deal${campDeals.length === 1 ? "" : "s"} · <b>${money(total)}</b></span></div>`;
-  if (!campDeals.length) {
-    body += `<div class="empty">No deals linked — assign deals to this campaign from the deal editor.</div>`;
-  } else {
-    body += ordered.map((s) => {
-      const ds = campDeals.filter((d) => d.stage === s);
-      const tot = stageTotals.get(s) || 0;
-      return `<div class="stagebar">
-          <div class="name">${esc(state.labels[s] || s)} (${ds.length})</div>
-          <div class="track"><div class="fill" style="width:${Math.round((tot / maxV) * 100)}%;background:${stageColor(s)}"></div></div>
-          <div class="amt">${moneyShort(tot)}</div></div>
-        ${ds.map((d) => `
-          <div class="activity">
-            <div class="dot" style="background:${stageColor(d.stage)}"></div>
-            <div class="text"><b>${esc(d.title)}</b>${d.company_name ? " · " + esc(d.company_name) : ""}${d.contact_name ? " (" + esc(d.contact_name) + ")" : ""}<br>
-            <span style="color:var(--text-3);font-size:12.5px">${money(d.value)} · ${d.probability}%${d.expected_close ? " · closes " + esc(d.expected_close) : ""}${d.owner ? " · " + esc(d.owner) : ""}</span></div>
-          </div>`).join("")}`;
-    }).join("");
-  }
-  return body + `</div>`;
-}
-
 function campaignContactsHtml(contacts) {
   let body = `<div class="panel"><div class="sheet-head"><div style="display:flex;align-items:center;gap:8px"><h3 style="margin:0">Contacts</h3>
     <span style="color:var(--text-3)">${contacts.length}</span></div>
@@ -1189,7 +1183,6 @@ function renderCampaignDetail(c, tasks, deals, camp) {
       ${next ? `<div class="widget wide"><div><div class="w-label">next up</div>
         <div class="w-next">${esc(next.title)}</div><div class="w-due">due ${esc(next.due_date)}</div></div></div>` : ""}
     </div>
-    ${campaignPipelineHtml(camp.deals)}
     <div class="cols2">
       ${campaignContactsHtml(camp.contacts)}
       ${campaignCompaniesHtml(camp.companies)}
@@ -1693,7 +1686,7 @@ function initPalette() {
   async function buildItems() {
     if (cache && cacheWs === wsId) return cache;
     const NAV = [
-      ["Dashboard", "#/dashboard"], ["Daily Feed", "#/feed"], ["Pipeline", "#/pipeline"],
+      ["Dashboard", "#/dashboard"], ["Daily Feed", "#/feed"],
       ["Campaigns", "#/campaigns"], ["Captures", "#/captures"],
       ["Automations", "#/automations"], ["Schema", "#/schema"],
     ];
@@ -1708,7 +1701,7 @@ function initPalette() {
       deals.forEach((d) => out.push({
         group: "Deals", kind: "deal",
         label: d.title, sub: `${money(d.value)} · ${state.labels[d.stage] || d.stage}`,
-        run: () => { location.hash = "#/pipeline"; },
+        run: () => { location.hash = d.campaign_id ? `#/campaigns/${d.campaign_id}` : "#/campaigns"; },
       }));
       contacts.forEach((c) => out.push({
         group: "Contacts", kind: "person",
@@ -1800,7 +1793,7 @@ async function route() {
       await vCampaignDetail(Number(parts[1]));
     } else {
       $("#page-title").textContent = TITLES[name];
-      await { dashboard: vDashboard, feed: vFeed, pipeline: vPipeline, contacts: vContacts,
+      await { dashboard: vDashboard, feed: vFeed, contacts: vContacts,
         companies: vCompanies, campaigns: vCampaigns, captures: vCaptures,
         automations: vAutomations, schema: vSchema }[name]();
     }

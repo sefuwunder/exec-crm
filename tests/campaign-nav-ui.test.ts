@@ -47,13 +47,41 @@ const inputT = (name: string, val: any = "") => `<input name="${name}" value="${
 const selectT = (name: string, options: [any, string][], val: any = "") =>
   `<select name="${name}">${options.map(([v, l]) => `<option value="${v}" ${String(v) === String(val) ? "selected" : ""}>${l}</option>`).join("")}</select>`;
 
-// ---------------------------------------------------------------- nav + links
+describe("nav: pipeline is no longer top-level", () => {
+  test("sidebar nav has no pipeline entry, keeps the rest", () => {
+    const nav = indexSrc.match(/<nav class="nav" id="nav">[\s\S]*?<\/nav>/)![0];
+    expect(nav).not.toContain('data-r="pipeline"');
+    for (const r of ["dashboard", "feed", "campaigns", "captures", "schema", "automations"]) {
+      expect(nav).toContain(`data-r="${r}"`);
+    }
+  });
+
+  test("Cmd+K 'Go to' list drops pipeline", () => {
+    const navBlock = appSrc.match(/const NAV = \[[\s\S]*?\];/)![0];
+    expect(navBlock).not.toContain('"#/pipeline"');
+    expect(navBlock).toContain('"#/campaigns"');
+  });
+
+  test("no visible href points at the pipeline view", () => {
+    expect(appSrc).not.toContain('href="#/pipeline"');
+  });
+
+  test("pipeline deal hits jump to the campaign detail when linked, campaigns otherwise", () => {
+    expect(appSrc).toContain("location.hash = d.campaign_id ? `#/campaigns/${d.campaign_id}` : \"#/campaigns\";");
+  });
+
+  test("router no longer dispatches a pipeline view", () => {
+    expect(appSrc).not.toContain("pipeline: vPipeline");
+  });
+});
+
+// ---------------------------------------------------------------- contacts/companies nav (from the earlier move)
 describe("nav: contacts/companies are no longer top-level", () => {
   test("sidebar nav has no contacts/companies entries, keeps the rest", () => {
     const nav = indexSrc.match(/<nav class="nav" id="nav">[\s\S]*?<\/nav>/)![0];
     expect(nav).not.toContain('data-r="contacts"');
     expect(nav).not.toContain('data-r="companies"');
-    for (const r of ["dashboard", "feed", "pipeline", "campaigns", "captures", "schema", "automations"]) {
+    for (const r of ["dashboard", "feed", "campaigns", "captures", "schema", "automations"]) {
       expect(nav).toContain(`data-r="${r}"`);
     }
   });

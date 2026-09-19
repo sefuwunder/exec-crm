@@ -769,6 +769,7 @@ function initDealDrag(deals) {
 async function editDealModal(d) {
   const { companies } = await GET("/api/companies");
   const { contacts } = await GET("/api/contacts");
+  const { campaigns } = await GET("/api/campaigns");
   const close = openModal("Edit deal", `
     <div class="formgrid">
       ${field("Title", input("title", d.title))}
@@ -776,6 +777,7 @@ async function editDealModal(d) {
       ${field("Company", select("company_id", [["", "—"]].concat(companies.map((c) => [c.id, c.name])), d.company_id || ""))}
       ${field("Contact", select("contact_id", [["", "—"]].concat(contacts.map((c) => [c.id, c.name])), d.contact_id || ""))}
       ${field("Stage", select("stage", state.stages.map((s) => [s, state.labels[s]]), d.stage))}
+      ${field("Campaign", select("campaign_id", [["", "—"]].concat(campaigns.map((c) => [c.id, c.name])), d.campaign_id || ""))}
       ${field("Probability %", input("probability", d.probability, "number"))}
       ${field("Expected close", input("expected_close", d.expected_close || "", "date"))}
       ${field("Owner", input("owner", d.owner || ""))}
@@ -783,6 +785,7 @@ async function editDealModal(d) {
     async (data) => {
       if (data.company_id === "") data.company_id = null;
       if (data.contact_id === "") data.contact_id = null;
+      if (data.campaign_id === "") data.campaign_id = null;
       await PATCH(`/api/deals/${d.id}`, data);
       route();
     }, "Save changes");
@@ -806,6 +809,7 @@ async function editDealModal(d) {
 async function newDealModal() {
   const { companies } = await GET("/api/companies");
   const { contacts } = await GET("/api/contacts");
+  const { campaigns } = await GET("/api/campaigns");
   openModal("New deal", `
     <div class="formgrid">
       ${field("Title", input("title", "", "text", "required"))}
@@ -813,6 +817,7 @@ async function newDealModal() {
       ${field("Company", select("company_id", companies.map((c) => [c.id, c.name])))}
       ${field("Contact", select("contact_id", contacts.map((c) => [c.id, c.name])))}
       ${field("Stage", select("stage", state.stages.map((s) => [s, state.labels[s]])))}
+      ${field("Campaign", select("campaign_id", [["", "—"]].concat(campaigns.map((c) => [c.id, c.name]))))}
       ${field("Probability %", input("probability", "20", "number"))}
       ${field("Expected close", input("expected_close", "", "date"))}
       ${field("Owner", input("owner", "You"))}
@@ -850,7 +855,7 @@ async function vContacts() {
   $("#q").addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
   wireContactCells(contacts, companies);
   $("#new-contact").onclick = async () => {
-    const [{ companies }, { fields }] = await Promise.all([GET("/api/companies"), getSchemaFields("contact")]);
+    const [{ companies }, { fields }, { campaigns }] = await Promise.all([GET("/api/companies"), getSchemaFields("contact"), GET("/api/campaigns")]);
     openModal("New contact", `
       <div class="formgrid">
         ${field("Name", input("name"))}
@@ -858,7 +863,7 @@ async function vContacts() {
         ${field("Company", select("company_id", companies.map((c) => [c.id, c.name])))}
         ${field("Email", input("email", "", "email"))}
         ${field("Phone", input("phone"))}
-        ${field("—", `<div></div>`)}
+        ${field("Campaign", select("campaign_id", [["", "—"]].concat(campaigns.map((c) => [c.id, c.name]))))}
       </div>
       ${cfFieldsHtml(fields)}`,
       async (d) => { await POST("/api/contacts", d); route(); }, "Create contact");
@@ -866,7 +871,7 @@ async function vContacts() {
 }
 
 async function editContactModal(c) {
-  const [{ companies }, { fields }] = await Promise.all([GET("/api/companies"), getSchemaFields("contact")]);
+  const [{ companies }, { fields }, { campaigns }] = await Promise.all([GET("/api/companies"), getSchemaFields("contact"), GET("/api/campaigns")]);
   openModal("Edit contact", `
     <div class="formgrid">
       ${field("Name", input("name", c.name))}
@@ -874,10 +879,14 @@ async function editContactModal(c) {
       ${field("Company", select("company_id", [["", "—"]].concat(companies.map((x) => [x.id, x.name])), c.company_id || ""))}
       ${field("Email", input("email", c.email, "email"))}
       ${field("Phone", input("phone", c.phone))}
-      ${field("—", `<div></div>`)}
+      ${field("Campaign", select("campaign_id", [["", "—"]].concat(campaigns.map((x) => [x.id, x.name])), c.campaign_id || ""))}
     </div>
     ${cfFieldsHtml(fields, c.custom)}`,
-    async (d) => { await PATCH(`/api/contacts/${c.id}`, d); route(); }, "Save changes");
+    async (d) => {
+      if (d.company_id === "") d.company_id = null;
+      if (d.campaign_id === "") d.campaign_id = null;
+      await PATCH(`/api/contacts/${c.id}`, d); route();
+    }, "Save changes");
 }
 
 async function vCompanies() {
@@ -898,22 +907,25 @@ async function vCompanies() {
     </table></div>`;
   wireCompanyCells(companies);
   $("#new-company").onclick = async () => {
-    const fields = await getSchemaFields("company");
+    const [fields, { campaigns }] = await Promise.all([getSchemaFields("company"), GET("/api/campaigns")]);
     openModal("New company", `
       ${field("Name", input("name"))}
-      <div class="formgrid">${field("Industry", input("industry"))}${field("Website", input("website"))}</div>
+      <div class="formgrid">${field("Industry", input("industry"))}${field("Website", input("website"))}${field("Campaign", select("campaign_id", [["", "—"]].concat(campaigns.map((c) => [c.id, c.name]))))}</div>
       ${cfFieldsHtml(fields)}`,
       async (d) => { await POST("/api/companies", d); route(); }, "Create company");
   };
 }
 
 async function editCompanyModal(c) {
-  const fields = await getSchemaFields("company");
+  const [fields, { campaigns }] = await Promise.all([getSchemaFields("company"), GET("/api/campaigns")]);
   openModal("Edit company", `
     ${field("Name", input("name", c.name))}
-    <div class="formgrid">${field("Industry", input("industry", c.industry))}${field("Website", input("website", c.website))}</div>
+    <div class="formgrid">${field("Industry", input("industry", c.industry))}${field("Website", input("website", c.website))}${field("Campaign", select("campaign_id", [["", "—"]].concat(campaigns.map((x) => [x.id, x.name])), c.campaign_id || ""))}</div>
     ${cfFieldsHtml(fields, c.custom)}`,
-    async (d) => { await PATCH(`/api/companies/${c.id}`, d); route(); }, "Save changes");
+    async (d) => {
+      if (d.campaign_id === "") d.campaign_id = null;
+      await PATCH(`/api/companies/${c.id}`, d); route();
+    }, "Save changes");
 }
 
 /* ---------- campaigns ---------- */
@@ -984,26 +996,94 @@ async function editCampaignModal(c) {
 }
 
 /* ---------- campaign detail: workflow task spreadsheet + widgets ---------- */
+async function campaignEntities(id) {
+  const [{ deals }, { contacts }, { companies }] = await Promise.all([
+    GET(`/api/deals?campaign_id=${id}`),
+    GET(`/api/contacts?campaign_id=${id}`),
+    GET(`/api/companies?campaign_id=${id}`),
+  ]);
+  return { deals, contacts, companies };
+}
+
 async function vCampaignDetail(id) {
-  const [{ campaigns }, { tasks }, { deals }] = await Promise.all([
+  const [{ campaigns }, { tasks }, { deals }, camp] = await Promise.all([
     GET("/api/campaigns"),
     GET(`/api/tasks?campaign_id=${id}`),
     GET("/api/deals"),
+    campaignEntities(id),
   ]);
   const c = campaigns.find((x) => x.id === id);
   if (!c) {
     view.innerHTML = `<div class="empty">Campaign not found. <a href="#/campaigns">Back to campaigns</a>.</div>`;
     return;
   }
-  renderCampaignDetail(c, tasks, deals);
+  renderCampaignDetail(c, tasks, deals, camp);
 }
 
 async function refreshCampaignDetail(c, deals) {
-  const { tasks } = await GET(`/api/tasks?campaign_id=${c.id}`);
-  renderCampaignDetail(c, tasks, deals);
+  const [{ tasks }, camp] = await Promise.all([
+    GET(`/api/tasks?campaign_id=${c.id}`),
+    campaignEntities(c.id),
+  ]);
+  renderCampaignDetail(c, tasks, deals, camp);
 }
 
-function renderCampaignDetail(c, tasks, deals) {
+function campaignPipelineHtml(campDeals) {
+  const stageTotals = new Map();
+  for (const d of campDeals) {
+    stageTotals.set(d.stage, (stageTotals.get(d.stage) || 0) + (Number(d.value) || 0));
+  }
+  const maxV = Math.max(1, ...stageTotals.values());
+  const ordered = state.stages
+    .filter((s) => stageTotals.has(s))
+    .concat([...stageTotals.keys()].filter((s) => !state.stages.includes(s)));
+  const total = campDeals.reduce((a, d) => a + (Number(d.value) || 0), 0);
+  let body = `<div class="panel"><div class="sheet-head"><h3 style="margin:0">Pipeline</h3>
+    <span style="color:var(--text-3)">${campDeals.length} deal${campDeals.length === 1 ? "" : "s"} · <b>${money(total)}</b></span></div>`;
+  if (!campDeals.length) {
+    body += `<div class="empty">No deals linked — assign deals to this campaign from the deal editor.</div>`;
+  } else {
+    body += ordered.map((s) => {
+      const ds = campDeals.filter((d) => d.stage === s);
+      const tot = stageTotals.get(s) || 0;
+      return `<div class="stagebar">
+          <div class="name">${esc(state.labels[s] || s)} (${ds.length})</div>
+          <div class="track"><div class="fill" style="width:${Math.round((tot / maxV) * 100)}%;background:${stageColor(s)}"></div></div>
+          <div class="amt">${moneyShort(tot)}</div></div>
+        ${ds.map((d) => `
+          <div class="activity">
+            <div class="dot" style="background:${stageColor(d.stage)}"></div>
+            <div class="text"><b>${esc(d.title)}</b>${d.company_name ? " · " + esc(d.company_name) : ""}${d.contact_name ? " (" + esc(d.contact_name) + ")" : ""}<br>
+            <span style="color:var(--text-3);font-size:12.5px">${money(d.value)} · ${d.probability}%${d.expected_close ? " · closes " + esc(d.expected_close) : ""}${d.owner ? " · " + esc(d.owner) : ""}</span></div>
+          </div>`).join("")}`;
+    }).join("");
+  }
+  return body + `</div>`;
+}
+
+function campaignContactsHtml(contacts) {
+  let body = `<div class="panel"><div class="sheet-head"><h3 style="margin:0">Contacts</h3>
+    <span style="color:var(--text-3)">${contacts.length}</span></div>`;
+  body += contacts.length
+    ? `<table><tr><th>Name</th><th>Title</th><th>Company</th><th>Email</th></tr>
+      ${contacts.map((ct) => `<tr><td><b>${esc(ct.name)}</b></td><td>${esc(ct.title) || "—"}</td>
+        <td>${esc(ct.company_name) || "—"}</td><td>${esc(ct.email) || "—"}</td></tr>`).join("")}</table>`
+    : `<div class="empty">No contacts linked — assign contacts from the contact editor.</div>`;
+  return body + `</div>`;
+}
+
+function campaignCompaniesHtml(companies) {
+  let body = `<div class="panel"><div class="sheet-head"><h3 style="margin:0">Companies</h3>
+    <span style="color:var(--text-3)">${companies.length}</span></div>`;
+  body += companies.length
+    ? `<table><tr><th>Company</th><th>Industry</th><th>Website</th></tr>
+      ${companies.map((co) => `<tr><td><b>${esc(co.name)}</b></td><td>${esc(co.industry) || "—"}</td>
+        <td>${esc(co.website) || "—"}</td></tr>`).join("")}</table>`
+    : `<div class="empty">No companies linked — assign companies from the company editor.</div>`;
+  return body + `</div>`;
+}
+
+function renderCampaignDetail(c, tasks, deals, camp) {
   const today = toISODate(new Date());
   const open = tasks.filter((t) => !t.done);
   const done = tasks.filter((t) => t.done);
@@ -1044,6 +1124,11 @@ function renderCampaignDetail(c, tasks, deals) {
       <div class="widget"><div><div class="w-num" style="color:#18a058">${done.length}</div><div class="w-label">done</div></div></div>
       ${next ? `<div class="widget wide"><div><div class="w-label">next up</div>
         <div class="w-next">${esc(next.title)}</div><div class="w-due">due ${esc(next.due_date)}</div></div></div>` : ""}
+    </div>
+    ${campaignPipelineHtml(camp.deals)}
+    <div class="cols2">
+      ${campaignContactsHtml(camp.contacts)}
+      ${campaignCompaniesHtml(camp.companies)}
     </div>
     <div class="panel sheet-wrap">
       <div class="sheet-head">

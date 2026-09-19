@@ -174,6 +174,17 @@ export function openDb(path: string): Database {
     db.exec("ALTER TABLE tasks ADD COLUMN campaign_id INTEGER REFERENCES campaigns(id)");
   }
   db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_campaign ON tasks(campaign_id)");
+  // migration: deals, contacts and companies can be linked to a campaign.
+  // Nullable campaign_id; deleting a campaign nulls the link, never the record.
+  for (const t of ["deals", "contacts", "companies"]) {
+    const cols = db.query(`PRAGMA table_info(${t})`).all() as any[];
+    if (!cols.some((c) => c.name === "campaign_id")) {
+      db.exec(`ALTER TABLE ${t} ADD COLUMN campaign_id INTEGER REFERENCES campaigns(id)`);
+    }
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_deals_campaign ON deals(campaign_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_contacts_campaign ON contacts(campaign_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_companies_campaign ON companies(campaign_id)");
   // migration: campaigns are now connected to a company
   const campCols = db.query("PRAGMA table_info(campaigns)").all() as any[];
   if (!campCols.some((c) => c.name === "company_id")) {

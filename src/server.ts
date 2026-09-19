@@ -211,6 +211,18 @@ function dealJson(id: number, w: number) {
 }
 
 // ---------------------------------------------------------------- helpers
+// Validate an incoming campaign_id against the active workspace.
+// Returns null for empty/missing, the numeric id for a workspace-owned
+// campaign, or false when the id is not a campaign in this workspace.
+function resolveCampaign(w: number, raw: any): number | null | false {
+  if (raw === undefined || raw === null || raw === "") return null;
+  const cid = Number(raw);
+  if (!cid) return false;
+  const hit = db
+    .query("SELECT id FROM campaigns WHERE id = ? AND workspace_id = ?")
+    .get(cid, w) as any;
+  return hit ? cid : false;
+}
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), {
     status,
@@ -562,16 +574,17 @@ const server = Bun.serve({
     if (path === "/api/deals" && method === "GET") {
       const w = needWs(req, url);
       if (w instanceof Response) return w;
+      const campId = url.searchParams.get("campaign_id");
       const rows = db
         .query(
           `SELECT d.*, c.name AS company_name, ct.name AS contact_name
            FROM deals d
            LEFT JOIN companies c ON c.id = d.company_id
            LEFT JOIN contacts ct ON ct.id = d.contact_id
-           WHERE d.workspace_id = ?
+           WHERE d.workspace_id = ?${campId ? " AND d.campaign_id = ?" : ""}
            ORDER BY d.updated_at DESC`
         )
-        .all(w);
+        .all(w, ...(campId ? [Number(campId)] : []));
       const wsStages = workspaceStages(db, w);
       const labels: Record<string, string> = {};
       for (const s of wsStages) labels[s.slug] = s.name;
@@ -581,11 +594,13 @@ const server = Bun.serve({
       const w = needWs(req, url);
       if (w instanceof Response) return w;
       const b = await readBody(req);
+      const campaignId = resolveCampaign(w, b.campaign_id);
+      if (campaignId === false) return json({ error: "unknown campaign_id" }, 400);
       const r = db
         .prepare(
           `INSERT INTO deals (title, company_id, contact_id, value, stage,
-           probability, expected_close, owner, workspace_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           probability, expected_close, owner, campaign_id, workspace_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           b.title || "Untitled deal",
@@ -596,6 +611,7 @@ const server = Bun.serve({
           Number(b.probability ?? 10),
           b.expected_close || "",
           b.owner || "",
+          campaignId,
           w
         );
       const deal = dealJson(Number(r.lastInsertRowid), w);
@@ -620,6 +636,12 @@ const server = Bun.serve({
           sets.push(`${k} = ?`);
           vals.push(b[k]);
         }
+      }
+      if (b.campaign_id !== undefined) {
+        const campaignId = resolveCampaign(w, b.campaign_id);
+        if (campaignId === false) return json({ error: "unknown campaign_id" }, 400);
+        sets.push("campaign_id = ?");
+        vals.push(campaignId);
       }
       if (sets.length) {
         sets.push("updated_at = datetime('now')");
@@ -654,6 +676,7 @@ const server = Bun.serve({
       const w = needWs(req, url);
       if (w instanceof Response) return w;
       const q = url.searchParams.get("q") || "";
+      const campId = url.searchParams.get("campaign_id");
       const rows = attachCustom(
         "contact",
         db
@@ -661,9 +684,10 @@ const server = Bun.serve({
             `SELECT ct.*, c.name AS company_name FROM contacts ct
              LEFT JOIN companies c ON c.id = ct.company_id
              WHERE ct.workspace_id = ? AND (ct.name LIKE ? OR ct.email LIKE ?)
+             ${campId ? "AND ct.campaign_id = ?" : ""}
              ORDER BY ct.name`
           )
-          .all(w, `%${q}%`, `%${q}%`) as any[]
+          .all(w, `%${q}%`, `%${q}%`, ...(campId ? [Number(campId)] : [])) as any[]
       );
       return json({ contacts: rows });
     }
@@ -671,11 +695,13 @@ const server = Bun.serve({
       const w = needWs(req, url);
       if (w instanceof Response) return w;
       const b = await readBody(req);
+      const campaignId = resolveCampaign(w, b.campaign_id);
+      if (campaignId === false) return json({ error: "unknown campaign_id" }, 400);
       const r = db
         .prepare(
-          "INSERT INTO contacts (company_id, name, title, email, phone, workspace_id) VALUES (?, ?, ?, ?, ?, ?)"
+          "INSERT INTO contacts (company_id, name, title, email, phone, campaign_id, workspace_id) VALUES (?, ?, ?, ?, ?, ?, ?)"
         )
-        .run(b.company_id || null, b.name || "Unnamed", b.title || "", b.email || "", b.phone || "", w);
+        .run(b.company_id || null, b.name || "Unnamed", b.title || "", b.email || "", b.phone || "", campaignId, w);
       const id = Number(r.lastInsertRowid);
       saveCustomValues("contact", id, b.custom, w);
       const contact = attachCustom("contact", [
@@ -701,6 +727,12 @@ const server = Bun.serve({
           sets.push(`${k} = ?`);
           vals.push(k === "company_id" && b[k] === "" ? null : b[k]);
         }
+      }
+      if (b.campaign_id !== undefined) {
+        const campaignId = resolveCampaign(w, b.campaign_id);
+        if (campaignId === false) return json({ error: "unknown campaign_id" }, 400);
+        sets.push("campaign_id = ?");
+        vals.push(campaignId);
       }
       if (sets.length) {
         db.prepare(`UPDATE contacts SET ${sets.join(", ")} WHERE id = ?`)
@@ -802,6 +834,7 @@ const server = Bun.serve({
     if (path === "/api/companies" && method === "GET") {
       const w = needWs(req, url);
       if (w instanceof Response) return w;
+      const campId = url.searchParams.get("campaign_id");
       const rows = attachCustom(
         "company",
         db
@@ -809,10 +842,10 @@ const server = Bun.serve({
             `SELECT c.*, COUNT(d.id) AS deal_count,
                     COALESCE(SUM(CASE WHEN d.stage NOT IN ('closed_won','closed_lost') THEN d.value ELSE 0 END),0) AS open_value
              FROM companies c LEFT JOIN deals d ON d.company_id = c.id AND d.workspace_id = c.workspace_id
-             WHERE c.workspace_id = ?
+             WHERE c.workspace_id = ?${campId ? " AND c.campaign_id = ?" : ""}
              GROUP BY c.id ORDER BY open_value DESC`
           )
-          .all(w) as any[]
+          .all(w, ...(campId ? [Number(campId)] : [])) as any[]
       );
       return json({ companies: rows });
     }
@@ -820,9 +853,11 @@ const server = Bun.serve({
       const w = needWs(req, url);
       if (w instanceof Response) return w;
       const b = await readBody(req);
+      const campaignId = resolveCampaign(w, b.campaign_id);
+      if (campaignId === false) return json({ error: "unknown campaign_id" }, 400);
       const r = db
-        .prepare("INSERT INTO companies (name, industry, website, workspace_id) VALUES (?, ?, ?, ?)")
-        .run(b.name || "Unnamed", b.industry || "", b.website || "", w);
+        .prepare("INSERT INTO companies (name, industry, website, campaign_id, workspace_id) VALUES (?, ?, ?, ?, ?)")
+        .run(b.name || "Unnamed", b.industry || "", b.website || "", campaignId, w);
       const id = Number(r.lastInsertRowid);
       saveCustomValues("company", id, b.custom, w);
       const company = attachCustom("company", [
@@ -847,6 +882,12 @@ const server = Bun.serve({
           sets.push(`${k} = ?`);
           vals.push(b[k]);
         }
+      }
+      if (b.campaign_id !== undefined) {
+        const campaignId = resolveCampaign(w, b.campaign_id);
+        if (campaignId === false) return json({ error: "unknown campaign_id" }, 400);
+        sets.push("campaign_id = ?");
+        vals.push(campaignId);
       }
       if (sets.length) {
         db.prepare(`UPDATE companies SET ${sets.join(", ")} WHERE id = ?`)
@@ -1247,6 +1288,10 @@ const server = Bun.serve({
       if (c) {
         db.prepare("DELETE FROM custom_values WHERE entity = 'campaign' AND record_id = ?").run(c.id);
         db.prepare("UPDATE tasks SET campaign_id = NULL WHERE campaign_id = ?").run(c.id);
+        // deleting a campaign unlinks its pipeline/contacts/companies, never removes them
+        db.prepare("UPDATE deals SET campaign_id = NULL WHERE campaign_id = ?").run(c.id);
+        db.prepare("UPDATE contacts SET campaign_id = NULL WHERE campaign_id = ?").run(c.id);
+        db.prepare("UPDATE companies SET campaign_id = NULL WHERE campaign_id = ?").run(c.id);
         db.prepare("DELETE FROM campaigns WHERE id = ?").run(c.id);
         fireWebhooks("campaign.deleted", { id: c.id, name: c.name, workspace_id: w }, w);
       } else {

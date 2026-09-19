@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS incoming_hooks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
   key TEXT NOT NULL UNIQUE,
+  workspace_id INTEGER REFERENCES workspaces(id),
   created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS settings (
@@ -169,10 +170,12 @@ export function openDb(path: string): Database {
     db.exec("ALTER TABLE campaigns ADD COLUMN company_id INTEGER REFERENCES companies(id)");
   }
   // migration: workspaces — every record lives in exactly one workspace.
-  // incoming_hooks and settings stay global (integration keys / app config).
+  // settings stays global (app config). incoming_hooks are per-workspace so an
+  // automation platform posts to one hook and its records land in that hook's
+  // workspace with no query-param juggling.
   const SCOPED = [
     "companies", "contacts", "deals", "tasks", "campaigns",
-    "activities", "captures", "custom_fields", "webhooks",
+    "activities", "captures", "custom_fields", "webhooks", "incoming_hooks",
   ];
   for (const t of SCOPED) {
     const cols = db.query(`PRAGMA table_info(${t})`).all() as any[];

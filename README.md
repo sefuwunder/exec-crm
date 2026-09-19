@@ -48,7 +48,9 @@ Payload shape: `{"event": "...", "sent_at": "...", "data": {...}}` with an
 `X-CRM-Event` header. Every delivery (ok / error / failed) is logged and
 visible in the Automations view; a **Test** button sends a sample payload.
 
-**Incoming** — create a hook, then POST from any platform's HTTP step:
+**Incoming** — each hook belongs to exactly one workspace (the one active
+when it's created). Create a hook, then POST from any platform's HTTP step —
+records land in the hook's workspace automatically:
 
 ```sh
 curl -X POST localhost:3001/api/hooks/in/YOUR_KEY \
@@ -56,8 +58,11 @@ curl -X POST localhost:3001/api/hooks/in/YOUR_KEY \
   -d '{"action":"create_deal","data":{"title":"Acme renewal","value":120000,"stage":"proposal"}}'
 ```
 
-Actions: `create_deal`, `create_contact`, `create_task`. Inbound records also
-fan out to outgoing webhooks, so chains compose.
+Actions: `create_deal`, `create_contact`, `create_task`. An explicit
+`?workspace=<id>` on the hook URL overrides the hook's workspace for one-off
+routing. Reassign a hook from the Automations view, or
+`PATCH /api/hooks/:id {"workspace_id": 2}`. Inbound records also fan out to
+outgoing webhooks, so chains compose.
 
 ## API
 
@@ -65,7 +70,7 @@ fan out to outgoing webhooks, so chains compose.
 `GET|POST /api/contacts` · `GET|POST /api/companies` · `GET|POST /api/tasks` ·
 `POST /api/tasks/:id/toggle` · `GET /api/activities` · `GET /api/webhooks` ·
 `POST /api/webhooks/:id/test` · `GET /api/deliveries` · `GET|POST /api/hooks` ·
-`DELETE /api/hooks/:id` · `POST /api/hooks/in/:key` ·
+`PATCH|DELETE /api/hooks/:id` · `POST /api/hooks/in/:key` ·
 `GET|POST /api/captures` (multipart `photos[]`) · `PATCH|DELETE /api/captures/:id` ·
 `GET /uploads/:file` ·
 `GET /api/schema/:entity` · `POST /api/schema/:entity` · `PATCH|DELETE /api/schema/fields/:id` ·

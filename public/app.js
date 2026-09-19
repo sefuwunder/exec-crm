@@ -7,10 +7,13 @@ const WS_KEY = "exec-crm-workspace";
 let workspaces = [];
 let wsId = null;
 let paletteBust = () => {}; // reassigned by initPalette to clear the Cmd+K index
+let showAllHooks = false; // incoming-hooks manager filter ("show all workspaces" toggle)
 // append the active workspace to every API call, except the global ones
 const wsParam = (p) => {
   if (wsId == null) return p;
-  if (p.startsWith("/api/workspaces") || p.startsWith("/api/hooks")) return p;
+  // /api/hooks/in/:key is called by external platforms — the hook itself
+  // determines the workspace, never the query string.
+  if (p.startsWith("/api/workspaces") || p.startsWith("/api/hooks/in/")) return p;
   if (p === "/api/meta-colors" || p === "/api/contacts/import/template") return p;
   return p + (p.includes("?") ? "&" : "?") + "workspace=" + encodeURIComponent(wsId);
 };
@@ -1238,7 +1241,7 @@ async function editTaskModal(t, deals) {
 async function vAutomations() {
   const { webhooks, events } = await GET("/api/webhooks");
   const { deliveries } = await GET("/api/deliveries");
-  const { hooks } = await GET("/api/hooks");
+  const { hooks } = await GET(showAllHooks ? "/api/hooks?all=1" : "/api/hooks");
   const base = location.origin;
   view.innerHTML = `
     <div class="panel">
@@ -1267,12 +1270,17 @@ async function vAutomations() {
     </div>
     <div class="panel">
       <h2>Incoming hooks <span style="color:var(--text-3);font-weight:400;font-size:13px">— Zapier / Make / n8n → CRM</span></h2>
-      <p style="color:var(--text-2);margin-top:-6px">POST JSON to the hook URL from any automation platform. Body: <span class="tag">{"action": "create_deal" | "create_contact" | "create_task", "data": {...}}</span></p>
+      <p style="color:var(--text-2);margin-top:-6px">POST JSON to the hook URL from any automation platform. Each hook belongs to one workspace, and records land there automatically — no workspace juggling on the platform side. Body: <span class="tag">{"action": "create_deal" | "create_contact" | "create_task", "data": {...}}</span></p>
+      <div class="toolbar" style="margin-bottom:10px">
+        <label style="font-weight:400;font-size:13px"><input type="checkbox" id="hooks-all" style="width:auto" ${showAllHooks ? "checked" : ""}> Show hooks from all workspaces</label>
+      </div>
       ${hooks.map((h) => `
-        <div class="hook"><div class="info"><div class="name">${esc(h.name)}</div>
+        <div class="hook"><div class="info"><div class="name">${esc(h.name)}
+            <span class="tag"><span class="ws-dot" style="background:${esc(h.workspace_color || "#999")}"></span>${esc(h.workspace_name || "—")}</span></div>
           <div class="url">${esc(base)}/api/hooks/in/${esc(h.key)}</div></div>
+          <select data-hws="${h.id}" title="Move hook to another workspace">${workspaces.map((x) => `<option value="${x.id}" ${x.id === h.workspace_id ? "selected" : ""}>→ ${esc(x.name)}</option>`).join("")}</select>
           <button class="btn ghost small" data-copy="${esc(base)}/api/hooks/in/${esc(h.key)}">Copy URL</button>
-          <button class="btn danger small" data-hdel="${h.id}">Delete</button></div>`).join("") || `<div class="empty">No incoming hooks yet.</div>`}
+          <button class="btn danger small" data-hdel="${h.id}">Delete</button></div>`).join("") || `<div class="empty">No incoming hooks yet${showAllHooks ? "" : " in this workspace"}.</div>`}
       <button class="btn" id="add-hook">+ New incoming hook</button>
       <h3>Example — n8n / Make / Zapier HTTP step</h3>
       <div class="code">POST ${esc(base)}/api/hooks/in/YOUR_KEY
@@ -1319,9 +1327,16 @@ Content-Type: application/json
     (b.onclick = () => { navigator.clipboard.writeText(b.dataset.copy); b.textContent = "Copied!"; }));
   document.querySelectorAll("[data-hdel]").forEach((b) =>
     (b.onclick = async () => { if (confirm("Delete this hook?")) { await DEL(`/api/hooks/${b.dataset.hdel}`); route(); } }));
-  $("#add-hook").onclick = () =>
-    openModal("New incoming hook", field("Name", input("name", "n8n deal intake")),
+  document.querySelectorAll("[data-hws]").forEach((s) =>
+    (s.onchange = async () => { await PATCH(`/api/hooks/${s.dataset.hws}`, { workspace_id: Number(s.value) }); route(); }));
+  $("#hooks-all").onchange = (e) => { showAllHooks = e.target.checked; route(); };
+  $("#add-hook").onclick = () => {
+    const w = workspaces.find((x) => x.id === wsId);
+    openModal("New incoming hook",
+      `<p style="color:var(--text-2);font-size:13px;margin:0 0 8px">Creates in <span class="tag"><span class="ws-dot" style="background:${esc((w && w.color) || "#999")}"></span>${esc((w && w.name) || "—")}</span> — switch workspaces in the topbar to change it.</p>` +
+      field("Name", input("name", "n8n deal intake")),
       async (d) => { const r = await POST("/api/hooks", d); alert("Hook URL:\n" + location.origin + "/api/hooks/in/" + r.hook.key); route(); }, "Create hook");
+  };
 
   const csvFile = $("#csv-file");
   csvFile.onchange = () => {

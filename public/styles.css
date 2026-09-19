@@ -461,6 +461,8 @@ td { transition: background 0.12s ease; }
 }
 .ws-btn:hover { border-color: #d3d8e4; background: #fff; }
 .ws-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+/* workspace dot inside inline badges (hook rows, modal notes) */
+.tag .ws-dot { display: inline-block; vertical-align: -1px; margin-right: 4px; }
 .ws-caret { color: var(--text-3); font-size: 11px; }
 .ws-menu {
   position: absolute; right: 0; top: calc(100% + 6px); min-width: 230px;

@@ -297,7 +297,7 @@ const server = Bun.serve({
         return json({ error: "cannot delete the last workspace" }, 400);
       }
       const counts: Record<string, number> = {};
-      for (const t of ["companies", "contacts", "deals", "tasks", "campaigns", "activities", "captures", "custom_fields", "webhooks"]) {
+      for (const t of ["companies", "contacts", "deals", "tasks", "campaigns", "activities", "captures", "custom_fields", "webhooks", "incoming_hooks"]) {
         counts[t] = (db.query(`SELECT COUNT(*) n FROM ${t} WHERE workspace_id = ?`).get(ws.id) as any).n;
       }
       const records = Object.values(counts).reduce((a, b) => a + b, 0);
@@ -315,6 +315,7 @@ const server = Bun.serve({
         db.query(`DELETE FROM webhook_deliveries WHERE webhook_id IN (${whIds.map(() => "?").join(",")})`).run(...whIds);
       }
       db.prepare("DELETE FROM webhooks WHERE workspace_id = ?").run(ws.id);
+      db.prepare("DELETE FROM incoming_hooks WHERE workspace_id = ?").run(ws.id);
       const fieldIds = (db.query("SELECT id FROM custom_fields WHERE workspace_id = ?").all(ws.id) as any[]).map((x) => x.id);
       if (fieldIds.length) {
         db.query(`DELETE FROM custom_values WHERE field_id IN (${fieldIds.map(() => "?").join(",")})`).run(...fieldIds);
@@ -1145,21 +1146,61 @@ const server = Bun.serve({
     }
 
     // ---- incoming hooks (Zapier / Make / n8n -> CRM)
+    // Each hook belongs to exactly one workspace. The management routes are
+    // scoped to the active workspace (with ?all=1 to list every workspace's
+    // hooks for the manager UI); the public /in/:key route is unscoped since
+    // the hook itself determines the target workspace.
     if (path === "/api/hooks" && method === "GET") {
-      return json({ hooks: db.query("SELECT id, name, key, created_at FROM incoming_hooks").all() });
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const q = `SELECT h.*, w.name AS workspace_name, w.color AS workspace_color
+                 FROM incoming_hooks h LEFT JOIN workspaces w ON w.id = h.workspace_id`;
+      const rows =
+        url.searchParams.get("all") === "1"
+          ? db.query(q + " ORDER BY h.id DESC").all()
+          : db.query(q + " WHERE h.workspace_id = ? ORDER BY h.id DESC").all(w);
+      return json({ hooks: rows });
     }
     if (path === "/api/hooks" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const b = await readBody(req);
       const key = b.key || crypto.randomUUID().replace(/-/g, "").slice(0, 24);
-      const r = db.prepare("INSERT INTO incoming_hooks (name, key) VALUES (?, ?)").run(b.name || "Untitled hook", key);
+      const r = db.prepare("INSERT INTO incoming_hooks (name, key, workspace_id) VALUES (?, ?, ?)")
+        .run(b.name || "Untitled hook", key, w);
       return json(
-        { hook: db.query("SELECT id, name, key, created_at FROM incoming_hooks WHERE id = ?").get(Number(r.lastInsertRowid)) },
+        { hook: db.query("SELECT id, name, key, workspace_id, created_at FROM incoming_hooks WHERE id = ?").get(Number(r.lastInsertRowid)) },
         201
       );
     }
     const hookDel = path.match(/^\/api\/hooks\/(\d+)$/);
+    if (hookDel && method === "PATCH") {
+      const hook = db.query("SELECT * FROM incoming_hooks WHERE id = ?").get(Number(hookDel[1])) as any;
+      if (!hook) return json({ error: "not found" }, 404);
+      const b = await readBody(req);
+      const sets: string[] = [];
+      const vals: any[] = [];
+      if (typeof b.name === "string" && b.name.trim()) {
+        sets.push("name = ?");
+        vals.push(b.name.trim());
+      }
+      if (b.workspace_id !== undefined) {
+        const target = allWorkspaces().find((x) => String(x.id) === String(b.workspace_id));
+        if (!target) return json({ error: `unknown workspace "${b.workspace_id}"` }, 400);
+        sets.push("workspace_id = ?");
+        vals.push(target.id);
+      }
+      if (sets.length) {
+        db.prepare(`UPDATE incoming_hooks SET ${sets.join(", ")} WHERE id = ?`).run(...vals, hook.id);
+      }
+      return json({ hook: db.query("SELECT * FROM incoming_hooks WHERE id = ?").get(hook.id) });
+    }
     if (hookDel && method === "DELETE") {
-      db.prepare("DELETE FROM incoming_hooks WHERE id = ?").run(Number(hookDel[1]));
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const hit = db.prepare("DELETE FROM incoming_hooks WHERE id = ? AND workspace_id = ?")
+        .run(Number(hookDel[1]), w);
+      if (!hit.changes) return json({ error: "not found" }, 404);
       return json({ ok: true });
     }
     const hookIn = path.match(/^\/api\/hooks\/in\/([A-Za-z0-9]+)$/);
@@ -1170,14 +1211,21 @@ const server = Bun.serve({
       // normalize: accept {action, data} or flat fields with action
       const action = b.action || "create_deal";
       const data = b.data || b;
-      const target = url.searchParams.get("workspace") || b.workspace_id || data.workspace_id;
+      // The hook owns its workspace: deliveries land there with no extra
+      // params. An explicit ?workspace= may override it for one-off routing
+      // (e.g. a shared intake hook fanning into several spaces).
+      const target = url.searchParams.get("workspace");
       let w: number;
       if (target) {
         const found = allWorkspaces().find((x) => String(x.id) === String(target));
         if (!found) return json({ error: `unknown workspace "${target}"` }, 400);
         w = found.id;
+      } else if (hook.workspace_id != null) {
+        w = hook.workspace_id;
       } else {
-        w = needWs(req, url) as number;
+        const dflt = needWs(req, url);
+        if (dflt instanceof Response) return dflt;
+        w = dflt;
       }
       let result: any = null;
       if (action === "create_deal") {

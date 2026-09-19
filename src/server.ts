@@ -1,4 +1,4 @@
-import { openDb, seedIfEmpty, ensureMainWorkspace, STAGES, STAGE_LABELS } from "./db";
+import { openDb, seedIfEmpty, ensureMainWorkspace, seedStages, workspaceStages, stageSlugs, slugifyStage, renumberStages } from "./db";
 
 const PORT = Number(process.env.PORT || 3001);
 const db = openDb(process.env.CRM_DB || "./crm.db");
@@ -332,8 +332,10 @@ const server = Bun.serve({
       const r = db
         .prepare("INSERT INTO workspaces (name, color) VALUES (?, ?)")
         .run(name, color);
+      const newId = Number(r.lastInsertRowid);
+      seedStages(db, newId);
       return json(
-        { workspace: db.query("SELECT * FROM workspaces WHERE id = ?").get(Number(r.lastInsertRowid)) },
+        { workspace: db.query("SELECT * FROM workspaces WHERE id = ?").get(newId) },
         201
       );
     }
@@ -364,7 +366,7 @@ const server = Bun.serve({
         return json({ error: "cannot delete the last workspace" }, 400);
       }
       const counts: Record<string, number> = {};
-      for (const t of ["companies", "contacts", "deals", "tasks", "campaigns", "activities", "captures", "custom_fields", "webhooks", "incoming_hooks"]) {
+      for (const t of ["companies", "contacts", "deals", "tasks", "campaigns", "activities", "captures", "custom_fields", "webhooks", "incoming_hooks", "stages"]) {
         counts[t] = (db.query(`SELECT COUNT(*) n FROM ${t} WHERE workspace_id = ?`).get(ws.id) as any).n;
       }
       const records = Object.values(counts).reduce((a, b) => a + b, 0);
@@ -392,11 +394,132 @@ const server = Bun.serve({
       for (const f of capFiles) {
         try { await Bun.$`rm -f ${UPLOAD_DIR}/${f.filename}`.quiet(); } catch {}
       }
-      for (const t of ["activities", "captures", "tasks", "deals", "contacts", "campaigns", "companies"]) {
+      for (const t of ["activities", "captures", "tasks", "deals", "contacts", "campaigns", "companies", "stages"]) {
         db.prepare(`DELETE FROM ${t} WHERE workspace_id = ?`).run(ws.id);
       }
       db.prepare("DELETE FROM workspaces WHERE id = ?").run(ws.id);
       return json({ ok: true, deleted_records: records });
+    }
+
+    // ---- pipeline stages (per-workspace editable schema) -----------------------
+    // deals.stage stays a TEXT slug; this table owns the ordered schema.
+    // Slugs are immutable once created — renames only change the display name —
+    // so deal references and automation filters never silently break.
+    // Fall back to the workspace's first stage when a payload names an unknown one.
+    const validStage = (w: number, s: any): string => {
+      const slugs = stageSlugs(db, w);
+      return typeof s === "string" && slugs.includes(s) ? s : slugs[0] || "prospecting";
+    };
+    const stageRow = (w: number, slug: string) =>
+      db.query("SELECT slug, name, position, color FROM stages WHERE workspace_id = ? AND slug = ?").get(w, slug) as any;
+    const stageDeals = (w: number, slug: string) =>
+      (db.query("SELECT COUNT(*) n FROM deals WHERE workspace_id = ? AND stage = ?").get(w, slug) as any).n;
+    if (path === "/api/stages" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      seedStages(db, w);
+      const stages = workspaceStages(db, w).map((s) => ({ ...s, deals: stageDeals(w, s.slug) }));
+      return json({ stages });
+    }
+    if (path === "/api/stages" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const b = await readBody(req);
+      const name = String(b.name || "").trim();
+      if (!name) return json({ error: "name is required" }, 400);
+      const slug = slugifyStage(name);
+      if (!slug) return json({ error: `name "${name}" produces no usable slug` }, 400);
+      seedStages(db, w);
+      if (stageRow(w, slug)) return json({ error: `stage "${slug}" already exists` }, 409);
+      const color = /^#[0-9a-fA-F]{6}$/.test(String(b.color || "")) ? b.color : "#579bfc";
+      const order = workspaceStages(db, w).map((s) => s.slug);
+      let at = order.length; // default: append
+      for (const key of ["before", "after"] as const) {
+        const ref = String(b[key] || "").trim();
+        if (ref) {
+          const i = order.indexOf(ref);
+          if (i < 0) return json({ error: `unknown stage "${ref}"` }, 400);
+          at = key === "before" ? i : i + 1;
+        }
+      }
+      db.prepare("INSERT INTO stages (workspace_id, slug, name, position, color) VALUES (?, ?, ?, ?, ?)")
+        .run(w, slug, name, at, color);
+      // renumber with the new stage spliced into place
+      order.splice(at, 0, slug);
+      const upd = db.prepare("UPDATE stages SET position = ? WHERE workspace_id = ? AND slug = ?");
+      order.forEach((s, i) => upd.run(i, w, s));
+      logActivity("deal", `stage "${name}" added`, w);
+      return json({ stage: stageRow(w, slug) }, 201);
+    }
+    const stageRec = path.match(/^\/api\/stages\/([a-z0-9_]+)$/);
+    if (stageRec && (method === "PATCH" || method === "DELETE")) {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      seedStages(db, w);
+      const slug = stageRec[1];
+      const cur = stageRow(w, slug);
+      if (!cur) return json({ error: `unknown stage "${slug}"` }, 404);
+      const b = method === "PATCH" ? await readBody(req) : {};
+      const moveTo = method === "DELETE"
+        ? String(url.searchParams.get("move_to") || b.move_to || "").trim()
+        : "";
+      if (method === "DELETE") {
+        const n = stageDeals(w, slug);
+        const total = workspaceStages(db, w).length;
+        if (total <= 1) return json({ error: "cannot delete the last stage" }, 400);
+        if (n > 0 && !moveTo) {
+          return json(
+            { error: `stage "${cur.name}" holds ${n} deal(s) — pass move_to with a target stage slug to relocate them`, deals: n },
+            409
+          );
+        }
+        if (moveTo) {
+          if (moveTo === slug) return json({ error: "move_to must be a different stage" }, 400);
+          if (!stageRow(w, moveTo)) return json({ error: `unknown stage "${moveTo}"` }, 400);
+          db.prepare("UPDATE deals SET stage = ? WHERE workspace_id = ? AND stage = ?").run(moveTo, w, slug);
+        }
+        db.prepare("DELETE FROM stages WHERE workspace_id = ? AND slug = ?").run(w, slug);
+        renumberStages(db, w);
+        logActivity("deal", `stage "${cur.name}" deleted${moveTo ? `, ${n} deal(s) moved` : ""}`, w);
+        return json({ ok: true, moved: moveTo ? n : 0 });
+      }
+      // PATCH
+      const sets: string[] = [];
+      const vals: unknown[] = [];
+      if (b.name !== undefined && String(b.name).trim()) {
+        sets.push("name = ?");
+        vals.push(String(b.name).trim());
+      }
+      if (b.color !== undefined && /^#[0-9a-fA-F]{6}$/.test(String(b.color))) {
+        sets.push("color = ?");
+        vals.push(b.color);
+      }
+      let moved: string | null = null;
+      for (const key of ["before", "after"] as const) {
+        const ref = String(b[key] || "").trim();
+        if (ref) {
+          if (ref === slug) return json({ error: `cannot move a stage ${key} itself` }, 400);
+          if (!stageRow(w, ref)) return json({ error: `unknown stage "${ref}"` }, 400);
+          moved = key + ":" + ref;
+        }
+      }
+      if (typeof b.position === "number" && Number.isInteger(b.position)) {
+        moved = "pos:" + b.position;
+      }
+      if (sets.length) {
+        db.prepare(`UPDATE stages SET ${sets.join(", ")} WHERE workspace_id = ? AND slug = ?`).run(...vals, w, slug);
+      }
+      if (moved) {
+        const order = workspaceStages(db, w).map((s) => s.slug).filter((s) => s !== slug);
+        let at: number;
+        if (moved.startsWith("before:")) at = order.indexOf(moved.slice(7));
+        else if (moved.startsWith("after:")) at = order.indexOf(moved.slice(6)) + 1;
+        else at = Math.max(0, Math.min(order.length, Number(moved.slice(4))));
+        order.splice(at, 0, slug);
+        const upd = db.prepare("UPDATE stages SET position = ? WHERE workspace_id = ? AND slug = ?");
+        order.forEach((s, i) => upd.run(i, w, s));
+      }
+      return json({ stage: stageRow(w, slug) });
     }
 
     // ---- KPIs
@@ -449,7 +572,10 @@ const server = Bun.serve({
            ORDER BY d.updated_at DESC`
         )
         .all(w);
-      return json({ deals: rows, stages: STAGES, labels: STAGE_LABELS });
+      const wsStages = workspaceStages(db, w);
+      const labels: Record<string, string> = {};
+      for (const s of wsStages) labels[s.slug] = s.name;
+      return json({ deals: rows, stages: wsStages.map((s) => s.slug), labels });
     }
     if (path === "/api/deals" && method === "POST") {
       const w = needWs(req, url);
@@ -466,7 +592,7 @@ const server = Bun.serve({
           b.company_id || null,
           b.contact_id || null,
           Number(b.value || 0),
-          b.stage && STAGES.includes(b.stage) ? b.stage : "prospecting",
+          validStage(w, b.stage),
           Number(b.probability ?? 10),
           b.expected_close || "",
           b.owner || "",
@@ -484,6 +610,9 @@ const server = Bun.serve({
       const b = await readBody(req);
       const before = dealJson(Number(dealId[1]), w) as any;
       if (!before) return json({ error: "not found" }, 404);
+      if (b.stage !== undefined && !stageSlugs(db, w).includes(b.stage)) {
+        return json({ error: `unknown stage "${b.stage}"` }, 400);
+      }
       const sets: string[] = [];
       const vals: unknown[] = [];
       for (const k of ["title", "value", "stage", "probability", "expected_close", "owner", "company_id", "contact_id"]) {
@@ -498,7 +627,8 @@ const server = Bun.serve({
       }
       const after = dealJson(Number(dealId[1]), w) as any;
       if (before.stage !== after.stage) {
-        logActivity("deal", `${after.title} moved to ${STAGE_LABELS[after.stage]}`, w);
+        const stageName = (db.query("SELECT name FROM stages WHERE workspace_id = ? AND slug = ?").get(w, after.stage) as any)?.name || after.stage;
+        logActivity("deal", `${after.title} moved to ${stageName}`, w);
         fireWebhooks("deal.stage_changed", {
           ...after,
           previous_stage: before.stage,
@@ -1125,10 +1255,14 @@ const server = Bun.serve({
       return json({ ok: true });
     }
 
-    // ---- stage colors for the frontend
+    // ---- stage colors for the frontend (per-workspace schema)
     if (path === "/api/meta-colors" && method === "GET") {
-      const { STAGE_COLORS } = await import("./db");
-      return json({ colors: STAGE_COLORS });
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      seedStages(db, w);
+      const colors: Record<string, string> = {};
+      for (const s of workspaceStages(db, w)) colors[s.slug] = s.color;
+      return json({ colors });
     }
 
     // ---- activities
@@ -1337,7 +1471,7 @@ const server = Bun.serve({
           `INSERT INTO deals (title, company_id, value, stage, probability, expected_close, owner, workspace_id)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
         ).run(data.title || "Inbound deal", data.company_id || null, Number(data.value || 0),
-          data.stage && STAGES.includes(data.stage) ? data.stage : "prospecting",
+          validStage(w, data.stage),
           Number(data.probability ?? 10), data.expected_close || "", data.owner || "automation", w);
         result = dealJson(Number(r.lastInsertRowid), w);
         logActivity("deal", `${(result as any).title} created via ${hook.name}`, w);

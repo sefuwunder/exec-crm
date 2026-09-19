@@ -109,6 +109,16 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS stages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER REFERENCES workspaces(id),
+  slug TEXT NOT NULL,
+  name TEXT NOT NULL,
+  position INTEGER DEFAULT 0,
+  color TEXT DEFAULT '#579bfc',
+  created_at TEXT DEFAULT (datetime('now')),
+  UNIQUE(workspace_id, slug)
+);
 CREATE TABLE IF NOT EXISTS captures (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   filename TEXT NOT NULL,
@@ -220,7 +230,71 @@ export function openDb(path: string): Database {
   if (!whCols.some((c) => c.name === "headers")) {
     db.exec("ALTER TABLE webhooks ADD COLUMN headers TEXT DEFAULT '{}'");
   }
+  // migration: pipeline stages are editable per workspace (Milton schema editing).
+  // deals.stage stays a TEXT slug; the stages table owns the per-workspace
+  // ordered schema. Legacy DBs get the table created and seeded below.
+  const hasStages = db
+    .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'stages'")
+    .get();
+  if (!hasStages) {
+    db.exec(`CREATE TABLE stages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      workspace_id INTEGER REFERENCES workspaces(id),
+      slug TEXT NOT NULL,
+      name TEXT NOT NULL,
+      position INTEGER DEFAULT 0,
+      color TEXT DEFAULT '#579bfc',
+      created_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(workspace_id, slug)
+    )`);
+  }
+  for (const w of db.query("SELECT id FROM workspaces").all() as any[]) {
+    seedStages(db, w.id);
+  }
   return db;
+}
+
+/** Turn a display name into a URL-safe stage slug. */
+export function slugifyStage(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 40);
+  return slug;
+}
+
+/** Ordered stage rows for a workspace. Empty array when exec-crm is unreachable is never the case here; callers seed on demand. */
+export function workspaceStages(db: Database, wsId: number) {
+  return db
+    .query("SELECT slug, name, position, color FROM stages WHERE workspace_id = ? ORDER BY position, id")
+    .all(wsId) as { slug: string; name: string; position: number; color: string }[];
+}
+
+/** Seed the six default stages into a workspace that has none. Idempotent. */
+export function seedStages(db: Database, wsId: number): void {
+  const n = (db.query("SELECT COUNT(*) AS n FROM stages WHERE workspace_id = ?").get(wsId) as any).n;
+  if (n > 0) return;
+  const ins = db.prepare(
+    "INSERT INTO stages (workspace_id, slug, name, position, color) VALUES (?, ?, ?, ?, ?)"
+  );
+  STAGES.forEach((slug, i) => {
+    ins.run(wsId, slug, STAGE_LABELS[slug] || slug, i, STAGE_COLORS[slug] || "#579bfc");
+  });
+}
+
+/** Slugs of the workspace's stages, seeded on demand. */
+export function stageSlugs(db: Database, wsId: number): string[] {
+  seedStages(db, wsId);
+  return workspaceStages(db, wsId).map((s) => s.slug);
+}
+
+/** Renumber stage positions 0..n in display order. */
+export function renumberStages(db: Database, wsId: number): void {
+  const rows = workspaceStages(db, wsId);
+  const upd = db.prepare("UPDATE stages SET position = ? WHERE workspace_id = ? AND slug = ?");
+  rows.forEach((r, i) => upd.run(i, wsId, r.slug));
 }
 
 // Returns the id of the first workspace, creating "Main" when none exist.

@@ -825,6 +825,21 @@ async function newDealModal() {
     async (d) => { await POST("/api/deals", d); route(); }, "Create deal");
 }
 
+async function newContactModal(presetCampaignId) {
+  const [{ companies }, fields, { campaigns }] = await Promise.all([GET("/api/companies"), getSchemaFields("contact"), GET("/api/campaigns")]);
+  openModal("New contact", `
+    <div class="formgrid">
+      ${field("Name", input("name"))}
+      ${field("Title", input("title"))}
+      ${field("Company", select("company_id", companies.map((c) => [c.id, c.name])))}
+      ${field("Email", input("email", "", "email"))}
+      ${field("Phone", input("phone"))}
+      ${field("Campaign", select("campaign_id", [["", "—"]].concat(campaigns.map((c) => [c.id, c.name])), presetCampaignId || ""))}
+    </div>
+    ${cfFieldsHtml(fields)}`,
+    async (d) => { await POST("/api/contacts", d); route(); }, "Create contact");
+}
+
 async function vContacts() {
   const q = new URLSearchParams(location.hash.split("?")[1] || "").get("q") || "";
   const [{ contacts }, { companies }] = await Promise.all([
@@ -854,24 +869,11 @@ async function vContacts() {
   $("#go").onclick = go;
   $("#q").addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
   wireContactCells(contacts, companies);
-  $("#new-contact").onclick = async () => {
-    const [{ companies }, { fields }, { campaigns }] = await Promise.all([GET("/api/companies"), getSchemaFields("contact"), GET("/api/campaigns")]);
-    openModal("New contact", `
-      <div class="formgrid">
-        ${field("Name", input("name"))}
-        ${field("Title", input("title"))}
-        ${field("Company", select("company_id", companies.map((c) => [c.id, c.name])))}
-        ${field("Email", input("email", "", "email"))}
-        ${field("Phone", input("phone"))}
-        ${field("Campaign", select("campaign_id", [["", "—"]].concat(campaigns.map((c) => [c.id, c.name]))))}
-      </div>
-      ${cfFieldsHtml(fields)}`,
-      async (d) => { await POST("/api/contacts", d); route(); }, "Create contact");
-  };
+  $("#new-contact").onclick = () => newContactModal();
 }
 
 async function editContactModal(c) {
-  const [{ companies }, { fields }, { campaigns }] = await Promise.all([GET("/api/companies"), getSchemaFields("contact"), GET("/api/campaigns")]);
+  const [{ companies }, fields, { campaigns }] = await Promise.all([GET("/api/companies"), getSchemaFields("contact"), GET("/api/campaigns")]);
   openModal("Edit contact", `
     <div class="formgrid">
       ${field("Name", input("name", c.name))}
@@ -887,6 +889,15 @@ async function editContactModal(c) {
       if (d.campaign_id === "") d.campaign_id = null;
       await PATCH(`/api/contacts/${c.id}`, d); route();
     }, "Save changes");
+}
+
+async function newCompanyModal(presetCampaignId) {
+  const [fields, { campaigns }] = await Promise.all([getSchemaFields("company"), GET("/api/campaigns")]);
+  openModal("New company", `
+    ${field("Name", input("name"))}
+    <div class="formgrid">${field("Industry", input("industry"))}${field("Website", input("website"))}${field("Campaign", select("campaign_id", [["", "—"]].concat(campaigns.map((c) => [c.id, c.name])), presetCampaignId || ""))}</div>
+    ${cfFieldsHtml(fields)}`,
+    async (d) => { await POST("/api/companies", d); route(); }, "Create company");
 }
 
 async function vCompanies() {
@@ -906,14 +917,7 @@ async function vCompanies() {
       </tr>`).join("")}
     </table></div>`;
   wireCompanyCells(companies);
-  $("#new-company").onclick = async () => {
-    const [fields, { campaigns }] = await Promise.all([getSchemaFields("company"), GET("/api/campaigns")]);
-    openModal("New company", `
-      ${field("Name", input("name"))}
-      <div class="formgrid">${field("Industry", input("industry"))}${field("Website", input("website"))}${field("Campaign", select("campaign_id", [["", "—"]].concat(campaigns.map((c) => [c.id, c.name]))))}</div>
-      ${cfFieldsHtml(fields)}`,
-      async (d) => { await POST("/api/companies", d); route(); }, "Create company");
-  };
+  $("#new-company").onclick = () => newCompanyModal();
 }
 
 async function editCompanyModal(c) {
@@ -930,6 +934,44 @@ async function editCompanyModal(c) {
 
 /* ---------- campaigns ---------- */
 const CAMPAIGN_STATUSES = ["draft", "active", "paused", "completed"];
+
+/* New-campaign draft rows: quick-add contacts & companies inline.
+   Draft inputs carry no `name` attribute so openModal's generic collector
+   ignores them — collectDrafts() gathers them explicitly on submit. */
+function draftContactRowHtml() {
+  return `<div class="draft-row" data-draft-contact>
+    <input class="draft-name" placeholder="Name" autocomplete="off">
+    <input class="draft-email" type="email" placeholder="Email (optional)" autocomplete="off">
+    <button type="button" class="btn ghost small draft-rm" aria-label="Remove row">✕</button></div>`;
+}
+function draftCompanyRowHtml() {
+  return `<div class="draft-row" data-draft-company>
+    <input class="draft-name" placeholder="Name" autocomplete="off">
+    <input class="draft-website" placeholder="Website (optional)" autocomplete="off">
+    <button type="button" class="btn ghost small draft-rm" aria-label="Remove row">✕</button></div>`;
+}
+function wireDraftRows(addBtnId, listId, rowHtml) {
+  $(`#${addBtnId}`).onclick = () => {
+    const list = $(`#${listId}`);
+    list.insertAdjacentHTML("beforeend", rowHtml());
+    list.lastElementChild.querySelector(".draft-rm").onclick = (e) =>
+      e.target.closest(".draft-row").remove();
+  };
+}
+function collectDrafts() {
+  const drafts = [];
+  document.querySelectorAll("#modal-root [data-draft-contact]").forEach((row) => {
+    const name = row.querySelector(".draft-name").value.trim();
+    if (!name) return; // blank rows skipped silently
+    drafts.push({ kind: "contact", name, body: { name, email: row.querySelector(".draft-email").value.trim() } });
+  });
+  document.querySelectorAll("#modal-root [data-draft-company]").forEach((row) => {
+    const name = row.querySelector(".draft-name").value.trim();
+    if (!name) return;
+    drafts.push({ kind: "company", name, body: { name, website: row.querySelector(".draft-website").value.trim() } });
+  });
+  return drafts;
+}
 
 async function vCampaigns() {
   const [{ campaigns }, { companies }] = await Promise.all([GET("/api/campaigns"), GET("/api/companies")]);
@@ -958,12 +1000,32 @@ async function vCampaigns() {
         ${field("End date", input("end_date", "", "date"))}
       </div>
       ${field("Notes", `<textarea name="notes" rows="3"></textarea>`)}
+      <div class="field"><label>Contacts <span style="color:var(--text-3);font-weight:normal">optional</span></label>
+        <div id="draft-contacts"></div>
+        <button type="button" class="btn ghost small" id="draft-add-contact" style="margin-top:6px">+ Add contact</button></div>
+      <div class="field"><label>Companies <span style="color:var(--text-3);font-weight:normal">optional</span></label>
+        <div id="draft-companies"></div>
+        <button type="button" class="btn ghost small" id="draft-add-company" style="margin-top:6px">+ Add company</button></div>
       ${cfFieldsHtml(fields)}`,
       async (d) => {
         if (!d.company_id) { alert("Please choose a company for this campaign."); return; }
         const { campaign } = await POST("/api/campaigns", d);
+        // Create draft contacts/companies against the new campaign. Drafts are
+        // best-effort: a failure surfaces but never rolls back the campaign.
+        const failed = [];
+        for (const dr of collectDrafts()) {
+          try {
+            await POST(`/api/${dr.kind === "contact" ? "contacts" : "companies"}`,
+              { ...dr.body, campaign_id: campaign.id });
+          } catch (e) { failed.push(`${dr.kind} "${dr.name}": ${e.message}`); }
+        }
+        if (failed.length) {
+          alert(`Campaign created, but ${failed.length} draft${failed.length === 1 ? "" : "s"} failed:\n- ${failed.join("\n- ")}`);
+        }
         location.hash = `#/campaigns/${campaign.id}`;
       }, "Create campaign");
+    wireDraftRows("draft-add-contact", "draft-contacts", draftContactRowHtml);
+    wireDraftRows("draft-add-company", "draft-companies", draftCompanyRowHtml);
   };
 }
 
@@ -1062,8 +1124,9 @@ function campaignPipelineHtml(campDeals) {
 }
 
 function campaignContactsHtml(contacts) {
-  let body = `<div class="panel"><div class="sheet-head"><h3 style="margin:0">Contacts</h3>
-    <span style="color:var(--text-3)">${contacts.length}</span></div>`;
+  let body = `<div class="panel"><div class="sheet-head"><div style="display:flex;align-items:center;gap:8px"><h3 style="margin:0">Contacts</h3>
+    <span style="color:var(--text-3)">${contacts.length}</span></div>
+    <button class="btn small" id="add-campaign-contact">+ Add contact</button></div>`;
   body += contacts.length
     ? `<table><tr><th>Name</th><th>Title</th><th>Company</th><th>Email</th></tr>
       ${contacts.map((ct) => `<tr><td><b>${esc(ct.name)}</b></td><td>${esc(ct.title) || "—"}</td>
@@ -1073,8 +1136,9 @@ function campaignContactsHtml(contacts) {
 }
 
 function campaignCompaniesHtml(companies) {
-  let body = `<div class="panel"><div class="sheet-head"><h3 style="margin:0">Companies</h3>
-    <span style="color:var(--text-3)">${companies.length}</span></div>`;
+  let body = `<div class="panel"><div class="sheet-head"><div style="display:flex;align-items:center;gap:8px"><h3 style="margin:0">Companies</h3>
+    <span style="color:var(--text-3)">${companies.length}</span></div>
+    <button class="btn small" id="add-campaign-company">+ Add company</button></div>`;
   body += companies.length
     ? `<table><tr><th>Company</th><th>Industry</th><th>Website</th></tr>
       ${companies.map((co) => `<tr><td><b>${esc(co.name)}</b></td><td>${esc(co.industry) || "—"}</td>
@@ -1153,6 +1217,8 @@ function renderCampaignDetail(c, tasks, deals, camp) {
       ${tasks.length ? "" : `<div class="empty">No tasks yet — add the first step.</div>`}
     </div>`;
   $("#edit-campaign").onclick = () => editCampaignModal(c);
+  $("#add-campaign-contact").onclick = () => newContactModal(c.id);
+  $("#add-campaign-company").onclick = () => newCompanyModal(c.id);
   // inline cell editing
   document.querySelectorAll("#view td[data-f]").forEach((td) => {
     const t = tasks.find((x) => x.id === Number(td.dataset.tid));
@@ -1627,8 +1693,8 @@ function initPalette() {
   async function buildItems() {
     if (cache && cacheWs === wsId) return cache;
     const NAV = [
-      ["Dashboard", "#/dashboard"], ["Daily Feed", "#/feed"], ["Pipeline", "#/pipeline"], ["Contacts", "#/contacts"],
-      ["Companies", "#/companies"], ["Campaigns", "#/campaigns"], ["Captures", "#/captures"],
+      ["Dashboard", "#/dashboard"], ["Daily Feed", "#/feed"], ["Pipeline", "#/pipeline"],
+      ["Campaigns", "#/campaigns"], ["Captures", "#/captures"],
       ["Automations", "#/automations"], ["Schema", "#/schema"],
     ];
     const out = NAV.map(([label, hash]) => ({
@@ -1647,12 +1713,12 @@ function initPalette() {
       contacts.forEach((c) => out.push({
         group: "Contacts", kind: "person",
         label: c.name, sub: c.company_name || c.title || "",
-        run: () => { location.hash = `#/contacts?q=${encodeURIComponent(c.name)}`; },
+        run: () => { location.hash = c.campaign_id ? `#/campaigns/${c.campaign_id}` : `#/contacts?q=${encodeURIComponent(c.name)}`; },
       }));
       companies.forEach((c) => out.push({
         group: "Companies", kind: "org",
         label: c.name, sub: c.industry || "",
-        run: () => { location.hash = "#/companies"; },
+        run: () => { location.hash = c.campaign_id ? `#/campaigns/${c.campaign_id}` : "#/companies"; },
       }));
     } catch {}
     cache = out;

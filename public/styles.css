@@ -552,3 +552,8 @@ td { transition: background 0.12s ease; }
 .sheet tr.is-done td[data-f="title"] { text-decoration: line-through; color: var(--muted); }
 .sheet .danger-text { color: #e5484d; }
 .sheet .danger-text:hover { background: rgba(229, 72, 77, 0.08); }
+
+/* new-campaign draft rows: inline quick-add of contacts & companies */
+.draft-row { display: flex; gap: 8px; margin-bottom: 6px; align-items: center; }
+.draft-row input { flex: 1; min-width: 0; }
+.draft-row .draft-rm { flex: none; }

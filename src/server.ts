@@ -301,7 +301,9 @@ const server = Bun.serve({
           ? "text/javascript"
           : file.endsWith(".css")
             ? "text/css"
-            : "text/html";
+            : file.endsWith(".svg")
+              ? "image/svg+xml"
+              : "text/html";
         return new Response(f, { headers: { "Content-Type": type } });
       }
       return new Response("not found", { status: 404 });

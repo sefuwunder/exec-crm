@@ -27,6 +27,12 @@
     <div class="topbar">
       <h1 id="page-title">Dashboard</h1>
       <div class="spacer"></div>
+      <div class="ws-wrap">
+        <button class="ws-btn" id="ws-btn" aria-haspopup="true" title="Switch workspace">
+          <span class="ws-dot" id="ws-dot"></span><span id="ws-name"></span><span class="ws-caret">▾</span>
+        </button>
+        <div class="ws-menu" id="ws-menu" hidden></div>
+      </div>
       <button class="cmdk" id="cmdk-btn" title="Quick find">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
         <span>Search deals, people…</span><kbd>⌘K</kbd>

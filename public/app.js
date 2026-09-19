@@ -1,6 +1,19 @@
 /* exec-crm frontend — vanilla SPA */
 const $ = (s, el = document) => el.querySelector(s);
 const view = $("#view");
+
+/* ---------- workspaces ---------- */
+const WS_KEY = "exec-crm-workspace";
+let workspaces = [];
+let wsId = null;
+let paletteBust = () => {}; // reassigned by initPalette to clear the Cmd+K index
+// append the active workspace to every API call, except the global ones
+const wsParam = (p) => {
+  if (wsId == null) return p;
+  if (p.startsWith("/api/workspaces") || p.startsWith("/api/hooks")) return p;
+  if (p === "/api/meta-colors" || p === "/api/contacts/import/template") return p;
+  return p + (p.includes("?") ? "&" : "?") + "workspace=" + encodeURIComponent(wsId);
+};
 const TITLES = {
   dashboard: "Dashboard", feed: "Daily Feed", pipeline: "Pipeline", contacts: "Contacts",
   companies: "Companies", campaigns: "Campaigns", captures: "Captures",
@@ -24,12 +37,16 @@ const moneyShort = (n) => {
 };
 
 async function api(method, path, body) {
-  const res = await fetch(path, {
+  const res = await fetch(wsParam(path), {
     method,
     headers: { "Content-Type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
   });
-  if (!res.ok) throw new Error(`${method} ${path} -> ${res.status}`);
+  if (!res.ok) {
+    let msg = `${method} ${path} -> ${res.status}`;
+    try { const j = await res.json(); if (j.error) msg = j.error; } catch {}
+    throw new Error(msg);
+  }
   return res.json();
 }
 const GET = (p) => api("GET", p);
@@ -116,6 +133,154 @@ const statusPill = (s) => {
   const colors = { draft: "#9aa1b3", active: "#18a058", paused: "#e6a23c", completed: "#2f62f0" };
   return `<span class="pill" style="background:${colors[s] || "#9aa1b3"}22;color:${colors[s] || "#9aa1b3"}">${esc(s)}</span>`;
 };
+
+/* ---------- workspace switcher ---------- */
+const WS_COLORS = ["#579bfc", "#00ca72", "#ffcb00", "#d974b9", "#784bd1", "#ff8a5c", "#20c5d2", "#8b9cf0"];
+
+async function initWorkspaces() {
+  const { workspaces: list } = await GET("/api/workspaces");
+  workspaces = list;
+  const stored = localStorage.getItem(WS_KEY);
+  const found = list.find((x) => String(x.id) === String(stored));
+  wsId = (found || list[0] || {}).id ?? null;
+  renderWsSwitcher();
+  $("#ws-btn").onclick = (e) => {
+    e.stopPropagation();
+    $("#ws-menu").hidden = !$("#ws-menu").hidden;
+  };
+  document.addEventListener("click", (e) => {
+    const m = $("#ws-menu");
+    if (m && !m.hidden && !e.target.closest(".ws-wrap")) m.hidden = true;
+  });
+}
+
+function setWorkspace(id) {
+  wsId = id;
+  localStorage.setItem(WS_KEY, String(id));
+  paletteBust();
+  renderWsSwitcher();
+  route();
+}
+
+function renderWsSwitcher() {
+  const w = workspaces.find((x) => x.id === wsId);
+  $("#ws-dot").style.background = (w && w.color) || "#999";
+  $("#ws-name").textContent = (w && w.name) || "—";
+  const menu = $("#ws-menu");
+  menu.innerHTML =
+    workspaces.map((x) => `
+      <button class="ws-item${x.id === wsId ? " on" : ""}" data-ws="${x.id}">
+        <span class="ws-dot" style="background:${esc(x.color)}"></span>
+        <span class="ws-iname">${esc(x.name)}</span>
+        ${x.id === wsId ? `<span class="ws-check">✓</span>` : ""}
+      </button>`).join("") +
+    `<div class="ws-sep"></div>
+     <button class="ws-item ws-action" data-ws-new="1">＋ New workspace</button>
+     <button class="ws-item ws-action" data-ws-manage="1">⚙ Manage workspaces</button>`;
+  menu.querySelectorAll("[data-ws]").forEach((b) => {
+    b.onclick = () => {
+      menu.hidden = true;
+      if (Number(b.dataset.ws) !== wsId) setWorkspace(Number(b.dataset.ws));
+    };
+  });
+  menu.querySelector("[data-ws-new]").onclick = () => { menu.hidden = true; newWorkspaceModal(); };
+  menu.querySelector("[data-ws-manage]").onclick = () => { menu.hidden = true; manageWorkspacesModal(); };
+}
+
+const wsSwatches = (current) => `
+  <div class="ws-colors">${WS_COLORS.map((c) =>
+    `<button type="button" class="ws-swatch${c === current ? " on" : ""}" data-c="${c}" style="background:${c}" aria-label="color ${c}"></button>`
+  ).join("")}</div>
+  <input type="hidden" name="color" value="${esc(current || WS_COLORS[0])}">`;
+const wireSwatches = () => {
+  document.querySelectorAll("#modal-root .ws-swatch").forEach((b) => {
+    b.onclick = () => {
+      document.querySelectorAll("#modal-root .ws-swatch").forEach((x) => x.classList.remove("on"));
+      b.classList.add("on");
+      document.querySelector('#modal-root input[name="color"]').value = b.dataset.c;
+    };
+  });
+};
+
+function newWorkspaceModal() {
+  openModal("New workspace", `
+    ${field("Name", input("name", "", "text", "required"))}
+    ${field("Color", wsSwatches(WS_COLORS[0]))}`,
+    async (d) => {
+      if (!d.name.trim()) { alert("Give the workspace a name."); return; }
+      const { workspace } = await POST("/api/workspaces", d);
+      workspaces = (await GET("/api/workspaces")).workspaces;
+      setWorkspace(workspace.id);
+    }, "Create workspace");
+  wireSwatches();
+}
+
+function editWorkspaceModal(w) {
+  openModal("Edit workspace", `
+    ${field("Name", input("name", w.name))}
+    ${field("Color", wsSwatches(w.color))}`,
+    async (d) => {
+      if (!d.name.trim()) { alert("Give the workspace a name."); return; }
+      await PATCH(`/api/workspaces/${w.id}`, { name: d.name.trim(), color: d.color });
+      workspaces = (await GET("/api/workspaces")).workspaces;
+      renderWsSwitcher();
+    }, "Save");
+  wireSwatches();
+}
+
+const wsRecordCount = (w) =>
+  (w.companies || 0) + (w.contacts || 0) + (w.deals || 0) + (w.tasks || 0) + (w.campaigns || 0);
+
+function deleteWorkspaceModal(w) {
+  const n = wsRecordCount(w);
+  openModal(`Delete "${w.name}"?`, `
+    ${n > 0
+      ? `<p style="color:var(--text-2)">This workspace holds <b>${n}</b> record${n === 1 ? "" : "s"}.
+         Deleting it removes them <b>permanently</b>. To confirm, type the workspace name below.</p>
+         ${field(`Type "${w.name}" to confirm`, input("confirm", "", "text", "required"))}`
+      : `<p style="color:var(--text-2)">This workspace is empty — deleting it is safe.</p>`}`,
+    async (d) => {
+      try {
+        await api("DELETE", `/api/workspaces/${w.id}`, n > 0 ? { confirm: d.confirm } : {});
+      } catch (e) {
+        alert("Delete failed: " + (e.message || e));
+        return;
+      }
+      workspaces = (await GET("/api/workspaces")).workspaces;
+      if (w.id === wsId) wsId = workspaces[0].id;
+      localStorage.setItem(WS_KEY, String(wsId));
+      paletteBust();
+      renderWsSwitcher();
+      route();
+    }, "Delete workspace");
+}
+
+function manageWorkspacesModal() {
+  openModal("Manage workspaces", `
+    <div>${workspaces.map((w) => `
+      <div class="ws-row">
+        <span class="ws-dot" style="background:${esc(w.color)}"></span>
+        <div class="ws-row-main">
+          <div class="ws-row-name">${esc(w.name)}${w.id === wsId ? ` <span class="tag">active</span>` : ""}</div>
+          <div class="ws-row-sub">${wsRecordCount(w)} records · ${w.deals || 0} deals</div>
+        </div>
+        <button class="btn ghost small" data-ws-edit="${w.id}">Edit</button>
+        <button class="btn danger small" data-ws-del="${w.id}" ${workspaces.length <= 1 ? "disabled" : ""}>Delete</button>
+      </div>`).join("")}</div>`,
+    async () => {}, "Done");
+  document.querySelectorAll("#modal-root [data-ws-edit]").forEach((b) => {
+    b.onclick = () => {
+      const w = workspaces.find((x) => x.id === Number(b.dataset.wsEdit));
+      if (w) editWorkspaceModal(w);
+    };
+  });
+  document.querySelectorAll("#modal-root [data-ws-del]").forEach((b) => {
+    b.onclick = () => {
+      const w = workspaces.find((x) => x.id === Number(b.dataset.wsDel));
+      if (w) deleteWorkspaceModal(w);
+    };
+  });
+}
 
 /* ---------- click-to-edit table cells ----------
    makeEditable(td, kind, opts, onSave)
@@ -1027,7 +1192,7 @@ async function vCaptures() {
     files.forEach((f) => fd.append("photos", f));
     $("#cap-status").innerHTML = `<div class="empty">Uploading ${files.length} photo${files.length === 1 ? "" : "s"}…</div>`;
     try {
-      const res = await fetch("/api/captures", { method: "POST", body: fd });
+      const res = await fetch(wsParam("/api/captures"), { method: "POST", body: fd });
       const r = await res.json();
       if (!res.ok) throw new Error(r.error || "upload failed");
       if (r.errors && r.errors.length) alert("Some files were skipped:\n" + r.errors.join("\n"));
@@ -1293,9 +1458,12 @@ function initPalette() {
   let items = [];
   let sel = 0;
   let cache = null;
+  let cacheWs = null;
+  // called when the workspace changes so Cmd+K re-indexes
+  paletteBust = () => { cache = null; };
 
   async function buildItems() {
-    if (cache) return cache;
+    if (cache && cacheWs === wsId) return cache;
     const NAV = [
       ["Dashboard", "#/dashboard"], ["Daily Feed", "#/feed"], ["Pipeline", "#/pipeline"], ["Contacts", "#/contacts"],
       ["Companies", "#/companies"], ["Campaigns", "#/campaigns"], ["Captures", "#/captures"],
@@ -1326,6 +1494,7 @@ function initPalette() {
       }));
     } catch {}
     cache = out;
+    cacheWs = wsId;
     return out;
   }
 
@@ -1414,6 +1583,7 @@ async function route() {
 
 (async () => {
   await loadMeta();
+  await initWorkspaces();
   initPalette();
   window.addEventListener("hashchange", route);
   if (!location.hash) location.hash = "#/dashboard";

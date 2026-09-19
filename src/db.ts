@@ -28,6 +28,12 @@ export const STAGE_COLORS: Record<string, string> = {
 };
 
 const SCHEMA = `
+CREATE TABLE IF NOT EXISTS workspaces (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  color TEXT DEFAULT '#579bfc',
+  created_at TEXT DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS companies (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
@@ -125,6 +131,7 @@ CREATE TABLE IF NOT EXISTS campaigns (
 );
 CREATE TABLE IF NOT EXISTS custom_fields (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER REFERENCES workspaces(id),
   entity TEXT NOT NULL,
   name TEXT NOT NULL,
   label TEXT NOT NULL,
@@ -133,7 +140,7 @@ CREATE TABLE IF NOT EXISTS custom_fields (
   required INTEGER DEFAULT 0,
   position INTEGER DEFAULT 0,
   created_at TEXT DEFAULT (datetime('now')),
-  UNIQUE(entity, name)
+  UNIQUE(entity, workspace_id, name)
 );
 CREATE TABLE IF NOT EXISTS custom_values (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -161,7 +168,60 @@ export function openDb(path: string): Database {
   if (!campCols.some((c) => c.name === "company_id")) {
     db.exec("ALTER TABLE campaigns ADD COLUMN company_id INTEGER REFERENCES companies(id)");
   }
+  // migration: workspaces — every record lives in exactly one workspace.
+  // incoming_hooks and settings stay global (integration keys / app config).
+  const SCOPED = [
+    "companies", "contacts", "deals", "tasks", "campaigns",
+    "activities", "captures", "custom_fields", "webhooks",
+  ];
+  for (const t of SCOPED) {
+    const cols = db.query(`PRAGMA table_info(${t})`).all() as any[];
+    if (!cols.some((c) => c.name === "workspace_id")) {
+      db.exec(`ALTER TABLE ${t} ADD COLUMN workspace_id INTEGER REFERENCES workspaces(id)`);
+    }
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_deals_ws ON deals(workspace_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_contacts_ws ON contacts(workspace_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_ws ON tasks(workspace_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_companies_ws ON companies(workspace_id)");
+  const mainId = ensureMainWorkspace(db);
+  for (const t of SCOPED) {
+    db.exec(`UPDATE ${t} SET workspace_id = ${mainId} WHERE workspace_id IS NULL`);
+  }
+  // migration: custom field names were globally unique; they are now unique per workspace
+  const cfSql = (db.query("SELECT sql FROM sqlite_master WHERE name = 'custom_fields'").get() as any)?.sql || "";
+  if (cfSql.includes("UNIQUE(entity, name)") && !cfSql.includes("workspace_id, name")) {
+    db.exec(`
+      CREATE TABLE custom_fields_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        workspace_id INTEGER REFERENCES workspaces(id),
+        entity TEXT NOT NULL,
+        name TEXT NOT NULL,
+        label TEXT NOT NULL,
+        type TEXT NOT NULL DEFAULT 'text',
+        options TEXT DEFAULT '[]',
+        required INTEGER DEFAULT 0,
+        position INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(entity, workspace_id, name)
+      );
+      INSERT INTO custom_fields_new (id, workspace_id, entity, name, label, type, options, required, position, created_at)
+        SELECT id, workspace_id, entity, name, label, type, options, required, position, created_at FROM custom_fields;
+      DROP TABLE custom_fields;
+      ALTER TABLE custom_fields_new RENAME TO custom_fields;
+    `);
+  }
   return db;
+}
+
+// Returns the id of the first workspace, creating "Main" when none exist.
+export function ensureMainWorkspace(db: Database): number {
+  const w = db.query("SELECT id FROM workspaces ORDER BY id LIMIT 1").get() as any;
+  if (w) return w.id;
+  const r = db
+    .prepare("INSERT INTO workspaces (name, color) VALUES ('Main', '#579bfc')")
+    .run();
+  return Number(r.lastInsertRowid);
 }
 
 function count(db: Database, table: string): number {
@@ -170,6 +230,7 @@ function count(db: Database, table: string): number {
 
 export function seedIfEmpty(db: Database) {
   if (count(db, "companies") > 0) return;
+  const ws = ensureMainWorkspace(db);
 
   const companies: [string, string, string][] = [
     ["Meridian Logistics", "Logistics", "meridianlog.com"],
@@ -182,9 +243,9 @@ export function seedIfEmpty(db: Database) {
     ["Ironpeak Manufacturing", "Industrial", "ironpeakmfg.com"],
   ];
   const insCo = db.prepare(
-    "INSERT INTO companies (name, industry, website) VALUES (?, ?, ?)"
+    "INSERT INTO companies (name, industry, website, workspace_id) VALUES (?, ?, ?, ?)"
   );
-  const coIds = companies.map((c) => Number(insCo.run(...c).lastInsertRowid));
+  const coIds = companies.map((c) => Number(insCo.run(c[0], c[1], c[2], ws).lastInsertRowid));
 
   const contacts: [number, string, string, string][] = [
     [0, "Amara Okafor", "COO", "amara@meridianlog.com"],
@@ -199,10 +260,10 @@ export function seedIfEmpty(db: Database) {
     [1, "Omar Haddad", "Partner", "omar@bluefincap.com"],
   ];
   const insCt = db.prepare(
-    "INSERT INTO contacts (company_id, name, title, email) VALUES (?, ?, ?, ?)"
+    "INSERT INTO contacts (company_id, name, title, email, workspace_id) VALUES (?, ?, ?, ?, ?)"
   );
   const ctIds = contacts.map(([ci, n, t, e]) =>
-    Number(insCt.run(coIds[ci], n, t, e).lastInsertRowid)
+    Number(insCt.run(coIds[ci], n, t, e, ws).lastInsertRowid)
   );
 
   const deals: [string, number, number, number, string, number, string, string][] = [
@@ -228,10 +289,10 @@ export function seedIfEmpty(db: Database) {
   ];
   const insDeal = db.prepare(
     `INSERT INTO deals (title, company_id, contact_id, value, stage, probability,
-     expected_close, owner) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+     expected_close, owner, workspace_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   const dealIds = deals.map(([t, ci, cti, v, s, p, ec, o]) =>
-    Number(insDeal.run(t, coIds[ci], ctIds[cti], v, s, p, ec, o).lastInsertRowid)
+    Number(insDeal.run(t, coIds[ci], ctIds[cti], v, s, p, ec, o, ws).lastInsertRowid)
   );
 
   const tasks: [string, number | null, string, string][] = [
@@ -243,9 +304,9 @@ export function seedIfEmpty(db: Database) {
     ["Q3 board deck — pipeline slide", null, "2026-09-18", "You"],
   ];
   const insTask = db.prepare(
-    "INSERT INTO tasks (title, deal_id, due_date, owner) VALUES (?, ?, ?, ?)"
+    "INSERT INTO tasks (title, deal_id, due_date, owner, workspace_id) VALUES (?, ?, ?, ?, ?)"
   );
-  for (const [t, d, dd, o] of tasks) insTask.run(t, d === null ? null : dealIds[d], dd, o);
+  for (const [t, d, dd, o] of tasks) insTask.run(t, d === null ? null : dealIds[d], dd, o, ws);
 
   const acts: [string, string][] = [
     ["deal", "Solar farm monitoring moved to Negotiation"],
@@ -255,8 +316,8 @@ export function seedIfEmpty(db: Database) {
     ["task", "Q3 board deck — pipeline slide due Sep 18"],
     ["deal", "Working capital facility added to Prospecting"],
   ];
-  const insAct = db.prepare("INSERT INTO activities (kind, text) VALUES (?, ?)");
-  for (const [k, t] of acts) insAct.run(k, t);
+  const insAct = db.prepare("INSERT INTO activities (kind, text, workspace_id) VALUES (?, ?, ?)");
+  for (const [k, t] of acts) insAct.run(k, t, ws);
 
   db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('seeded', '1')").run();
 }

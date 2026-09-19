@@ -1,4 +1,4 @@
-import { openDb, seedIfEmpty, STAGES, STAGE_LABELS } from "./db";
+import { openDb, seedIfEmpty, ensureMainWorkspace, STAGES, STAGE_LABELS } from "./db";
 
 const PORT = Number(process.env.PORT || 3001);
 const db = openDb(process.env.CRM_DB || "./crm.db");
@@ -32,10 +32,10 @@ const CORE_COLUMNS: Record<string, string[]> = {
 };
 const FIELD_TYPES = ["text", "textarea", "number", "date", "select", "checkbox", "url"];
 
-function getCustomFields(entity: string) {
+function getCustomFields(entity: string, w: number) {
   return db
-    .query("SELECT * FROM custom_fields WHERE entity = ? ORDER BY position, id")
-    .all(entity) as any[];
+    .query("SELECT * FROM custom_fields WHERE entity = ? AND workspace_id = ? ORDER BY position, id")
+    .all(entity, w) as any[];
 }
 function attachCustom(entity: string, rows: any[]) {
   if (!rows.length) return rows;
@@ -53,9 +53,9 @@ function attachCustom(entity: string, rows: any[]) {
   for (const r of rows) r.custom = byRecord.get(r.id) || {};
   return rows;
 }
-function saveCustomValues(entity: string, recordId: number, custom: unknown) {
+function saveCustomValues(entity: string, recordId: number, custom: unknown, w: number) {
   if (!custom || typeof custom !== "object") return;
-  const byId = new Map(getCustomFields(entity).map((f: any) => [String(f.id), f]));
+  const byId = new Map(getCustomFields(entity, w).map((f: any) => [String(f.id), f]));
   for (const [fid, raw] of Object.entries(custom as Record<string, unknown>)) {
     const f = byId.get(String(fid));
     if (!f) continue;
@@ -92,14 +92,15 @@ const ALL_EVENTS = [
   "task.completed",
 ];
 
-function logActivity(kind: string, text: string) {
-  db.prepare("INSERT INTO activities (kind, text) VALUES (?, ?)").run(kind, text);
+function logActivity(kind: string, text: string, w: number) {
+  db.prepare("INSERT INTO activities (kind, text, workspace_id) VALUES (?, ?, ?)")
+    .run(kind, text, w);
 }
 
-async function fireWebhooks(event: string, payload: Record<string, unknown>) {
+async function fireWebhooks(event: string, payload: Record<string, unknown>, w: number) {
   const hooks = db
-    .query("SELECT * FROM webhooks WHERE active = 1")
-    .all() as any[];
+    .query("SELECT * FROM webhooks WHERE active = 1 AND workspace_id = ?")
+    .all(w) as any[];
   for (const h of hooks) {
     let events: string[] = [];
     try {
@@ -132,16 +133,16 @@ async function fireWebhooks(event: string, payload: Record<string, unknown>) {
   }
 }
 
-function dealJson(id: number) {
+function dealJson(id: number, w: number) {
   return db
     .query(
       `SELECT d.*, c.name AS company_name, ct.name AS contact_name
        FROM deals d
        LEFT JOIN companies c ON c.id = d.company_id
        LEFT JOIN contacts ct ON ct.id = d.contact_id
-       WHERE d.id = ?`
+       WHERE d.id = ? AND d.workspace_id = ?`
     )
-    .get(id);
+    .get(id, w);
 }
 
 // ---------------------------------------------------------------- helpers
@@ -157,6 +158,24 @@ async function readBody(req: Request): Promise<any> {
   } catch {
     return {};
   }
+}
+
+// ---------------------------------------------------------------- workspaces
+function allWorkspaces() {
+  return db.query("SELECT * FROM workspaces ORDER BY id").all() as any[];
+}
+// Active workspace: ?workspace=<id> wins, then the X-Workspace header,
+// then the first workspace. Unknown ids get a 400 Response.
+function needWs(req: Request, url: URL): number | Response {
+  const list = allWorkspaces();
+  if (!list.length) return ensureMainWorkspace(db);
+  const raw = (url.searchParams.get("workspace") || req.headers.get("X-Workspace") || "").trim();
+  if (raw) {
+    const w = list.find((x) => String(x.id) === raw);
+    if (!w) return json({ error: `unknown workspace "${raw}"` }, 400);
+    return w.id;
+  }
+  return list[0].id;
 }
 
 // minimal CSV parser: handles quoted fields, embedded commas/quotes, CRLF
@@ -223,29 +242,120 @@ const server = Bun.serve({
       return new Response("not found", { status: 404 });
     }
 
+    // ---- workspaces
+    if (path === "/api/workspaces" && method === "GET") {
+      const rows = db
+        .query(
+          `SELECT w.*,
+             (SELECT COUNT(*) FROM companies WHERE workspace_id = w.id) AS companies,
+             (SELECT COUNT(*) FROM contacts WHERE workspace_id = w.id) AS contacts,
+             (SELECT COUNT(*) FROM deals WHERE workspace_id = w.id) AS deals,
+             (SELECT COUNT(*) FROM tasks WHERE workspace_id = w.id) AS tasks,
+             (SELECT COUNT(*) FROM campaigns WHERE workspace_id = w.id) AS campaigns
+           FROM workspaces w ORDER BY w.id`
+        )
+        .all();
+      return json({ workspaces: rows });
+    }
+    if (path === "/api/workspaces" && method === "POST") {
+      const b = await readBody(req);
+      const name = String(b.name || "").trim();
+      if (!name) return json({ error: "name is required" }, 400);
+      const color = /^#[0-9a-fA-F]{6}$/.test(String(b.color || "")) ? b.color : "#579bfc";
+      const r = db
+        .prepare("INSERT INTO workspaces (name, color) VALUES (?, ?)")
+        .run(name, color);
+      return json(
+        { workspace: db.query("SELECT * FROM workspaces WHERE id = ?").get(Number(r.lastInsertRowid)) },
+        201
+      );
+    }
+    const wsRec = path.match(/^\/api\/workspaces\/(\d+)$/);
+    if (wsRec && method === "PATCH") {
+      const b = await readBody(req);
+      const ws = db.query("SELECT * FROM workspaces WHERE id = ?").get(Number(wsRec[1])) as any;
+      if (!ws) return json({ error: "not found" }, 404);
+      const sets: string[] = [];
+      const vals: unknown[] = [];
+      if (b.name !== undefined && String(b.name).trim()) {
+        sets.push("name = ?");
+        vals.push(String(b.name).trim());
+      }
+      if (b.color !== undefined && /^#[0-9a-fA-F]{6}$/.test(String(b.color))) {
+        sets.push("color = ?");
+        vals.push(b.color);
+      }
+      if (sets.length) {
+        db.prepare(`UPDATE workspaces SET ${sets.join(", ")} WHERE id = ?`).run(...vals, ws.id);
+      }
+      return json({ workspace: db.query("SELECT * FROM workspaces WHERE id = ?").get(ws.id) });
+    }
+    if (wsRec && method === "DELETE") {
+      const ws = db.query("SELECT * FROM workspaces WHERE id = ?").get(Number(wsRec[1])) as any;
+      if (!ws) return json({ error: "not found" }, 404);
+      if (allWorkspaces().length <= 1) {
+        return json({ error: "cannot delete the last workspace" }, 400);
+      }
+      const counts: Record<string, number> = {};
+      for (const t of ["companies", "contacts", "deals", "tasks", "campaigns", "activities", "captures", "custom_fields", "webhooks"]) {
+        counts[t] = (db.query(`SELECT COUNT(*) n FROM ${t} WHERE workspace_id = ?`).get(ws.id) as any).n;
+      }
+      const records = Object.values(counts).reduce((a, b) => a + b, 0);
+      const b = await readBody(req);
+      // safe default: deleting a non-empty workspace needs the typed name as confirmation
+      if (records > 0 && b.confirm !== ws.name) {
+        return json(
+          { error: `workspace "${ws.name}" holds ${records} record(s) — pass { "confirm": "<name>" } to delete them too`, counts },
+          409
+        );
+      }
+      // cascade, FK-safe order
+      const whIds = (db.query("SELECT id FROM webhooks WHERE workspace_id = ?").all(ws.id) as any[]).map((x) => x.id);
+      if (whIds.length) {
+        db.query(`DELETE FROM webhook_deliveries WHERE webhook_id IN (${whIds.map(() => "?").join(",")})`).run(...whIds);
+      }
+      db.prepare("DELETE FROM webhooks WHERE workspace_id = ?").run(ws.id);
+      const fieldIds = (db.query("SELECT id FROM custom_fields WHERE workspace_id = ?").all(ws.id) as any[]).map((x) => x.id);
+      if (fieldIds.length) {
+        db.query(`DELETE FROM custom_values WHERE field_id IN (${fieldIds.map(() => "?").join(",")})`).run(...fieldIds);
+      }
+      db.prepare("DELETE FROM custom_fields WHERE workspace_id = ?").run(ws.id);
+      const capFiles = db.query("SELECT filename FROM captures WHERE workspace_id = ?").all(ws.id) as any[];
+      for (const f of capFiles) {
+        try { await Bun.$`rm -f ${UPLOAD_DIR}/${f.filename}`.quiet(); } catch {}
+      }
+      for (const t of ["activities", "captures", "tasks", "deals", "contacts", "campaigns", "companies"]) {
+        db.prepare(`DELETE FROM ${t} WHERE workspace_id = ?`).run(ws.id);
+      }
+      db.prepare("DELETE FROM workspaces WHERE id = ?").run(ws.id);
+      return json({ ok: true, deleted_records: records });
+    }
+
     // ---- KPIs
     if (path === "/api/kpis" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const open = db
         .query(
           `SELECT COUNT(*) n, COALESCE(SUM(value),0) v,
                   COALESCE(SUM(value * probability / 100.0),0) w
-           FROM deals WHERE stage NOT IN ('closed_won','closed_lost')`
+           FROM deals WHERE workspace_id = ? AND stage NOT IN ('closed_won','closed_lost')`
         )
-        .get() as any;
+        .get(w) as any;
       const wonQ = db
         .query(
           `SELECT COALESCE(SUM(value),0) v FROM deals
-           WHERE stage = 'closed_won' AND expected_close >= '2026-07-01'`
+           WHERE workspace_id = ? AND stage = 'closed_won' AND expected_close >= '2026-07-01'`
         )
-        .get() as any;
+        .get(w) as any;
       const byStage = db
         .query(
           `SELECT stage, COUNT(*) n, COALESCE(SUM(value),0) v FROM deals
-           GROUP BY stage`
+           WHERE workspace_id = ? GROUP BY stage`
         )
-        .all() as any[];
+        .all(w) as any[];
       const tasksOpen = (
-        db.query("SELECT COUNT(*) n FROM tasks WHERE done = 0").get() as any
+        db.query("SELECT COUNT(*) n FROM tasks WHERE workspace_id = ? AND done = 0").get(w) as any
       ).n;
       return json({
         open_deals: open.n,
@@ -259,24 +369,29 @@ const server = Bun.serve({
 
     // ---- deals
     if (path === "/api/deals" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const rows = db
         .query(
           `SELECT d.*, c.name AS company_name, ct.name AS contact_name
            FROM deals d
            LEFT JOIN companies c ON c.id = d.company_id
            LEFT JOIN contacts ct ON ct.id = d.contact_id
+           WHERE d.workspace_id = ?
            ORDER BY d.updated_at DESC`
         )
-        .all();
+        .all(w);
       return json({ deals: rows, stages: STAGES, labels: STAGE_LABELS });
     }
     if (path === "/api/deals" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const b = await readBody(req);
       const r = db
         .prepare(
           `INSERT INTO deals (title, company_id, contact_id, value, stage,
-           probability, expected_close, owner)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+           probability, expected_close, owner, workspace_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           b.title || "Untitled deal",
@@ -286,17 +401,21 @@ const server = Bun.serve({
           b.stage && STAGES.includes(b.stage) ? b.stage : "prospecting",
           Number(b.probability ?? 10),
           b.expected_close || "",
-          b.owner || ""
+          b.owner || "",
+          w
         );
-      const deal = dealJson(Number(r.lastInsertRowid));
-      logActivity("deal", `${(deal as any).title} created`);
-      fireWebhooks("deal.created", deal as any);
+      const deal = dealJson(Number(r.lastInsertRowid), w);
+      logActivity("deal", `${(deal as any).title} created`, w);
+      fireWebhooks("deal.created", deal as any, w);
       return json({ deal }, 201);
     }
     const dealId = path.match(/^\/api\/deals\/(\d+)$/);
     if (dealId && method === "PATCH") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const b = await readBody(req);
-      const before = dealJson(Number(dealId[1])) as any;
+      const before = dealJson(Number(dealId[1]), w) as any;
+      if (!before) return json({ error: "not found" }, 404);
       const sets: string[] = [];
       const vals: unknown[] = [];
       for (const k of ["title", "value", "stage", "probability", "expected_close", "owner", "company_id", "contact_id"]) {
@@ -309,25 +428,33 @@ const server = Bun.serve({
         sets.push("updated_at = datetime('now')");
         db.prepare(`UPDATE deals SET ${sets.join(", ")} WHERE id = ?`).run(...vals, Number(dealId[1]));
       }
-      const after = dealJson(Number(dealId[1])) as any;
-      if (before && after && before.stage !== after.stage) {
-        logActivity("deal", `${after.title} moved to ${STAGE_LABELS[after.stage]}`);
+      const after = dealJson(Number(dealId[1]), w) as any;
+      if (before.stage !== after.stage) {
+        logActivity("deal", `${after.title} moved to ${STAGE_LABELS[after.stage]}`, w);
         fireWebhooks("deal.stage_changed", {
           ...after,
           previous_stage: before.stage,
-        });
-      } else if (after) {
-        fireWebhooks("deal.updated", after);
+        }, w);
+      } else {
+        fireWebhooks("deal.updated", after, w);
       }
       return json({ deal: after });
     }
     if (dealId && method === "DELETE") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const exists = db
+        .query("SELECT id FROM deals WHERE id = ? AND workspace_id = ?")
+        .get(Number(dealId[1]), w);
+      if (!exists) return json({ error: "not found" }, 404);
       db.prepare("DELETE FROM deals WHERE id = ?").run(Number(dealId[1]));
       return json({ ok: true });
     }
 
     // ---- contacts
     if (path === "/api/contacts" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const q = url.searchParams.get("q") || "";
       const rows = attachCustom(
         "contact",
@@ -335,32 +462,40 @@ const server = Bun.serve({
           .query(
             `SELECT ct.*, c.name AS company_name FROM contacts ct
              LEFT JOIN companies c ON c.id = ct.company_id
-             WHERE ct.name LIKE ? OR ct.email LIKE ?
+             WHERE ct.workspace_id = ? AND (ct.name LIKE ? OR ct.email LIKE ?)
              ORDER BY ct.name`
           )
-          .all(`%${q}%`, `%${q}%`) as any[]
+          .all(w, `%${q}%`, `%${q}%`) as any[]
       );
       return json({ contacts: rows });
     }
     if (path === "/api/contacts" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const b = await readBody(req);
       const r = db
         .prepare(
-          "INSERT INTO contacts (company_id, name, title, email, phone) VALUES (?, ?, ?, ?, ?)"
+          "INSERT INTO contacts (company_id, name, title, email, phone, workspace_id) VALUES (?, ?, ?, ?, ?, ?)"
         )
-        .run(b.company_id || null, b.name || "Unnamed", b.title || "", b.email || "", b.phone || "");
+        .run(b.company_id || null, b.name || "Unnamed", b.title || "", b.email || "", b.phone || "", w);
       const id = Number(r.lastInsertRowid);
-      saveCustomValues("contact", id, b.custom);
+      saveCustomValues("contact", id, b.custom, w);
       const contact = attachCustom("contact", [
         db.query("SELECT * FROM contacts WHERE id = ?").get(id) as any,
       ])[0];
-      fireWebhooks("contact.created", contact as any);
+      fireWebhooks("contact.created", contact as any, w);
       return json({ contact }, 201);
     }
 
     const contactId = path.match(/^\/api\/contacts\/(\d+)$/);
     if (contactId && method === "PATCH") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const b = await readBody(req);
+      const contactExists = db
+        .query("SELECT id FROM contacts WHERE id = ? AND workspace_id = ?")
+        .get(Number(contactId[1]), w);
+      if (!contactExists) return json({ error: "not found" }, 404);
       const sets: string[] = [];
       const vals: unknown[] = [];
       for (const k of ["company_id", "name", "title", "email", "phone"]) {
@@ -373,7 +508,7 @@ const server = Bun.serve({
         db.prepare(`UPDATE contacts SET ${sets.join(", ")} WHERE id = ?`)
           .run(...vals, Number(contactId[1]));
       }
-      saveCustomValues("contact", Number(contactId[1]), b.custom);
+      saveCustomValues("contact", Number(contactId[1]), b.custom, w);
       const updatedContact = attachCustom("contact", [
         db.query("SELECT * FROM contacts WHERE id = ?").get(Number(contactId[1])) as any,
       ])[0];
@@ -383,6 +518,8 @@ const server = Bun.serve({
     // ---- CSV import: POST { csv: "..." } with header row
     // columns: name, title, company, email, phone (case-insensitive)
     if (path === "/api/contacts/import" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const b = await readBody(req);
       const rows = parseCsv(String(b.csv || ""));
       if (!rows.length) return json({ error: "empty CSV" }, 400);
@@ -408,11 +545,11 @@ const server = Bun.serve({
         const hit = companyCache.get(key);
         if (hit !== undefined) return hit;
         const existing = db
-          .query("SELECT id FROM companies WHERE lower(name) = ?")
-          .get(key) as any;
+          .query("SELECT id FROM companies WHERE lower(name) = ? AND workspace_id = ?")
+          .get(key, w) as any;
         const id = existing
           ? existing.id
-          : Number(db.prepare("INSERT INTO companies (name) VALUES (?)").run(name.trim()).lastInsertRowid);
+          : Number(db.prepare("INSERT INTO companies (name, workspace_id) VALUES (?, ?)").run(name.trim(), w).lastInsertRowid);
         companyCache.set(key, id);
         return id;
       };
@@ -427,19 +564,20 @@ const server = Bun.serve({
         const email = iEmail >= 0 ? (r[iEmail] || "").trim() : "";
         if (email) {
           const dup = db
-            .query("SELECT id FROM contacts WHERE lower(email) = ?")
-            .get(email.toLowerCase()) as any;
+            .query("SELECT id FROM contacts WHERE lower(email) = ? AND workspace_id = ?")
+            .get(email.toLowerCase(), w) as any;
           if (dup) { skipped++; return; }
         }
         try {
           db.prepare(
-            "INSERT INTO contacts (company_id, name, title, email, phone) VALUES (?, ?, ?, ?, ?)"
+            "INSERT INTO contacts (company_id, name, title, email, phone, workspace_id) VALUES (?, ?, ?, ?, ?, ?)"
           ).run(
             iCompany >= 0 ? companyIdFor(r[iCompany] || "") : null,
             name,
             iTitle >= 0 ? (r[iTitle] || "").trim() : "",
             email,
-            iPhone >= 0 ? (r[iPhone] || "").trim() : ""
+            iPhone >= 0 ? (r[iPhone] || "").trim() : "",
+            w
           );
           imported++;
         } catch (e) {
@@ -447,7 +585,7 @@ const server = Bun.serve({
         }
       });
       // bulk imports intentionally don't fire outgoing webhooks
-      logActivity("contact", `Imported ${imported} contact${imported === 1 ? "" : "s"} from CSV`);
+      logActivity("contact", `Imported ${imported} contact${imported === 1 ? "" : "s"} from CSV`, w);
       return json({ imported, skipped, errors: errors.slice(0, 10) });
     }
     if (path === "/api/contacts/import/template" && method === "GET") {
@@ -464,26 +602,31 @@ const server = Bun.serve({
 
     // ---- companies
     if (path === "/api/companies" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const rows = attachCustom(
         "company",
         db
           .query(
             `SELECT c.*, COUNT(d.id) AS deal_count,
                     COALESCE(SUM(CASE WHEN d.stage NOT IN ('closed_won','closed_lost') THEN d.value ELSE 0 END),0) AS open_value
-             FROM companies c LEFT JOIN deals d ON d.company_id = c.id
+             FROM companies c LEFT JOIN deals d ON d.company_id = c.id AND d.workspace_id = c.workspace_id
+             WHERE c.workspace_id = ?
              GROUP BY c.id ORDER BY open_value DESC`
           )
-          .all() as any[]
+          .all(w) as any[]
       );
       return json({ companies: rows });
     }
     if (path === "/api/companies" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const b = await readBody(req);
       const r = db
-        .prepare("INSERT INTO companies (name, industry, website) VALUES (?, ?, ?)")
-        .run(b.name || "Unnamed", b.industry || "", b.website || "");
+        .prepare("INSERT INTO companies (name, industry, website, workspace_id) VALUES (?, ?, ?, ?)")
+        .run(b.name || "Unnamed", b.industry || "", b.website || "", w);
       const id = Number(r.lastInsertRowid);
-      saveCustomValues("company", id, b.custom);
+      saveCustomValues("company", id, b.custom, w);
       const company = attachCustom("company", [
         db.query("SELECT * FROM companies WHERE id = ?").get(id) as any,
       ])[0];
@@ -492,7 +635,13 @@ const server = Bun.serve({
 
     const companyId = path.match(/^\/api\/companies\/(\d+)$/);
     if (companyId && method === "PATCH") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const b = await readBody(req);
+      const companyExists = db
+        .query("SELECT id FROM companies WHERE id = ? AND workspace_id = ?")
+        .get(Number(companyId[1]), w);
+      if (!companyExists) return json({ error: "not found" }, 404);
       const sets: string[] = [];
       const vals: unknown[] = [];
       for (const k of ["name", "industry", "website"]) {
@@ -505,7 +654,7 @@ const server = Bun.serve({
         db.prepare(`UPDATE companies SET ${sets.join(", ")} WHERE id = ?`)
           .run(...vals, Number(companyId[1]));
       }
-      saveCustomValues("company", Number(companyId[1]), b.custom);
+      saveCustomValues("company", Number(companyId[1]), b.custom, w);
       const updatedCompany = attachCustom("company", [
         db.query("SELECT * FROM companies WHERE id = ?").get(Number(companyId[1])) as any,
       ])[0];
@@ -514,34 +663,42 @@ const server = Bun.serve({
 
     // ---- tasks
     if (path === "/api/tasks" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const cid = url.searchParams.get("campaign_id");
       let q = `SELECT t.*, d.title AS deal_title FROM tasks t
              LEFT JOIN deals d ON d.id = t.deal_id`;
-      const params: unknown[] = [];
-      if (cid) {
-        q += ` WHERE t.campaign_id = ?`;
-        params.push(Number(cid));
-      }
+      const params: unknown[] = [w];
+      q += cid ? ` WHERE t.workspace_id = ? AND t.campaign_id = ?` : ` WHERE t.workspace_id = ?`;
+      if (cid) params.push(Number(cid));
       q += ` ORDER BY t.done, t.due_date`;
       const rows = attachCustom("task", db.query(q).all(...params) as any[]);
       return json({ tasks: rows });
     }
     if (path === "/api/tasks" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const b = await readBody(req);
       const r = db
-        .prepare("INSERT INTO tasks (title, deal_id, campaign_id, due_date, owner) VALUES (?, ?, ?, ?, ?)")
-        .run(b.title || "Untitled task", b.deal_id || null, b.campaign_id || null, b.due_date || "", b.owner || "");
+        .prepare("INSERT INTO tasks (title, deal_id, campaign_id, due_date, owner, workspace_id) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(b.title || "Untitled task", b.deal_id || null, b.campaign_id || null, b.due_date || "", b.owner || "", w);
       const id = Number(r.lastInsertRowid);
-      saveCustomValues("task", id, b.custom);
+      saveCustomValues("task", id, b.custom, w);
       const task = attachCustom("task", [
         db.query("SELECT * FROM tasks WHERE id = ?").get(id) as any,
       ])[0];
-      fireWebhooks("task.created", task as any);
+      fireWebhooks("task.created", task as any, w);
       return json({ task }, 201);
     }
     const taskId = path.match(/^\/api\/tasks\/(\d+)$/);
     if (taskId && method === "PATCH") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const b = await readBody(req);
+      const taskExists = db
+        .query("SELECT id FROM tasks WHERE id = ? AND workspace_id = ?")
+        .get(Number(taskId[1]), w);
+      if (!taskExists) return json({ error: "not found" }, 404);
       const sets: string[] = [];
       const vals: unknown[] = [];
       for (const k of ["title", "deal_id", "campaign_id", "due_date", "owner"]) {
@@ -554,45 +711,61 @@ const server = Bun.serve({
         db.prepare(`UPDATE tasks SET ${sets.join(", ")} WHERE id = ?`)
           .run(...vals, Number(taskId[1]));
       }
-      saveCustomValues("task", Number(taskId[1]), b.custom);
+      saveCustomValues("task", Number(taskId[1]), b.custom, w);
       const updatedTask = attachCustom("task", [
         db.query("SELECT * FROM tasks WHERE id = ?").get(Number(taskId[1])) as any,
       ])[0];
       return json({ task: updatedTask });
     }
     if (taskId && method === "DELETE") {
-      const t = db.query("SELECT * FROM tasks WHERE id = ?").get(Number(taskId[1])) as any;
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const t = db
+        .query("SELECT * FROM tasks WHERE id = ? AND workspace_id = ?")
+        .get(Number(taskId[1]), w) as any;
       if (t) {
         db.prepare("DELETE FROM custom_values WHERE entity = 'task' AND record_id = ?").run(t.id);
         db.prepare("DELETE FROM tasks WHERE id = ?").run(t.id);
-        fireWebhooks("task.deleted", { id: t.id, title: t.title });
+        fireWebhooks("task.deleted", { id: t.id, title: t.title, workspace_id: w }, w);
+      } else {
+        return json({ error: "not found" }, 404);
       }
       return json({ ok: true });
     }
     const taskToggle = path.match(/^\/api\/tasks\/(\d+)\/toggle$/);
     if (taskToggle && method === "POST") {
-      const t = db.query("SELECT * FROM tasks WHERE id = ?").get(Number(taskToggle[1])) as any;
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const t = db
+        .query("SELECT * FROM tasks WHERE id = ? AND workspace_id = ?")
+        .get(Number(taskToggle[1]), w) as any;
+      if (!t) return json({ error: "not found" }, 404);
       db.prepare("UPDATE tasks SET done = ? WHERE id = ?").run(t.done ? 0 : 1, t.id);
       const updated = db.query("SELECT * FROM tasks WHERE id = ?").get(t.id);
       if (!t.done) {
-        logActivity("task", `Completed: ${t.title}`);
-        fireWebhooks("task.completed", updated as any);
+        logActivity("task", `Completed: ${t.title}`, w);
+        fireWebhooks("task.completed", updated as any, w);
       }
       return json({ task: updated });
     }
 
     // ---- captures: business-card / client-note photos
     if (path === "/api/captures" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const rows = db
         .query(
           `SELECT c.*, ct.name AS contact_name FROM captures c
            LEFT JOIN contacts ct ON ct.id = c.contact_id
+           WHERE c.workspace_id = ?
            ORDER BY c.id DESC`
         )
-        .all();
+        .all(w);
       return json({ captures: rows });
     }
     if (path === "/api/captures" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       let form: FormData;
       try {
         form = await req.formData();
@@ -621,9 +794,9 @@ const server = Bun.serve({
         }
         const r = db
           .prepare(
-            "INSERT INTO captures (filename, original_name, mime, size) VALUES (?, ?, ?, ?)"
+            "INSERT INTO captures (filename, original_name, mime, size, workspace_id) VALUES (?, ?, ?, ?, ?)"
           )
-          .run(filename, file.name || "", file.type, file.size);
+          .run(filename, file.name || "", file.type, file.size, w);
         saved.push(
           db.query("SELECT * FROM captures WHERE id = ?").get(Number(r.lastInsertRowid))
         );
@@ -631,14 +804,21 @@ const server = Bun.serve({
       if (saved.length) {
         logActivity(
           "note",
-          `Captured ${saved.length} photo${saved.length === 1 ? "" : "s"} (business card / notes)`
+          `Captured ${saved.length} photo${saved.length === 1 ? "" : "s"} (business card / notes)`,
+          w
         );
       }
       return json({ captures: saved, errors }, 201);
     }
     const captureId = path.match(/^\/api\/captures\/(\d+)$/);
     if (captureId && method === "PATCH") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const b = await readBody(req);
+      const capExists = db
+        .query("SELECT id FROM captures WHERE id = ? AND workspace_id = ?")
+        .get(Number(captureId[1]), w);
+      if (!capExists) return json({ error: "not found" }, 404);
       const sets: string[] = [];
       const vals: unknown[] = [];
       if (b.note !== undefined) {
@@ -663,9 +843,11 @@ const server = Bun.serve({
       });
     }
     if (captureId && method === "DELETE") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const row = db
-        .query("SELECT * FROM captures WHERE id = ?")
-        .get(Number(captureId[1])) as any;
+        .query("SELECT * FROM captures WHERE id = ? AND workspace_id = ?")
+        .get(Number(captureId[1]), w) as any;
       if (row) {
         try {
           await Bun.$`rm -f ${UPLOAD_DIR}/${row.filename}`.quiet();
@@ -678,9 +860,13 @@ const server = Bun.serve({
     // ---- custom fields (schema editor)
     const schemaEntity = path.match(/^\/api\/schema\/([a-z]+)$/);
     if (schemaEntity && CUSTOM_ENTITIES.includes(schemaEntity[1]) && method === "GET") {
-      return json({ fields: getCustomFields(schemaEntity[1]) });
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      return json({ fields: getCustomFields(schemaEntity[1], w) });
     }
     if (schemaEntity && CUSTOM_ENTITIES.includes(schemaEntity[1]) && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const b = await readBody(req);
       const entity = schemaEntity[1];
       const label = String(b.label || "").trim();
@@ -689,7 +875,7 @@ const server = Bun.serve({
       let name = slugify(label);
       if (CORE_COLUMNS[entity].includes(name)) return json({ error: `"${name}" is a built-in field` }, 400);
       let n = 2;
-      while (db.query("SELECT id FROM custom_fields WHERE entity = ? AND name = ?").get(entity, name)) {
+      while (db.query("SELECT id FROM custom_fields WHERE entity = ? AND workspace_id = ? AND name = ?").get(entity, w, name)) {
         name = `${slugify(label)}_${n++}`;
       }
       let options = "[]";
@@ -701,15 +887,21 @@ const server = Bun.serve({
       const pos = (db.query("SELECT COALESCE(MAX(position), -1) + 1 AS p FROM custom_fields WHERE entity = ?").get(entity) as any).p;
       const r = db
         .prepare(
-          "INSERT INTO custom_fields (entity, name, label, type, options, required, position) VALUES (?, ?, ?, ?, ?, ?, ?)"
+          "INSERT INTO custom_fields (entity, name, label, type, options, required, position, workspace_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         )
-        .run(entity, name, label, type, options, b.required ? 1 : 0, pos);
-      logActivity("note", `Added custom field "${label}" to ${entity}s`);
+        .run(entity, name, label, type, options, b.required ? 1 : 0, pos, w);
+      logActivity("note", `Added custom field "${label}" to ${entity}s`, w);
       return json({ field: db.query("SELECT * FROM custom_fields WHERE id = ?").get(Number(r.lastInsertRowid)) }, 201);
     }
     const schemaFieldId = path.match(/^\/api\/schema\/fields\/(\d+)$/);
     if (schemaFieldId && method === "PATCH") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const b = await readBody(req);
+      const fieldExists = db
+        .query("SELECT id FROM custom_fields WHERE id = ? AND workspace_id = ?")
+        .get(Number(schemaFieldId[1]), w);
+      if (!fieldExists) return json({ error: "not found" }, 404);
       const sets: string[] = [];
       const vals: unknown[] = [];
       if (b.label !== undefined && String(b.label).trim()) {
@@ -741,37 +933,48 @@ const server = Bun.serve({
       return json({ field: db.query("SELECT * FROM custom_fields WHERE id = ?").get(Number(schemaFieldId[1])) });
     }
     if (schemaFieldId && method === "DELETE") {
-      const f = db.query("SELECT * FROM custom_fields WHERE id = ?").get(Number(schemaFieldId[1])) as any;
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const f = db
+        .query("SELECT * FROM custom_fields WHERE id = ? AND workspace_id = ?")
+        .get(Number(schemaFieldId[1]), w) as any;
       if (f) {
         db.prepare("DELETE FROM custom_values WHERE field_id = ?").run(f.id);
         db.prepare("DELETE FROM custom_fields WHERE id = ?").run(f.id);
-        logActivity("note", `Removed custom field "${f.label}" from ${f.entity}s`);
+        logActivity("note", `Removed custom field "${f.label}" from ${f.entity}s`, w);
+      } else {
+        return json({ error: "not found" }, 404);
       }
       return json({ ok: true });
     }
 
     // ---- campaigns
     if (path === "/api/campaigns" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const rows = attachCustom("campaign", db.query(
         `SELECT c.*, co.name AS company_name FROM campaigns c
          LEFT JOIN companies co ON co.id = c.company_id
+         WHERE c.workspace_id = ?
          ORDER BY c.created_at DESC`
-      ).all() as any[]);
+      ).all(w) as any[]);
       return json({ campaigns: rows });
     }
     if (path === "/api/campaigns" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const b = await readBody(req);
       const companyId = Number(b.company_id) || null;
       const company = companyId
-        ? (db.query("SELECT id FROM companies WHERE id = ?").get(companyId) as any)
+        ? (db.query("SELECT id FROM companies WHERE id = ? AND workspace_id = ?").get(companyId, w) as any)
         : null;
       if (!company) return json({ error: "a valid company_id is required" }, 400);
       const r = db
-        .prepare("INSERT INTO campaigns (name, company_id, status, start_date, end_date, budget, notes) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .prepare("INSERT INTO campaigns (name, company_id, status, start_date, end_date, budget, notes, workspace_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
         .run(b.name || "Untitled campaign", companyId, b.status || "draft", b.start_date || "", b.end_date || "",
-          Number(b.budget) || 0, b.notes || "");
+          Number(b.budget) || 0, b.notes || "", w);
       const id = Number(r.lastInsertRowid);
-      saveCustomValues("campaign", id, b.custom);
+      saveCustomValues("campaign", id, b.custom, w);
       // autopopulate the standard sales workflow (beginning -> closing)
       const base = b.start_date || new Date().toISOString().slice(0, 10);
       const dueFor = (offset: number) => {
@@ -795,20 +998,26 @@ const server = Bun.serve({
         ["Post-close check-in", 65],
       ];
       const insTask = db.prepare(
-        "INSERT INTO tasks (title, campaign_id, due_date, owner) VALUES (?, ?, ?, ?)"
+        "INSERT INTO tasks (title, campaign_id, due_date, owner, workspace_id) VALUES (?, ?, ?, ?, ?)"
       );
       for (const [title, offset] of WORKFLOW) {
-        insTask.run(title, id, dueFor(offset), "");
+        insTask.run(title, id, dueFor(offset), "", w);
       }
-      logActivity("note", `Autopopulated ${WORKFLOW.length} workflow tasks for campaign "${b.name || "Untitled campaign"}"`);
+      logActivity("note", `Autopopulated ${WORKFLOW.length} workflow tasks for campaign "${b.name || "Untitled campaign"}"`, w);
       const campaign = attachCustom("campaign", [db.query("SELECT * FROM campaigns WHERE id = ?").get(id) as any])[0];
-      logActivity("note", `Created campaign "${campaign.name}"`);
-      fireWebhooks("campaign.created", campaign);
+      logActivity("note", `Created campaign "${campaign.name}"`, w);
+      fireWebhooks("campaign.created", campaign, w);
       return json({ campaign }, 201);
     }
     const campaignId = path.match(/^\/api\/campaigns\/(\d+)$/);
     if (campaignId && method === "PATCH") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const b = await readBody(req);
+      const campaignExists = db
+        .query("SELECT id FROM campaigns WHERE id = ? AND workspace_id = ?")
+        .get(Number(campaignId[1]), w);
+      if (!campaignExists) return json({ error: "not found" }, 404);
       const sets: string[] = [];
       const vals: unknown[] = [];
       for (const k of ["name", "status", "start_date", "end_date", "notes"]) {
@@ -816,7 +1025,7 @@ const server = Bun.serve({
       }
       if (b.company_id !== undefined) {
         const cid = b.company_id === "" ? null : Number(b.company_id);
-        if (cid && !(db.query("SELECT id FROM companies WHERE id = ?").get(cid) as any)) {
+        if (cid && !(db.query("SELECT id FROM companies WHERE id = ? AND workspace_id = ?").get(cid, w) as any)) {
           return json({ error: "unknown company_id" }, 400);
         }
         sets.push("company_id = ?");
@@ -826,18 +1035,24 @@ const server = Bun.serve({
       if (sets.length) {
         db.prepare(`UPDATE campaigns SET ${sets.join(", ")} WHERE id = ?`).run(...vals, Number(campaignId[1]));
       }
-      saveCustomValues("campaign", Number(campaignId[1]), b.custom);
+      saveCustomValues("campaign", Number(campaignId[1]), b.custom, w);
       const campaign = attachCustom("campaign", [db.query("SELECT * FROM campaigns WHERE id = ?").get(Number(campaignId[1])) as any])[0];
-      fireWebhooks("campaign.updated", campaign);
+      fireWebhooks("campaign.updated", campaign, w);
       return json({ campaign });
     }
     if (campaignId && method === "DELETE") {
-      const c = db.query("SELECT * FROM campaigns WHERE id = ?").get(Number(campaignId[1])) as any;
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const c = db
+        .query("SELECT * FROM campaigns WHERE id = ? AND workspace_id = ?")
+        .get(Number(campaignId[1]), w) as any;
       if (c) {
         db.prepare("DELETE FROM custom_values WHERE entity = 'campaign' AND record_id = ?").run(c.id);
         db.prepare("UPDATE tasks SET campaign_id = NULL WHERE campaign_id = ?").run(c.id);
         db.prepare("DELETE FROM campaigns WHERE id = ?").run(c.id);
-        fireWebhooks("campaign.deleted", { id: c.id, name: c.name });
+        fireWebhooks("campaign.deleted", { id: c.id, name: c.name, workspace_id: w }, w);
+      } else {
+        return json({ error: "not found" }, 404);
       }
       return json({ ok: true });
     }
@@ -849,23 +1064,30 @@ const server = Bun.serve({
     }
 
     // ---- activities
-    if (path === "/api/activities" && method === "GET") {      const rows = db
-        .query("SELECT * FROM activities ORDER BY id DESC LIMIT 30")
-        .all();
+    if (path === "/api/activities" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const rows = db
+        .query("SELECT * FROM activities WHERE workspace_id = ? ORDER BY id DESC LIMIT 30")
+        .all(w);
       return json({ activities: rows });
     }
 
     // ---- outgoing webhooks (automation platforms)
     if (path === "/api/webhooks" && method === "GET") {
-      const rows = db.query("SELECT * FROM webhooks ORDER BY id DESC").all();
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const rows = db.query("SELECT * FROM webhooks WHERE workspace_id = ? ORDER BY id DESC").all(w);
       return json({ webhooks: rows, events: ALL_EVENTS });
     }
     if (path === "/api/webhooks" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const b = await readBody(req);
       if (!b.url) return json({ error: "url required" }, 400);
       const r = db
-        .prepare("INSERT INTO webhooks (name, url, events, active) VALUES (?, ?, ?, ?)")
-        .run(b.name || b.url, b.url, JSON.stringify(b.events || []), b.active === false ? 0 : 1);
+        .prepare("INSERT INTO webhooks (name, url, events, active, workspace_id) VALUES (?, ?, ?, ?, ?)")
+        .run(b.name || b.url, b.url, JSON.stringify(b.events || []), b.active === false ? 0 : 1, w);
       return json(
         { webhook: db.query("SELECT * FROM webhooks WHERE id = ?").get(Number(r.lastInsertRowid)) },
         201
@@ -873,13 +1095,23 @@ const server = Bun.serve({
     }
     const whId = path.match(/^\/api\/webhooks\/(\d+)$/);
     if (whId && method === "DELETE") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const whExists = db
+        .query("SELECT id FROM webhooks WHERE id = ? AND workspace_id = ?")
+        .get(Number(whId[1]), w);
+      if (!whExists) return json({ error: "not found" }, 404);
       db.prepare("DELETE FROM webhooks WHERE id = ?").run(Number(whId[1]));
       db.prepare("DELETE FROM webhook_deliveries WHERE webhook_id = ?").run(Number(whId[1]));
       return json({ ok: true });
     }
     const whTest = path.match(/^\/api\/webhooks\/(\d+)\/test$/);
     if (whTest && method === "POST") {
-      const h = db.query("SELECT * FROM webhooks WHERE id = ?").get(Number(whTest[1])) as any;
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const h = db
+        .query("SELECT * FROM webhooks WHERE id = ? AND workspace_id = ?")
+        .get(Number(whTest[1]), w) as any;
       if (!h) return json({ error: "not found" }, 404);
       const payload = { event: "test", sent_at: new Date().toISOString(), data: { hello: "from exec-crm" } };
       let status = "ok", code = 0;
@@ -899,13 +1131,16 @@ const server = Bun.serve({
       return json({ status, response_code: code });
     }
     if (path === "/api/deliveries" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
       const rows = db
         .query(
           `SELECT d.*, w.name AS webhook_name FROM webhook_deliveries d
            LEFT JOIN webhooks w ON w.id = d.webhook_id
+           WHERE w.workspace_id = ?
            ORDER BY d.id DESC LIMIT 50`
         )
-        .all();
+        .all(w);
       return json({ deliveries: rows });
     }
 
@@ -935,29 +1170,38 @@ const server = Bun.serve({
       // normalize: accept {action, data} or flat fields with action
       const action = b.action || "create_deal";
       const data = b.data || b;
+      const target = url.searchParams.get("workspace") || b.workspace_id || data.workspace_id;
+      let w: number;
+      if (target) {
+        const found = allWorkspaces().find((x) => String(x.id) === String(target));
+        if (!found) return json({ error: `unknown workspace "${target}"` }, 400);
+        w = found.id;
+      } else {
+        w = needWs(req, url) as number;
+      }
       let result: any = null;
       if (action === "create_deal") {
         const r = db.prepare(
-          `INSERT INTO deals (title, company_id, value, stage, probability, expected_close, owner)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO deals (title, company_id, value, stage, probability, expected_close, owner, workspace_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
         ).run(data.title || "Inbound deal", data.company_id || null, Number(data.value || 0),
           data.stage && STAGES.includes(data.stage) ? data.stage : "prospecting",
-          Number(data.probability ?? 10), data.expected_close || "", data.owner || "automation");
-        result = dealJson(Number(r.lastInsertRowid));
-        logActivity("deal", `${(result as any).title} created via ${hook.name}`);
-        fireWebhooks("deal.created", result as any);
+          Number(data.probability ?? 10), data.expected_close || "", data.owner || "automation", w);
+        result = dealJson(Number(r.lastInsertRowid), w);
+        logActivity("deal", `${(result as any).title} created via ${hook.name}`, w);
+        fireWebhooks("deal.created", result as any, w);
       } else if (action === "create_contact") {
         const r = db.prepare(
-          "INSERT INTO contacts (company_id, name, title, email, phone) VALUES (?, ?, ?, ?, ?)"
-        ).run(data.company_id || null, data.name || "Unnamed", data.title || "", data.email || "", data.phone || "");
+          "INSERT INTO contacts (company_id, name, title, email, phone, workspace_id) VALUES (?, ?, ?, ?, ?, ?)"
+        ).run(data.company_id || null, data.name || "Unnamed", data.title || "", data.email || "", data.phone || "", w);
         result = db.query("SELECT * FROM contacts WHERE id = ?").get(Number(r.lastInsertRowid));
-        fireWebhooks("contact.created", result as any);
+        fireWebhooks("contact.created", result as any, w);
       } else if (action === "create_task") {
         const r = db.prepare(
-          "INSERT INTO tasks (title, deal_id, due_date, owner) VALUES (?, ?, ?, ?)"
-        ).run(data.title || "Inbound task", data.deal_id || null, data.due_date || "", data.owner || "automation");
+          "INSERT INTO tasks (title, deal_id, due_date, owner, workspace_id) VALUES (?, ?, ?, ?, ?)"
+        ).run(data.title || "Inbound task", data.deal_id || null, data.due_date || "", data.owner || "automation", w);
         result = db.query("SELECT * FROM tasks WHERE id = ?").get(Number(r.lastInsertRowid));
-        fireWebhooks("task.created", result as any);
+        fireWebhooks("task.created", result as any, w);
       } else {
         return json({ error: `unknown action: ${action}` }, 400);
       }

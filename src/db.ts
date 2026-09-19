@@ -214,6 +214,12 @@ export function openDb(path: string): Database {
       ALTER TABLE custom_fields_new RENAME TO custom_fields;
     `);
   }
+  // migration: outgoing webhooks can carry custom headers (e.g. X-Milton-Secret).
+  // Values are secrets; the API only ever exposes header names.
+  const whCols = db.query("PRAGMA table_info(webhooks)").all() as any[];
+  if (!whCols.some((c) => c.name === "headers")) {
+    db.exec("ALTER TABLE webhooks ADD COLUMN headers TEXT DEFAULT '{}'");
+  }
   return db;
 }
 

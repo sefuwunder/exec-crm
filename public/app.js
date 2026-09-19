@@ -99,6 +99,44 @@ const field = (label, inner) =>
   `<div class="field"><label>${esc(label)}</label>${inner}</div>`;
 const input = (name, val = "", type = "text", extra = "") =>
   `<input name="${name}" type="${type}" value="${esc(val)}" ${extra}>`;
+
+/* ---------- webhook custom headers editor ----------
+   Standalone helpers (depend only on esc); covered by tests/webhook-headers.test.ts.
+   Header inputs carry no `name` attribute so openModal's generic collector
+   ignores them — collectHeaders() gathers them explicitly on submit. */
+function headerRowHtml(name, existing) {
+  return `<div class="hdr-row" style="display:flex;gap:8px;margin-bottom:6px">` +
+    `<input class="hdr-name" placeholder="Header-Name" value="${esc(name || "")}" style="flex:1;min-width:0" autocomplete="off" spellcheck="false">` +
+    `<input class="hdr-value" placeholder="${existing ? "•••••• (unchanged — type to replace)" : "value"}" value="" style="flex:1;min-width:0" autocomplete="off" spellcheck="false">` +
+    `<button type="button" class="btn ghost small" data-hdr-del title="Remove header">×</button></div>`;
+}
+function headersEditorHtml(names) {
+  const rows = (names || []).map((n) => headerRowHtml(n, true)).join("");
+  return `<div class="field"><label>Custom headers</label>` +
+    `<div id="hdr-rows">${rows}${headerRowHtml("", false)}</div>` +
+    `<button type="button" class="btn ghost small" id="hdr-add">+ Add header</button>` +
+    `<div style="color:var(--text-3);font-size:12px;margin-top:6px">Sent with every delivery, e.g. <span class="tag">X-Milton-Secret</span>. ` +
+    `Values are secrets — stored server-side and never shown again. Remove a row to delete that header.</div></div>`;
+}
+function bindHeadersEditor(root) {
+  const add = root.querySelector("#hdr-add");
+  if (add) add.onclick = () =>
+    root.querySelector("#hdr-rows").insertAdjacentHTML("beforeend", headerRowHtml("", false));
+  const rows = root.querySelector("#hdr-rows");
+  if (rows) rows.addEventListener("click", (e) => {
+    const btn = e.target && e.target.closest ? e.target.closest("[data-hdr-del]") : null;
+    const row = btn && btn.closest ? btn.closest(".hdr-row") : null;
+    if (row) row.remove();
+  });
+}
+function collectHeaders(root) {
+  const out = {};
+  root.querySelectorAll(".hdr-row").forEach((row) => {
+    const n = row.querySelector(".hdr-name").value.trim();
+    if (n) out[n] = row.querySelector(".hdr-value").value;
+  });
+  return out;
+}
 const select = (name, options, val = "") =>
   `<select name="${name}">${options
     .map(([v, l]) => `<option value="${esc(v)}" ${String(v) === String(val) ? "selected" : ""}>${esc(l)}</option>`)
@@ -1238,6 +1276,19 @@ async function editTaskModal(t, deals) {
     async (d) => { await PATCH(`/api/tasks/${t.id}`, d); route(); }, "Save changes");
 }
 
+function webhookFormHtml(w, events) {
+  let ev = [];
+  try { ev = JSON.parse(w.events || "[]"); } catch {}
+  return `
+      ${field("Name", input("name", w.name || "Zapier catch hook"))}
+      ${field("URL", input("url", w.url || "https://", "url"))}
+      <div class="field"><label>Events (none checked = all)</label>
+        <div style="display:flex;gap:12px;flex-wrap:wrap">
+          ${events.map((e) => `<label style="font-weight:400"><input type="checkbox" name="events" value="${e}" style="width:auto" ${ev.includes(e) ? "checked" : ""}> ${e}</label>`).join("")}
+        </div></div>
+      ${headersEditorHtml(w.headers || [])}`;
+}
+
 async function vAutomations() {
   const { webhooks, events } = await GET("/api/webhooks");
   const { deliveries } = await GET("/api/deliveries");
@@ -1254,7 +1305,8 @@ async function vAutomations() {
           return `<div class="hook">
             <div class="info"><div class="name">${esc(w.name)} ${w.active ? "" : '<span class="tag">paused</span>'}</div>
               <div class="url">${esc(w.url)}</div>
-              <div class="events">${(ev.length ? ev : ["all"]).map((e) => `<span class="tag">${esc(e)}</span>`).join("")}</div></div>
+              <div class="events">${(ev.length ? ev : ["all"]).map((e) => `<span class="tag">${esc(e)}</span>`).join("")}${(w.headers || []).length ? ` <span class="tag" title="${esc(w.headers.join(", "))}">${w.headers.length} header${w.headers.length > 1 ? "s" : ""}</span>` : ""}</div></div>
+            <button class="btn ghost small" data-edit="${w.id}">Edit</button>
             <button class="btn ghost small" data-test="${w.id}">Test</button>
             <button class="btn danger small" data-del="${w.id}">Delete</button>
           </div>`;
@@ -1309,16 +1361,26 @@ Content-Type: application/json
       <div id="import-result"></div>
     </div>`;
 
-  $("#add-wh").onclick = () =>
-    openModal("Add outgoing webhook", `
-      ${field("Name", input("name", "Zapier catch hook"))}
-      ${field("URL", input("url", "https://", "url"))}
-      <div class="field"><label>Events (none checked = all)</label>
-        <div style="display:flex;gap:12px;flex-wrap:wrap">
-          ${events.map((e) => `<label style="font-weight:400"><input type="checkbox" name="events" value="${e}" style="width:auto"> ${e}</label>`).join("")}
-        </div></div>`,
-      async (d) => { await POST("/api/webhooks", d); route(); }, "Add webhook");
+  $("#add-wh").onclick = () => {
+    openModal("Add outgoing webhook", webhookFormHtml({ headers: [] }, events),
+      async (d) => {
+        d.headers = collectHeaders($("#modal-root"));
+        await POST("/api/webhooks", d); route();
+      }, "Add webhook");
+    bindHeadersEditor($("#modal-root"));
+  };
 
+  document.querySelectorAll("[data-edit]").forEach((b) =>
+    (b.onclick = () => {
+      const w = webhooks.find((x) => String(x.id) === b.dataset.edit) || { headers: [] };
+      openModal("Edit outgoing webhook", webhookFormHtml(w, events),
+        async (d) => {
+          d.headers = collectHeaders($("#modal-root"));
+          if (d.events === undefined) d.events = []; // none checked = all
+          await PATCH(`/api/webhooks/${w.id}`, d); route();
+        }, "Save changes");
+      bindHeadersEditor($("#modal-root"));
+    }));
   document.querySelectorAll("[data-test]").forEach((b) =>
     (b.onclick = async () => { const r = await POST(`/api/webhooks/${b.dataset.test}/test`); alert(`Test ${r.status} (HTTP ${r.response_code || "—"})`); route(); }));
   document.querySelectorAll("[data-del]").forEach((b) =>

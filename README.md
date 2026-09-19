@@ -48,6 +48,23 @@ Payload shape: `{"event": "...", "sent_at": "...", "data": {...}}` with an
 `X-CRM-Event` header. Every delivery (ok / error / failed) is logged and
 visible in the Automations view; a **Test** button sends a sample payload.
 
+**Custom headers** — each outgoing webhook can send extra headers with every
+delivery (API keys, shared secrets). Add them in the Automations view's
+webhook editor, or pass `"headers": {"X-Foo": "bar"}` to
+`POST /api/webhooks` (`PATCH /api/webhooks/:id` to change them later).
+Header values are secrets: the API and UI only ever reveal header *names*,
+never values. Custom headers win over the defaults (`Content-Type`,
+`X-CRM-Event`); connection-framing headers (`Content-Length`, `Host`, …)
+are rejected.
+
+**Milton wiring** — no proxy needed. Point a webhook straight at Milton:
+1. In Milton: set `MILTON_HOOK_SECRET` to a shared secret and restart it.
+2. Here: Automations → Add webhook, URL
+   `http://<milton-host>:3009/api/hooks/exec-crm`, events e.g.
+   `deal.stage_changed`, custom header `X-Milton-Secret` = the same secret.
+3. In Milton chat: `when deal won run celebrate`. exec-crm fires on the
+   event, Milton runs the routine.
+
 **Incoming** — each hook belongs to exactly one workspace (the one active
 when it's created). Create a hook, then POST from any platform's HTTP step —
 records land in the hook's workspace automatically:
@@ -68,7 +85,7 @@ outgoing webhooks, so chains compose.
 
 `GET /api/kpis` · `GET|POST /api/deals` · `PATCH|DELETE /api/deals/:id` ·
 `GET|POST /api/contacts` · `GET|POST /api/companies` · `GET|POST /api/tasks` ·
-`POST /api/tasks/:id/toggle` · `GET /api/activities` · `GET /api/webhooks` ·
+`POST /api/tasks/:id/toggle` · `GET /api/activities` · `GET|POST /api/webhooks` · `PATCH /api/webhooks/:id` ·
 `POST /api/webhooks/:id/test` · `GET /api/deliveries` · `GET|POST /api/hooks` ·
 `PATCH|DELETE /api/hooks/:id` · `POST /api/hooks/in/:key` ·
 `GET|POST /api/captures` (multipart `photos[]`) · `PATCH|DELETE /api/captures/:id` ·

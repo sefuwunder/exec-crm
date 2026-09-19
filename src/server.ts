@@ -97,6 +97,71 @@ function logActivity(kind: string, text: string, w: number) {
     .run(kind, text, w);
 }
 
+// ---- outgoing webhook custom headers ------------------------------------------
+// Header values are secrets (API keys, shared secrets). They are stored
+// server-side and never exposed: API/UI reads only ever see header *names*.
+const HEADER_NAME_RE = /^[A-Za-z0-9-]+$/;
+// framing headers that would corrupt delivery if overridden
+const BLOCKED_HEADERS = new Set([
+  "content-length", "host", "connection", "transfer-encoding", "upgrade",
+  "trailer", "te", "keep-alive", "proxy-authenticate", "proxy-authorization", "expect",
+]);
+const MAX_CUSTOM_HEADERS = 20;
+const MAX_HEADER_LEN = 2048;
+
+function validateHeaders(input: unknown): Record<string, string> | { error: string } {
+  if (input === undefined || input === null) return {};
+  if (typeof input !== "object" || Array.isArray(input))
+    return { error: "headers must be an object of name -> value" };
+  const out: Record<string, string> = {};
+  const names = Object.keys(input as Record<string, unknown>);
+  if (names.length > MAX_CUSTOM_HEADERS)
+    return { error: `too many headers (max ${MAX_CUSTOM_HEADERS})` };
+  for (const name of names) {
+    const value = (input as Record<string, unknown>)[name];
+    if (!name || !HEADER_NAME_RE.test(name))
+      return { error: `invalid header name: ${name || "(empty)"}` };
+    if (BLOCKED_HEADERS.has(name.toLowerCase()))
+      return { error: `header not allowed: ${name}` };
+    if (typeof value !== "string")
+      return { error: `header value must be a string: ${name}` };
+    if (name.length > MAX_HEADER_LEN || value.length > MAX_HEADER_LEN)
+      return { error: `header too long: ${name} (max 2KB)` };
+    if (/[\r\n]/.test(name) || /[\r\n]/.test(value))
+      return { error: `header must not contain line breaks: ${name}` };
+    out[name] = value;
+  }
+  return out;
+}
+
+// stored JSON -> validated string map (tolerates legacy/garbage rows)
+function storedHeaders(row: any): Record<string, string> {
+  try {
+    const h = JSON.parse(row.headers || "{}");
+    if (h && typeof h === "object" && !Array.isArray(h)) {
+      const out: Record<string, string> = {};
+      for (const k of Object.keys(h))
+        if (typeof h[k] === "string") out[k] = h[k];
+      return out;
+    }
+  } catch {}
+  return {};
+}
+
+// public shape: header values never leave the server — names only
+function maskHeaders(row: any): any {
+  return { ...row, headers: Object.keys(storedHeaders(row)) };
+}
+
+// merge custom headers over the defaults; custom wins case-insensitively,
+// framing headers can never be overridden (they're rejected at write time)
+function deliveryHeaders(custom: Record<string, string>, event: string): Record<string, string> {
+  const lower = new Set(Object.keys(custom).map((k) => k.toLowerCase()));
+  const out: Record<string, string> = { "Content-Type": "application/json", "X-CRM-Event": event };
+  for (const k of Object.keys(out)) if (lower.has(k.toLowerCase())) delete out[k];
+  return { ...out, ...custom };
+}
+
 async function fireWebhooks(event: string, payload: Record<string, unknown>, w: number) {
   const hooks = db
     .query("SELECT * FROM webhooks WHERE active = 1 AND workspace_id = ?")
@@ -117,7 +182,7 @@ async function fireWebhooks(event: string, payload: Record<string, unknown>, w: 
     try {
       const res = await fetch(h.url, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-CRM-Event": event },
+        headers: deliveryHeaders(storedHeaders(h), event),
         body,
         signal: AbortSignal.timeout(8000),
       });
@@ -1078,7 +1143,9 @@ const server = Bun.serve({
     if (path === "/api/webhooks" && method === "GET") {
       const w = needWs(req, url);
       if (w instanceof Response) return w;
-      const rows = db.query("SELECT * FROM webhooks WHERE workspace_id = ? ORDER BY id DESC").all(w);
+      const rows = (
+        db.query("SELECT * FROM webhooks WHERE workspace_id = ? ORDER BY id DESC").all(w) as any[]
+      ).map(maskHeaders);
       return json({ webhooks: rows, events: ALL_EVENTS });
     }
     if (path === "/api/webhooks" && method === "POST") {
@@ -1086,13 +1153,48 @@ const server = Bun.serve({
       if (w instanceof Response) return w;
       const b = await readBody(req);
       if (!b.url) return json({ error: "url required" }, 400);
+      const v = validateHeaders(b.headers);
+      if ("error" in v) return json({ error: v.error }, 400);
       const r = db
-        .prepare("INSERT INTO webhooks (name, url, events, active, workspace_id) VALUES (?, ?, ?, ?, ?)")
-        .run(b.name || b.url, b.url, JSON.stringify(b.events || []), b.active === false ? 0 : 1, w);
+        .prepare("INSERT INTO webhooks (name, url, events, active, workspace_id, headers) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(b.name || b.url, b.url, JSON.stringify(b.events || []), b.active === false ? 0 : 1, w, JSON.stringify(v));
       return json(
-        { webhook: db.query("SELECT * FROM webhooks WHERE id = ?").get(Number(r.lastInsertRowid)) },
+        { webhook: maskHeaders(db.query("SELECT * FROM webhooks WHERE id = ?").get(Number(r.lastInsertRowid))) },
         201
       );
+    }
+    const whPatch = path.match(/^\/api\/webhooks\/(\d+)$/);
+    if (whPatch && method === "PATCH") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const h = db
+        .query("SELECT * FROM webhooks WHERE id = ? AND workspace_id = ?")
+        .get(Number(whPatch[1]), w) as any;
+      if (!h) return json({ error: "not found" }, 404);
+      const b = await readBody(req);
+      const sets: string[] = [];
+      const vals: any[] = [];
+      if (b.name !== undefined) { sets.push("name = ?"); vals.push(String(b.name)); }
+      if (b.url !== undefined) { sets.push("url = ?"); vals.push(String(b.url)); }
+      if (b.events !== undefined) { sets.push("events = ?"); vals.push(JSON.stringify(b.events || [])); }
+      if (b.active !== undefined) { sets.push("active = ?"); vals.push(b.active ? 1 : 0); }
+      if (b.headers !== undefined) {
+        // Replace semantics: keys present with a non-empty value are set;
+        // an empty-string value keeps the existing stored value (UI "unchanged"
+        // convention — values are never readable back); keys absent are removed.
+        const v = validateHeaders(b.headers);
+        if ("error" in v) return json({ error: v.error }, 400);
+        const prev = storedHeaders(h);
+        const next: Record<string, string> = {};
+        for (const k of Object.keys(v))
+          next[k] = v[k] === "" && k in prev ? prev[k] : v[k];
+        sets.push("headers = ?"); vals.push(JSON.stringify(next));
+      }
+      if (sets.length)
+        db.prepare(`UPDATE webhooks SET ${sets.join(", ")} WHERE id = ?`).run(...vals, Number(whPatch[1]));
+      return json({
+        webhook: maskHeaders(db.query("SELECT * FROM webhooks WHERE id = ?").get(Number(whPatch[1]))),
+      });
     }
     const whId = path.match(/^\/api\/webhooks\/(\d+)$/);
     if (whId && method === "DELETE") {
@@ -1119,7 +1221,7 @@ const server = Bun.serve({
       try {
         const res = await fetch(h.url, {
           method: "POST",
-          headers: { "Content-Type": "application/json", "X-CRM-Event": "test" },
+          headers: deliveryHeaders(storedHeaders(h), "test"),
           body: JSON.stringify(payload),
           signal: AbortSignal.timeout(8000),
         });

@@ -177,6 +177,34 @@ CREATE TABLE IF NOT EXISTS saved_views (
   filters_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS sandbox_batches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER REFERENCES workspaces(id),
+  name TEXT NOT NULL,
+  filename TEXT DEFAULT '',
+  status TEXT DEFAULT 'open',
+  row_count INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now')),
+  completed_at TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS sandbox_rows (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id INTEGER REFERENCES sandbox_batches(id),
+  workspace_id INTEGER REFERENCES workspaces(id),
+  row_num INTEGER DEFAULT 0,
+  name TEXT DEFAULT '',
+  title TEXT DEFAULT '',
+  email TEXT DEFAULT '',
+  phone TEXT DEFAULT '',
+  company TEXT DEFAULT '',
+  notes TEXT DEFAULT '',
+  status TEXT DEFAULT 'clean',
+  decision TEXT DEFAULT 'pending',
+  dup_of_contact_id INTEGER DEFAULT 0,
+  dup_of_row_id INTEGER DEFAULT 0,
+  flags TEXT DEFAULT '[]',
+  created_at TEXT DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS deal_stage_history (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   deal_id INTEGER REFERENCES deals(id),

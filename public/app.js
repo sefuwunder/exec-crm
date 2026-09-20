@@ -2110,6 +2110,7 @@ const WORKSHOP_TABS = [
   ["captures", "Captures"],
   ["schema", "Schema"],
   ["automation", "Automation"],
+  ["sandbox", "Sandbox"],
 ];
 async function vWorkshop(sub) {
   const tab = WORKSHOP_TABS.some(([t]) => t === sub) ? sub : "captures";
@@ -2127,7 +2128,188 @@ async function vWorkshop(sub) {
   const root = $("#ws-body");
   if (tab === "schema") await vSchema(root);
   else if (tab === "automation") await vAutomations(root);
+  else if (tab === "sandbox") await vSandbox(root);
   else await vCaptures(root);
+}
+
+/* ---------- data sandbox: staged mass contact imports ---------- */
+// Nothing lands in the live contacts table until a batch is committed.
+let sbOpenBatch = null;
+
+const SB_STATUS_PILL = {
+  clean: ["Clean", "var(--ok)"],
+  duplicate: ["Duplicate", "var(--urgent)"],
+  flagged: ["Flagged", "var(--ctp-yellow)"],
+};
+const SB_DECISION_PILL = {
+  approved: ["Approved", "var(--ok)"],
+  rejected: ["Rejected", "var(--ctp-red)"],
+  pending: ["Pending", "var(--text-3)"],
+};
+
+async function vSandbox(root) {
+  const el = root || view;
+  if (sbOpenBatch) return vSandboxDetail(el, sbOpenBatch);
+  const { batches } = await GET("/api/sandbox/batches");
+  el.innerHTML = `
+    <div class="toolbar">
+      <span style="color:var(--text-2)">${batches.length} import batch${batches.length === 1 ? "" : "es"}</span>
+      <div class="spacer"></div>
+      <a class="btn ghost small" href="/api/contacts/import/template">CSV template</a>
+    </div>
+    <div class="sb-drop" id="sb-drop">
+      <div><b>Drop a contacts CSV here</b> or <label class="link" for="sb-file" style="cursor:pointer">choose a file</label></div>
+      <div class="sb-hint">Columns: name, email, phone, company, title, notes — extra columns are ignored. Staged rows stay out of your contacts until you approve them.</div>
+      <input type="file" id="sb-file" accept=".csv,text/csv" hidden>
+    </div>
+    <div id="sb-status"></div>
+    <div class="sb-list">
+      ${batches.map((b) => {
+        const s = b.summary || {};
+        return `
+        <div class="sb-card">
+          <div class="info">
+            <div class="name">${esc(b.name)} ${b.status === "complete" ? `<span class="feed-pill" style="border-color:var(--ok);color:var(--ok)">imported</span>` : `<span class="feed-pill" style="border-color:var(--brand);color:var(--brand)">open</span>`}</div>
+            <div class="sb-meta">${b.filename ? esc(b.filename) + " · " : ""}${esc((b.created_at || "").slice(0, 16).replace("T", " "))}</div>
+            <div class="sb-counts"><span><b>${s.total || 0}</b> rows</span><span style="color:var(--ok)">${s.clean || 0} clean</span><span style="color:var(--urgent)">${s.duplicates || 0} duplicates</span><span style="color:var(--ctp-yellow)">${s.flagged || 0} flagged</span></div>
+          </div>
+          <div class="sb-actions">
+            <button class="btn small" data-sb-open="${b.id}">Review</button>
+            <button class="btn danger small" data-sb-del="${b.id}">Delete</button>
+          </div>
+        </div>`;
+      }).join("") || `<div class="empty">No imports yet — drop a CSV above to stage your first batch.</div>`}
+    </div>`;
+
+  const readAndStage = (file) => {
+    if (!file) return;
+    const rd = new FileReader();
+    rd.onload = async () => {
+      $("#sb-status").innerHTML = `<div class="empty">Analyzing ${esc(file.name)}…</div>`;
+      try {
+        const { batch } = await POST("/api/sandbox/batches", {
+          name: file.name.replace(/\.csv$/i, ""),
+          filename: file.name,
+          csv: String(rd.result || ""),
+        });
+        sbOpenBatch = batch.id;
+        route();
+      } catch (err) {
+        $("#sb-status").innerHTML = `<div class="empty" style="color:var(--ctp-red)">Upload failed: ${esc(err.message)}</div>`;
+      }
+    };
+    rd.readAsText(file);
+  };
+  $("#sb-file").onchange = (e) => readAndStage(e.target.files[0]);
+  const dz = $("#sb-drop");
+  ["dragenter", "dragover"].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("over"); }));
+  ["dragleave", "drop"].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove("over"); }));
+  dz.addEventListener("drop", (e) => readAndStage(e.dataTransfer.files[0]));
+
+  document.querySelectorAll("[data-sb-open]").forEach((b) => {
+    b.onclick = () => { sbOpenBatch = Number(b.dataset.sbOpen); route(); };
+  });
+  document.querySelectorAll("[data-sb-del]").forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm("Delete this import batch? Staged rows are discarded; your live contacts are untouched.")) return;
+      await DEL(`/api/sandbox/batches/${b.dataset.sbDel}`);
+      route();
+    };
+  });
+}
+
+async function vSandboxDetail(el, batchId) {
+  const { batch, rows } = await GET(`/api/sandbox/batches/${batchId}`);
+  const s = batch.summary || {};
+  const open = batch.status === "open";
+  const approvable = rows.filter((r) => r.decision === "approved" && r.status !== "duplicate").length;
+  el.innerHTML = `
+    <div class="toolbar">
+      <button class="btn ghost small" id="sb-back">← All imports</button>
+      <div class="spacer"></div>
+      ${open ? `<button class="btn ghost small" id="sb-bulk-clean">Approve all clean</button>
+      <button class="btn ghost small" id="sb-bulk-dup">Reject all duplicates</button>
+      <button class="btn small" id="sb-commit" ${approvable ? "" : "disabled"}>Import approved (${approvable})</button>
+      <button class="btn danger small" id="sb-del">Delete batch</button>` : ``}
+    </div>
+    <div class="camp-head">
+      <h2 style="margin:0">${esc(batch.name)}</h2>
+      <div class="sb-meta">${batch.filename ? esc(batch.filename) + " · " : ""}staged ${esc((batch.created_at || "").slice(0, 16).replace("T", " "))}${batch.status === "complete" ? " · imported " + esc((batch.completed_at || "").slice(0, 16).replace("T", " ")) : ""}</div>
+      <div class="sb-summary">
+        <span><b>${s.total || 0}</b> rows</span>
+        <span style="color:var(--ok)"><b>${s.clean || 0}</b> clean</span>
+        <span style="color:var(--urgent)"><b>${s.duplicates || 0}</b> duplicates</span>
+        <span style="color:var(--ctp-yellow)"><b>${s.flagged || 0}</b> flagged</span>
+        <span><b>${s.approved || 0}</b> approved</span>
+        <span><b>${s.rejected || 0}</b> rejected</span>
+      </div>
+    </div>
+    <div class="sb-table-wrap"><table class="sb-table">
+      <thead><tr><th>#</th><th>Contact</th><th>Email</th><th class="sb-phone-col">Phone</th><th>Status</th><th>Decision</th></tr></thead>
+      <tbody>
+      ${rows.map((r) => {
+        const [sl, sc] = SB_STATUS_PILL[r.status] || SB_STATUS_PILL.clean;
+        const [dl, dc] = SB_DECISION_PILL[r.decision] || SB_DECISION_PILL.pending;
+        const dupNote = r.dup_contact
+          ? `↳ matches <b>${esc(r.dup_contact.name)}</b> in contacts`
+          : r.dup_row ? `↳ same as row #${r.dup_row.row_num} (${esc(r.dup_row.name || "unnamed")})` : "";
+        const flags = r.flags || [];
+        const flagHtml = flags.length ? `
+          <div style="margin-top:6px"><button class="link" data-sb-flags="${r.id}">⚠ ${flags.length} flag${flags.length === 1 ? "" : "s"}</button>
+          <ul class="sb-flags" id="sb-flags-${r.id}" hidden>${flags.map((f) => `<li>${esc(f.reason)}</li>`).join("")}</ul></div>` : "";
+        return `
+        <tr>
+          <td style="color:var(--text-3)">${r.row_num}</td>
+          <td><b>${esc(r.name) || `<span style="color:var(--text-3)">(no name)</span>`}</b>${r.title ? `<div class="sb-meta">${esc(r.title)}</div>` : ""}${r.company ? `<div class="sb-meta">🏢 ${esc(r.company)}</div>` : ""}</td>
+          <td class="sb-email">${esc(r.email)}</td>
+          <td class="sb-phone-col">${esc(r.phone)}</td>
+          <td><span class="feed-pill" style="border-color:${sc};color:${sc}">${sl}</span>${dupNote ? `<div class="sb-meta sb-status-note">${dupNote}</div>` : ""}${flagHtml}</td>
+          <td>${open ? `
+            <span class="feed-pill" style="border-color:${dc};color:${dc}">${dl}</span>
+            <div class="sb-actions" style="margin-top:6px">
+              ${r.decision !== "approved" ? `<button class="btn ghost small" data-sb-approve="${r.id}">Approve</button>` : ""}
+              ${r.decision !== "rejected" ? `<button class="btn ghost small" data-sb-reject="${r.id}">Reject</button>` : ""}
+              <button class="btn ghost small" data-sb-edit="${r.id}">Edit</button>
+            </div>` : `<span class="feed-pill" style="border-color:${dc};color:${dc}">${dl}</span>`}</td>
+        </tr>`;
+      }).join("")}
+      </tbody>
+    </table></div>`;
+
+  $("#sb-back").onclick = () => { sbOpenBatch = null; route(); };
+  document.querySelectorAll("[data-sb-flags]").forEach((b) => {
+    b.onclick = () => { const u = $(`#sb-flags-${b.dataset.sbFlags}`); if (u) u.hidden = !u.hidden; };
+  });
+  if (!open) return;
+  const refresh = () => route();
+  const setDecision = async (id, decision) => { await PATCH(`/api/sandbox/rows/${id}`, { decision }); refresh(); };
+  document.querySelectorAll("[data-sb-approve]").forEach((b) => { b.onclick = () => setDecision(b.dataset.sbApprove, "approved"); });
+  document.querySelectorAll("[data-sb-reject]").forEach((b) => { b.onclick = () => setDecision(b.dataset.sbReject, "rejected"); });
+  document.querySelectorAll("[data-sb-edit]").forEach((b) => {
+    b.onclick = async () => {
+      const r = rows.find((x) => x.id === Number(b.dataset.sbEdit));
+      if (!r) return;
+      openModal(`Edit row #${r.row_num}`,
+        field("Name", input("name", r.name)) + field("Title", input("title", r.title)) +
+        field("Email", input("email", r.email)) + field("Phone", input("phone", r.phone)) +
+        field("Company", input("company", r.company)) + field("Notes", `<textarea name="notes" rows="2">${esc(r.notes)}</textarea>`),
+        async (data) => { await PATCH(`/api/sandbox/rows/${r.id}`, data); refresh(); });
+    };
+  });
+  $("#sb-bulk-clean").onclick = async () => { await POST(`/api/sandbox/batches/${batch.id}/decision`, { action: "approve-clean" }); refresh(); };
+  $("#sb-bulk-dup").onclick = async () => { await POST(`/api/sandbox/batches/${batch.id}/decision`, { action: "reject-duplicates" }); refresh(); };
+  $("#sb-commit").onclick = async () => {
+    if (!confirm(`Import ${approvable} approved contact${approvable === 1 ? "" : "s"}? Duplicate rows are skipped; this can't be undone in bulk.`)) return;
+    const r = await POST(`/api/sandbox/batches/${batch.id}/commit`, {});
+    alert(`Imported ${r.imported}, skipped ${r.skipped} duplicate${r.skipped === 1 ? "" : "s"}.`);
+    refresh();
+  };
+  $("#sb-del").onclick = async () => {
+    if (!confirm("Delete this import batch? Staged rows are discarded; your live contacts are untouched.")) return;
+    await DEL(`/api/sandbox/batches/${batch.id}`);
+    sbOpenBatch = null;
+    route();
+  };
 }
 
 /* ---------- captures: business cards & client notes ---------- */

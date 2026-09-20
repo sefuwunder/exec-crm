@@ -568,6 +568,14 @@ td { transition: background 0.12s ease; }
 /* ---------- schema editor + custom fields ---------- */
 .cf-section { margin-top: 16px; padding-top: 14px; border-top: 1px dashed var(--border); }
 .cf-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-3); margin-bottom: 10px; }
+.cf-readonly { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.cf-pill {
+  display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+  padding: 3px 9px; border-radius: 999px; color: var(--text-2);
+  background: color-mix(in srgb, var(--ctp-mauve) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ctp-mauve) 30%, transparent);
+}
+.cf-pill b { color: var(--text); font-weight: 600; }
 .schema-field {
   border: 1px solid var(--border); border-radius: 10px; padding: 13px 15px; margin-bottom: 10px;
   display: flex; align-items: center; gap: 12px; background: var(--surface);

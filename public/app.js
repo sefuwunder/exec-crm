@@ -183,6 +183,15 @@ const cfFieldsHtml = (fields, values = {}) => {
     `</div></div>`;
 };
 const getSchemaFields = async (entity) => (await GET(`/api/schema/${entity}`)).fields;
+/* Read-only pills for an entity's custom_fields: [{id, name, field_type, value}]. */
+const cfReadonlyHtml = (customFields = []) => {
+  const set = (customFields || []).filter((f) => f.value !== "" && f.value != null);
+  if (!set.length) return "";
+  return `<div class="cf-readonly">${set.map((f) => {
+    const v = f.field_type === "checkbox" ? (f.value === "1" ? "✓" : "—") : esc(f.value);
+    return `<span class="cf-pill"><b>${esc(f.name)}</b><span>${v}</span></span>`;
+  }).join("")}</div>`;
+};
 const statusPill = (s) => {
   const colors = { draft: "var(--ctp-overlay0)", active: "var(--ctp-green)", paused: "var(--ctp-yellow)", completed: "var(--ctp-blue)" };
   const c = colors[s] || "var(--ctp-overlay0)";
@@ -910,10 +919,12 @@ async function newContactModal(presetCampaignId) {
 
 async function vContacts() {
   const q = new URLSearchParams(location.hash.split("?")[1] || "").get("q") || "";
-  const [{ contacts }, { companies }] = await Promise.all([
+  const [{ contacts }, { companies }, fields] = await Promise.all([
     GET(`/api/contacts?q=${encodeURIComponent(q)}`),
     GET("/api/companies"),
+    getSchemaFields("contact"),
   ]);
+  const hasContactCf = fields.length > 0;
   view.innerHTML = `
     <div class="toolbar">
       <input class="search" id="q" placeholder="Search name or email…" value="${esc(q)}">
@@ -923,13 +934,14 @@ async function vContacts() {
     </div>
     <p class="hint">Tip: click any cell to edit it in place — Enter saves, Esc cancels.</p>
     <div class="panel"><table>
-      <tr><th>Name</th><th>Title</th><th>Company</th><th>Email</th><th>Phone</th><th></th></tr>
+      <tr><th>Name</th><th>Title</th><th>Company</th><th>Email</th><th>Phone</th>${hasContactCf ? "<th>Custom</th>" : ""}<th></th></tr>
       ${contacts.map((c) => `<tr>
         <td data-cid="${c.id}" data-f="name"><b>${esc(c.name)}</b></td>
         <td data-cid="${c.id}" data-f="title">${esc(c.title) || "—"}</td>
         <td data-cid="${c.id}" data-f="company_id">${esc(c.company_name || "—")}</td>
         <td data-cid="${c.id}" data-f="email">${esc(c.email) || "—"}</td>
         <td data-cid="${c.id}" data-f="phone">${esc(c.phone) || "—"}</td>
+        ${hasContactCf ? `<td>${cfReadonlyHtml(c.custom_fields) || "—"}</td>` : ""}
         <td class="rowact"><button class="btn ghost small" data-edit="${c.id}">Edit</button></td>
       </tr>`).join("")}
     </table>${contacts.length ? "" : `<div class="empty">No contacts match.</div>`}</div>`;
@@ -969,18 +981,20 @@ async function newCompanyModal(presetCampaignId) {
 }
 
 async function vCompanies() {
-  const { companies } = await GET("/api/companies");
+  const [{ companies }, fields] = await Promise.all([GET("/api/companies"), getSchemaFields("company")]);
+  const hasCompanyCf = fields.length > 0;
   view.innerHTML = `
     <div class="toolbar"><div class="spacer"></div>
       <button class="btn" id="new-company">+ New company</button></div>
     <p class="hint">Tip: click any cell to edit it in place — Enter saves, Esc cancels.</p>
     <div class="panel"><table>
-      <tr><th>Company</th><th>Industry</th><th>Website</th><th>Deals</th><th>Open pipeline</th><th></th></tr>
+      <tr><th>Company</th><th>Industry</th><th>Website</th><th>Deals</th><th>Open pipeline</th>${hasCompanyCf ? "<th>Custom</th>" : ""}<th></th></tr>
       ${companies.map((c) => `<tr>
         <td data-cid="${c.id}" data-f="name"><b>${esc(c.name)}</b></td>
         <td data-cid="${c.id}" data-f="industry">${esc(c.industry) || "—"}</td>
         <td data-cid="${c.id}" data-f="website">${esc(c.website) || "—"}</td>
         <td>${c.deal_count}</td><td><b>${money(c.open_value)}</b></td>
+        ${hasCompanyCf ? `<td>${cfReadonlyHtml(c.custom_fields) || "—"}</td>` : ""}
         <td class="rowact"><button class="btn ghost small" data-edit="${c.id}">Edit</button></td>
       </tr>`).join("")}
     </table></div>`;
@@ -1266,6 +1280,7 @@ function renderCampaignDetail(c, tasks, deals, camp) {
           <span>💰 <b>${money(c.budget)}</b></span>
         </div>
         ${c.notes ? `<p class="camp-notes">${esc(c.notes)}</p>` : ""}
+        ${cfReadonlyHtml(c.custom_fields)}
       </div>
     </div>
     <div class="widgets">
@@ -1385,7 +1400,7 @@ function taskRow(t) {
   return `<div class="task ${t.done ? "done" : ""}">
     <input type="checkbox" data-id="${t.id}" ${t.done ? "checked" : ""}>
     <div><div class="tt">${esc(t.title)}</div>
-      <div class="meta">${t.deal_title ? esc(t.deal_title) + " · " : ""}${t.due_date ? "due " + esc(t.due_date) + " · " : ""}${esc(t.owner)}</div></div>
+      <div class="meta">${t.deal_title ? esc(t.deal_title) + " · " : ""}${t.due_date ? "due " + esc(t.due_date) + " · " : ""}${esc(t.owner)}</div>${cfReadonlyHtml(t.custom_fields)}</div>
     <div class="spacer"></div>
     <button class="btn ghost small" data-edit="${t.id}">Edit</button>
   </div>`;

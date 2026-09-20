@@ -46,12 +46,70 @@ function attachCustom(entity: string, rows: any[]) {
     )
     .all(entity, ...rows.map((r) => r.id)) as any[];
   const byRecord = new Map<number, Record<string, string>>();
+  const valsByField = new Map<number, Map<number, string>>();
   for (const v of vals) {
     if (!byRecord.has(v.record_id)) byRecord.set(v.record_id, {});
     byRecord.get(v.record_id)![v.field_id] = v.value;
+    if (!valsByField.has(v.record_id)) valsByField.set(v.record_id, new Map());
+    valsByField.get(v.record_id)!.set(v.field_id, v.value);
   }
   for (const r of rows) r.custom = byRecord.get(r.id) || {};
+  // merged defs for detail GETs: custom_fields: [{id, name, field_type, value}]
+  const w = (rows[0] as any).workspace_id;
+  if (w != null) {
+    const defs = getCustomFields(entity, Number(w));
+    for (const r of rows) {
+      const vm = valsByField.get(r.id) || new Map<number, string>();
+      r.custom_fields = defs.map((f: any) => ({
+        id: f.id,
+        name: f.label,
+        field_type: f.type,
+        value: vm.get(f.id) ?? "",
+      }));
+    }
+  }
   return rows;
+}
+
+/* Validate a custom-field value against its type. Empty string means "clear". */
+function validateCustomValue(
+  f: any,
+  raw: unknown
+): { ok: true; stored: string } | { ok: false; error: string } {
+  const v = raw == null ? "" : String(raw).trim();
+  if (v === "") return { ok: true, stored: "" };
+  switch (f.type) {
+    case "number":
+      if (!/^[-+]?(\d+(\.\d+)?|\.\d+)$/.test(v))
+        return { ok: false, error: `"${f.label}" expects a number, got "${v}"` };
+      return { ok: true, stored: v };
+    case "date": {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(v))
+        return { ok: false, error: `"${f.label}" expects a date like 2026-10-01, got "${v}"` };
+      const [y, m, d] = v.split("-").map(Number);
+      const dt = new Date(Date.UTC(y, m - 1, d));
+      if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d)
+        return { ok: false, error: `"${v}" is not a real calendar date` };
+      return { ok: true, stored: v };
+    }
+    case "checkbox": {
+      const t = v.toLowerCase();
+      if (["1", "true", "yes", "y"].includes(t)) return { ok: true, stored: "1" };
+      if (["0", "false", "no", "n"].includes(t)) return { ok: true, stored: "0" };
+      return { ok: false, error: `"${f.label}" expects yes/no or true/false, got "${v}"` };
+    }
+    case "select": {
+      let opts: string[] = [];
+      try {
+        opts = JSON.parse(f.options || "[]");
+      } catch {}
+      if (!opts.includes(v))
+        return { ok: false, error: `"${v}" is not one of: ${opts.join(", ") || "—"}` };
+      return { ok: true, stored: v };
+    }
+    default:
+      return { ok: true, stored: v }; // text, textarea, url
+  }
 }
 function saveCustomValues(entity: string, recordId: number, custom: unknown, w: number) {
   if (!custom || typeof custom !== "object") return;
@@ -1243,6 +1301,127 @@ const server = Bun.serve({
         return json({ error: "not found" }, 404);
       }
       return json({ ok: true });
+    }
+
+    // ---- custom fields: Milton-friendly aliases + value upsert ------------------
+    const ENTITY_TABLES: Record<string, string> = {
+      contact: "contacts",
+      company: "companies",
+      campaign: "campaigns",
+      task: "tasks",
+    };
+    const CF_ALIAS_TYPES = ["text", "number", "date", "checkbox"];
+    const needEntityType = (raw: string | null) => {
+      const entity = raw || "";
+      if (!CUSTOM_ENTITIES.includes(entity))
+        return { error: `entity_type must be one of: ${CUSTOM_ENTITIES.join(", ")}` };
+      return { entity };
+    };
+    if (path === "/api/custom-fields" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const { entity, error } = needEntityType(url.searchParams.get("entity_type"));
+      if (error) return json({ error }, 400);
+      return json({ fields: getCustomFields(entity!, w) });
+    }
+    if (path === "/api/custom-fields" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const b = await readBody(req);
+      const { entity, error } = needEntityType(String(b.entity_type || "") || null);
+      if (error) return json({ error }, 400);
+      const name = String(b.name || "").trim();
+      const ftype = String(b.field_type || "text");
+      if (!name) return json({ error: "name is required" }, 400);
+      if (!CF_ALIAS_TYPES.includes(ftype))
+        return json({ error: `field_type must be one of: ${CF_ALIAS_TYPES.join(", ")}` }, 400);
+      const slug = slugify(name);
+      if (CORE_COLUMNS[entity!].includes(slug)) return json({ error: `"${name}" is a built-in field` }, 400);
+      const dupe = db
+        .query("SELECT id FROM custom_fields WHERE entity = ? AND workspace_id = ? AND name = ?")
+        .get(entity, w, slug);
+      if (dupe) return json({ error: `custom field "${name}" already exists for ${entity}s` }, 400);
+      const pos = (
+        db
+          .query("SELECT COALESCE(MAX(position), -1) + 1 AS p FROM custom_fields WHERE entity = ? AND workspace_id = ?")
+          .get(entity, w) as any
+      ).p;
+      const r = db
+        .prepare(
+          "INSERT INTO custom_fields (entity, name, label, type, options, required, position, workspace_id) VALUES (?, ?, ?, ?, '[]', 0, ?, ?)"
+        )
+        .run(entity, slug, name, ftype, pos, w);
+      const field = db.query("SELECT * FROM custom_fields WHERE id = ?").get(Number(r.lastInsertRowid));
+      logActivity("note", `Added custom field "${name}" to ${entity}s`, w);
+      return json({ field }, 201);
+    }
+    const cfAliasId = path.match(/^\/api\/custom-fields\/(\d+)$/);
+    if (cfAliasId && method === "DELETE") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const f = db
+        .query("SELECT * FROM custom_fields WHERE id = ? AND workspace_id = ?")
+        .get(Number(cfAliasId[1]), w) as any;
+      if (!f) return json({ error: "not found" }, 404);
+      db.prepare("DELETE FROM custom_values WHERE field_id = ?").run(f.id);
+      db.prepare("DELETE FROM custom_fields WHERE id = ?").run(f.id);
+      logActivity("note", `Removed custom field "${f.label}" from ${f.entity}s`, w);
+      return json({ ok: true });
+    }
+    if (path === "/api/custom-fields/values" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const { entity, error } = needEntityType(url.searchParams.get("entity_type"));
+      if (error) return json({ error }, 400);
+      const entityId = Number(url.searchParams.get("entity_id") || "");
+      if (!entityId) return json({ error: "entity_id is required" }, 400);
+      const rec = db
+        .query(`SELECT id FROM ${ENTITY_TABLES[entity!]} WHERE id = ? AND workspace_id = ?`)
+        .get(entityId, w);
+      if (!rec) return json({ error: `${entity} not found` }, 404);
+      const defs = getCustomFields(entity!, w);
+      const vals = db
+        .query("SELECT field_id, value FROM custom_values WHERE entity = ? AND record_id = ?")
+        .all(entity, entityId) as any[];
+      const byField = new Map(vals.map((v) => [v.field_id, v.value]));
+      return json({
+        values: defs.map((f: any) => ({
+          field_id: f.id,
+          name: f.label,
+          field_type: f.type,
+          value: byField.get(f.id) ?? "",
+        })),
+      });
+    }
+    if (path === "/api/custom-fields/values" && method === "PUT") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const b = await readBody(req);
+      const f = db
+        .query("SELECT * FROM custom_fields WHERE id = ? AND workspace_id = ?")
+        .get(Number(b.field_id), w) as any;
+      if (!f) return json({ error: "custom field not found" }, 404);
+      const entityId = Number(b.entity_id);
+      if (!entityId) return json({ error: "entity_id is required" }, 400);
+      const rec = db
+        .query(`SELECT id FROM ${ENTITY_TABLES[f.entity]} WHERE id = ? AND workspace_id = ?`)
+        .get(entityId, w);
+      if (!rec) return json({ error: `${f.entity} not found` }, 404);
+      const check = validateCustomValue(f, b.value);
+      if (!check.ok) return json({ error: check.error }, 400);
+      if (check.stored === "") {
+        db.prepare("DELETE FROM custom_values WHERE entity = ? AND record_id = ? AND field_id = ?").run(
+          f.entity,
+          entityId,
+          f.id
+        );
+        return json({ field_id: f.id, entity_id: entityId, value: "", cleared: true });
+      }
+      db.prepare(
+        `INSERT INTO custom_values (entity, record_id, field_id, value) VALUES (?, ?, ?, ?)
+         ON CONFLICT(entity, record_id, field_id) DO UPDATE SET value = excluded.value`
+      ).run(f.entity, entityId, f.id, check.stored);
+      return json({ field_id: f.id, entity_id: entityId, value: check.stored });
     }
 
     // ---- campaigns

@@ -155,6 +155,14 @@ function logActivity(kind: string, text: string, w: number) {
     .run(kind, text, w);
 }
 
+// Deal stage-transition history: one row per move, server-side, on every
+// stage-change path. from_stage is "" when the deal is created ("opened").
+function logStageChange(dealId: number, fromStage: string, toStage: string, w: number) {
+  db.prepare(
+    "INSERT INTO deal_stage_history (deal_id, workspace_id, from_stage, to_stage) VALUES (?, ?, ?, ?)"
+  ).run(dealId, w, fromStage || "", toStage);
+}
+
 // ---- outgoing webhook custom headers ------------------------------------------
 // Header values are secrets (API keys, shared secrets). They are stored
 // server-side and never exposed: API/UI reads only ever see header *names*.
@@ -268,6 +276,45 @@ function dealJson(id: number, w: number) {
     .get(id, w);
 }
 
+// ---- task dependencies ------------------------------------------------------
+// blocked_by: [{id, title, done}] predecessors; is_blocked: any predecessor not done.
+function taskDepsJson(taskId: number, w: number) {
+  const rows = db
+    .query(
+      `SELECT t.id, t.title, t.done FROM task_dependencies td
+       JOIN tasks t ON t.id = td.depends_on_task_id
+       WHERE td.task_id = ? AND td.workspace_id = ? ORDER BY t.title`
+    )
+    .all(taskId, w) as any[];
+  return {
+    blocked_by: rows,
+    is_blocked: rows.some((r) => !r.done),
+  };
+}
+function attachTaskDeps(tasks: any[], w: number) {
+  for (const t of tasks) Object.assign(t, taskDepsJson(t.id, w));
+  return tasks;
+}
+// Would adding task -> dep edges create a cycle? DFS from each dep following
+// depends_on links; reaching `task` means task already (transitively) depends
+// on dep, so dep depending back on task closes a loop.
+function depWouldCycle(task: number, deps: number[], w: number): boolean {
+  const childrenOf = (id: number) =>
+    (db.query("SELECT depends_on_task_id AS d FROM task_dependencies WHERE task_id = ? AND workspace_id = ?")
+      .all(id, w) as any[]).map((r) => r.d);
+  for (const dep of deps) {
+    const seen = new Set<number>([dep]);
+    const stack = [dep];
+    while (stack.length) {
+      const cur = stack.pop()!;
+      if (cur === task) return true;
+      for (const nxt of childrenOf(cur)) {
+        if (!seen.has(nxt)) { seen.add(nxt); stack.push(nxt); }
+      }
+    }
+  }
+  return false;
+}
 // ---------------------------------------------------------------- helpers
 // Validate an incoming campaign_id against the active workspace.
 // Returns null for empty/missing, the numeric id for a workspace-owned
@@ -522,7 +569,7 @@ const server = Bun.serve({
       for (const f of capFiles) {
         try { await Bun.$`rm -f ${UPLOAD_DIR}/${f.filename}`.quiet(); } catch {}
       }
-      for (const t of ["activities", "captures", "tasks", "deals", "contacts", "campaigns", "companies", "stages", "milton_widgets"]) {
+      for (const t of ["deal_stage_history", "task_dependencies", "activities", "captures", "tasks", "deals", "contacts", "campaigns", "companies", "stages", "milton_widgets", "saved_views"]) {
         db.prepare(`DELETE FROM ${t} WHERE workspace_id = ?`).run(ws.id);
       }
       db.prepare("DELETE FROM workspaces WHERE id = ?").run(ws.id);
@@ -604,7 +651,11 @@ const server = Bun.serve({
         if (moveTo) {
           if (moveTo === slug) return json({ error: "move_to must be a different stage" }, 400);
           if (!stageRow(w, moveTo)) return json({ error: `unknown stage "${moveTo}"` }, 400);
+          const movedIds = db
+            .query("SELECT id FROM deals WHERE workspace_id = ? AND stage = ?")
+            .all(w, slug) as any[];
           db.prepare("UPDATE deals SET stage = ? WHERE workspace_id = ? AND stage = ?").run(moveTo, w, slug);
+          for (const m of movedIds) logStageChange(m.id, slug, moveTo, w);
         }
         db.prepare("DELETE FROM stages WHERE workspace_id = ? AND slug = ?").run(w, slug);
         renumberStages(db, w);
@@ -691,16 +742,32 @@ const server = Bun.serve({
       const w = needWs(req, url);
       if (w instanceof Response) return w;
       const campId = url.searchParams.get("campaign_id");
+      const fOwner = (url.searchParams.get("owner") || "").trim();
+      const fStage = (url.searchParams.get("stage") || "").trim();
+      const fSource = (url.searchParams.get("source") || "").trim();
+      const fMin = Number(url.searchParams.get("min_value") || "");
+      const fSearch = (url.searchParams.get("search") || url.searchParams.get("q") || "").trim();
+      const conds: string[] = [];
+      const params: unknown[] = [w];
+      if (campId) { conds.push("d.campaign_id = ?"); params.push(Number(campId)); }
+      if (fOwner) { conds.push("d.owner = ?"); params.push(fOwner); }
+      if (fStage) { conds.push("d.stage = ?"); params.push(fStage); }
+      if (fSource) { conds.push("d.source = ?"); params.push(fSource); }
+      if (fMin) { conds.push("d.value >= ?"); params.push(fMin); }
+      if (fSearch) {
+        conds.push("(d.title LIKE ? OR c.name LIKE ?)");
+        params.push(`%${fSearch}%`, `%${fSearch}%`);
+      }
       const rows = db
         .query(
           `SELECT d.*, c.name AS company_name, ct.name AS contact_name
            FROM deals d
            LEFT JOIN companies c ON c.id = d.company_id
            LEFT JOIN contacts ct ON ct.id = d.contact_id
-           WHERE d.workspace_id = ?${campId ? " AND d.campaign_id = ?" : ""}
+           WHERE d.workspace_id = ?${conds.length ? " AND " + conds.join(" AND ") : ""}
            ORDER BY d.updated_at DESC`
         )
-        .all(w, ...(campId ? [Number(campId)] : []));
+        .all(...params);
       const wsStages = workspaceStages(db, w);
       const labels: Record<string, string> = {};
       for (const s of wsStages) labels[s.slug] = s.name;
@@ -715,8 +782,8 @@ const server = Bun.serve({
       const r = db
         .prepare(
           `INSERT INTO deals (title, company_id, contact_id, value, stage,
-           probability, expected_close, owner, campaign_id, workspace_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           probability, expected_close, owner, source, campaign_id, workspace_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           b.title || "Untitled deal",
@@ -727,10 +794,12 @@ const server = Bun.serve({
           Number(b.probability ?? 10),
           b.expected_close || "",
           b.owner || "",
+          String(b.source || "").trim(),
           campaignId,
           w
         );
       const deal = dealJson(Number(r.lastInsertRowid), w);
+      logStageChange(Number(r.lastInsertRowid), "", (deal as any).stage, w); // "opened"
       logActivity("deal", `${(deal as any).title} created`, w);
       fireWebhooks("deal.created", deal as any, w);
       return json({ deal }, 201);
@@ -747,7 +816,7 @@ const server = Bun.serve({
       }
       const sets: string[] = [];
       const vals: unknown[] = [];
-      for (const k of ["title", "value", "stage", "probability", "expected_close", "owner", "company_id", "contact_id"]) {
+      for (const k of ["title", "value", "stage", "probability", "expected_close", "owner", "source", "company_id", "contact_id"]) {
         if (b[k] !== undefined) {
           sets.push(`${k} = ?`);
           vals.push(b[k]);
@@ -766,6 +835,7 @@ const server = Bun.serve({
       const after = dealJson(Number(dealId[1]), w) as any;
       if (before.stage !== after.stage) {
         const stageName = (db.query("SELECT name FROM stages WHERE workspace_id = ? AND slug = ?").get(w, after.stage) as any)?.name || after.stage;
+        logStageChange(Number(dealId[1]), before.stage, after.stage, w);
         logActivity("deal", `${after.title} moved to ${stageName}`, w);
         fireWebhooks("deal.stage_changed", {
           ...after,
@@ -783,8 +853,50 @@ const server = Bun.serve({
         .query("SELECT id FROM deals WHERE id = ? AND workspace_id = ?")
         .get(Number(dealId[1]), w);
       if (!exists) return json({ error: "not found" }, 404);
+      db.prepare("DELETE FROM deal_stage_history WHERE deal_id = ?").run(Number(dealId[1]));
       db.prepare("DELETE FROM deals WHERE id = ?").run(Number(dealId[1]));
       return json({ ok: true });
+    }
+
+    // ---- deal stage history: GET /api/deals/:id/history (chronological)
+    const dealHistory = path.match(/^\/api\/deals\/(\d+)\/history$/);
+    if (dealHistory && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const exists = db
+        .query("SELECT id FROM deals WHERE id = ? AND workspace_id = ?")
+        .get(Number(dealHistory[1]), w);
+      if (!exists) return json({ error: "not found" }, 404);
+      const rows = db
+        .query(
+          `SELECT id, from_stage, to_stage, created_at FROM deal_stage_history
+           WHERE deal_id = ? AND workspace_id = ? ORDER BY id`
+        )
+        .all(Number(dealHistory[1]), w) as any[];
+      const names: Record<string, string> = {};
+      for (const s of db.query("SELECT slug, name FROM stages WHERE workspace_id = ?").all(w) as any[])
+        names[s.slug] = s.name;
+      return json({
+        history: rows.map((r) => ({
+          ...r,
+          from_name: r.from_stage ? (names[r.from_stage] || r.from_stage) : null,
+          to_name: names[r.to_stage] || r.to_stage,
+        })),
+      });
+    }
+
+    // ---- deal sources: distinct non-null sources in the workspace (datalist suggestions)
+    if (path === "/api/deal-sources" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const rows = db
+        .query(
+          `SELECT DISTINCT source FROM deals
+           WHERE workspace_id = ? AND source IS NOT NULL AND TRIM(source) <> ''
+           ORDER BY source`
+        )
+        .all(w) as any[];
+      return json({ sources: rows.map((r) => r.source) });
     }
 
     // ---- contacts
@@ -1027,7 +1139,10 @@ const server = Bun.serve({
       q += cid ? ` WHERE t.workspace_id = ? AND t.campaign_id = ?` : ` WHERE t.workspace_id = ?`;
       if (cid) params.push(Number(cid));
       q += ` ORDER BY t.done, t.due_date`;
-      const rows = attachCustom("task", db.query(q).all(...params) as any[]);
+      const rows = attachTaskDeps(
+        attachCustom("task", db.query(q).all(...params) as any[]),
+        w
+      );
       return json({ tasks: rows });
     }
     if (path === "/api/tasks" && method === "POST") {
@@ -1080,12 +1195,43 @@ const server = Bun.serve({
         .get(Number(taskId[1]), w) as any;
       if (t) {
         db.prepare("DELETE FROM custom_values WHERE entity = 'task' AND record_id = ?").run(t.id);
+        db.prepare("DELETE FROM task_dependencies WHERE task_id = ? OR depends_on_task_id = ?").run(t.id, t.id);
         db.prepare("DELETE FROM tasks WHERE id = ?").run(t.id);
         fireWebhooks("task.deleted", { id: t.id, title: t.title, workspace_id: w }, w);
       } else {
-        return json({ error: "not found" }, 404);
       }
       return json({ ok: true });
+    }
+
+    // ---- task dependencies: POST /api/tasks/:id/dependencies {depends_on:[ids]}
+    // replace semantics — the list is the full new predecessor set.
+    const taskDeps = path.match(/^\/api\/tasks\/(\d+)\/dependencies$/);
+    if (taskDeps && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const tid = Number(taskDeps[1]);
+      const exists = db
+        .query("SELECT id FROM tasks WHERE id = ? AND workspace_id = ?")
+        .get(tid, w);
+      if (!exists) return json({ error: "not found" }, 404);
+      const b = await readBody(req);
+      const ids = Array.isArray(b.depends_on) ? [...new Set(b.depends_on.map(Number).filter((n) => n > 0))] : [];
+      if (ids.includes(tid)) return json({ error: "a task cannot depend on itself" }, 400);
+      for (const id of ids) {
+        const hit = db
+          .query("SELECT id FROM tasks WHERE id = ? AND workspace_id = ?")
+          .get(id, w);
+        if (!hit) return json({ error: `task ${id} not found in this workspace` }, 400);
+      }
+      if (depWouldCycle(tid, ids, w)) {
+        return json({ error: "adding these dependencies would create a cycle" }, 400);
+      }
+      const ins = db.prepare(
+        "INSERT OR IGNORE INTO task_dependencies (task_id, depends_on_task_id, workspace_id) VALUES (?, ?, ?)"
+      );
+      db.prepare("DELETE FROM task_dependencies WHERE task_id = ? AND workspace_id = ?").run(tid, w);
+      for (const id of ids) ins.run(tid, id, w);
+      return json({ task_id: tid, ...taskDepsJson(tid, w) });
     }
     const taskToggle = path.match(/^\/api\/tasks\/(\d+)\/toggle$/);
     if (taskToggle && method === "POST") {
@@ -1861,6 +2007,7 @@ const server = Bun.serve({
           validStage(w, data.stage),
           Number(data.probability ?? 10), data.expected_close || "", data.owner || "automation", w);
         result = dealJson(Number(r.lastInsertRowid), w);
+        logStageChange(Number(r.lastInsertRowid), "", (result as any).stage, w); // "opened"
         logActivity("deal", `${(result as any).title} created via ${hook.name}`, w);
         fireWebhooks("deal.created", result as any, w);
       } else if (action === "create_contact") {
@@ -1880,6 +2027,267 @@ const server = Bun.serve({
       }
       return json({ ok: true, action, result }, 201);
     }
+
+        // ---- duplicate detection & merge (contacts + companies) ---------------------
+    // Deterministic, workspace-scoped. Contacts: same non-empty email
+    // (case-insensitive) OR normalized-name fuzzy match. Companies: normalized
+    // name fuzzy match OR same website host.
+    function normName(s: string): string {
+      return String(s || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+    }
+    function levenshtein(a: string, b: string): number {
+      if (a === b) return 0;
+      if (!a.length) return b.length;
+      if (!b.length) return a.length;
+      let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+      for (let i = 1; i <= a.length; i++) {
+        let cur = i;
+        for (let j = 1; j <= b.length; j++) {
+          const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+          const next = Math.min(prev[j] + 1, cur + 1, prev[j - 1] + cost);
+          prev[j - 1] = cur;
+          cur = next;
+        }
+        prev[b.length] = cur;
+      }
+      return prev[b.length];
+    }
+    function namesSimilar(a: string, b: string): boolean {
+      const na = normName(a), nb = normName(b);
+      if (!na || !nb) return false;
+      if (na === nb) return true;
+      if (levenshtein(na, nb) <= 2) return true;
+      if (Math.min(na.length, nb.length) >= 5 && (na.includes(nb) || nb.includes(na))) return true;
+      return false;
+    }
+    function hostOf(raw: string): string {
+      const s = String(raw || "").trim();
+      if (!s) return "";
+      try {
+        return new URL(s.includes("://") ? s : "https://" + s).hostname.toLowerCase().replace(/^www\./, "");
+      } catch { return ""; }
+    }
+    if (path === "/api/duplicates" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const type = url.searchParams.get("type");
+      if (type !== "contact" && type !== "company") {
+        return json({ error: "type must be contact or company" }, 400);
+      }
+      const pairs: any[] = [];
+      if (type === "contact") {
+        const rows = db.query(
+          `SELECT ct.*, c.name AS company_name FROM contacts ct
+           LEFT JOIN companies c ON c.id = ct.company_id
+           WHERE ct.workspace_id = ? ORDER BY ct.id`
+        ).all(w) as any[];
+        for (let i = 0; i < rows.length && pairs.length < 100; i++) {
+          for (let j = i + 1; j < rows.length && pairs.length < 100; j++) {
+            const a = rows[i], b = rows[j];
+            let reason = "";
+            const ea = String(a.email || "").trim().toLowerCase();
+            const eb = String(b.email || "").trim().toLowerCase();
+            if (ea && ea === eb) reason = "same email";
+            else if (namesSimilar(a.name, b.name)) reason = "similar name";
+            if (reason) pairs.push({ a, b, reason });
+          }
+        }
+      } else {
+        const rows = db.query("SELECT * FROM companies WHERE workspace_id = ? ORDER BY id").all(w) as any[];
+        for (let i = 0; i < rows.length && pairs.length < 100; i++) {
+          for (let j = i + 1; j < rows.length && pairs.length < 100; j++) {
+            const a = rows[i], b = rows[j];
+            let reason = "";
+            const ha = hostOf(a.website), hb = hostOf(b.website);
+            if (ha && ha === hb) reason = "same website";
+            else if (namesSimilar(a.name, b.name)) reason = "similar name";
+            if (reason) pairs.push({ a, b, reason });
+          }
+        }
+      }
+      return json({ pairs });
+    }
+    if (path === "/api/duplicates/merge" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const b = await readBody(req);
+      const type = b.type;
+      if (type !== "contact" && type !== "company") {
+        return json({ error: "type must be contact or company" }, 400);
+      }
+      if (b.confirm !== true) {
+        return json({ error: "merge is destructive — pass { confirm: true } to proceed" }, 400);
+      }
+      const winnerId = Number(b.winner_id), loserId = Number(b.loser_id);
+      if (!winnerId || !loserId || winnerId === loserId) {
+        return json({ error: "winner_id and loser_id must be two different ids" }, 400);
+      }
+      const table = type === "contact" ? "contacts" : "companies";
+      const winner = db.query(`SELECT * FROM ${table} WHERE id = ? AND workspace_id = ?`).get(winnerId, w) as any;
+      const loser = db.query(`SELECT * FROM ${table} WHERE id = ? AND workspace_id = ?`).get(loserId, w) as any;
+      if (!winner || !loser) return json({ error: "both records must exist in this workspace" }, 400);
+      const reassigned: Record<string, number> = {};
+      const move = (label: string, sql: string, ...args: unknown[]) => {
+        reassigned[label] = Number(db.prepare(sql).run(...args).changes);
+      };
+      db.exec("BEGIN");
+      try {
+        if (type === "contact") {
+          move("deals", "UPDATE deals SET contact_id = ? WHERE contact_id = ? AND workspace_id = ?", winnerId, loserId, w);
+          move("captures", "UPDATE captures SET contact_id = ? WHERE contact_id = ?", winnerId, loserId);
+          // custom values: winner wins on field conflicts, then reassign the rest
+          db.prepare(
+            `DELETE FROM custom_values WHERE entity = 'contact' AND record_id = ?
+             AND field_id IN (SELECT field_id FROM custom_values WHERE entity = 'contact' AND record_id = ?)`
+          ).run(loserId, winnerId);
+          move("custom field values", "UPDATE custom_values SET record_id = ? WHERE entity = 'contact' AND record_id = ?", winnerId, loserId);
+          move("activities", "UPDATE activities SET ref_id = ? WHERE ref_type = 'contact' AND ref_id = ? AND workspace_id = ?", winnerId, loserId, w);
+          db.prepare("DELETE FROM contacts WHERE id = ?").run(loserId);
+        } else {
+          move("deals", "UPDATE deals SET company_id = ? WHERE company_id = ? AND workspace_id = ?", winnerId, loserId, w);
+          move("contacts", "UPDATE contacts SET company_id = ? WHERE company_id = ? AND workspace_id = ?", winnerId, loserId, w);
+          db.prepare(
+            `DELETE FROM custom_values WHERE entity = 'company' AND record_id = ?
+             AND field_id IN (SELECT field_id FROM custom_values WHERE entity = 'company' AND record_id = ?)`
+          ).run(loserId, winnerId);
+          move("custom field values", "UPDATE custom_values SET record_id = ? WHERE entity = 'company' AND record_id = ?", winnerId, loserId);
+          move("activities", "UPDATE activities SET ref_id = ? WHERE ref_type = 'company' AND ref_id = ? AND workspace_id = ?", winnerId, loserId, w);
+          db.prepare("DELETE FROM companies WHERE id = ?").run(loserId);
+        }
+        db.exec("COMMIT");
+      } catch (e) {
+        db.exec("ROLLBACK");
+        throw e;
+      }
+      logActivity("note", `Merged duplicate ${type} "${loser.name}" into "${winner.name}"`, w);
+      return json({ ok: true, winner_id: winnerId, loser_id: loserId, reassigned });
+    }
+
+    // ---- saved pipeline views -------------------------------------------------
+    const VIEW_FILTER_KEYS = ["owner", "stage", "source", "min_value", "search"];
+    const cleanFilters = (raw: any): Record<string, string> => {
+      const out: Record<string, string> = {};
+      if (raw && typeof raw === "object") {
+        for (const k of VIEW_FILTER_KEYS) {
+          const v = String(raw[k] ?? "").trim();
+          if (v) out[k] = k === "min_value" ? String(Number(v) || "") : v;
+          if (k === "min_value" && !out[k]) delete out[k];
+        }
+      }
+      return out;
+    };
+    if (path === "/api/saved-views" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const rows = db
+        .query("SELECT * FROM saved_views WHERE workspace_id = ? ORDER BY name")
+        .all(w) as any[];
+      return json({
+        views: rows.map((r) => ({ ...r, filters: JSON.parse(r.filters_json || "{}") })),
+      });
+    }
+    if (path === "/api/saved-views" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const b = await readBody(req);
+      const name = String(b.name || "").trim();
+      if (!name) return json({ error: "name is required" }, 400);
+      const r = db
+        .prepare("INSERT INTO saved_views (workspace_id, name, filters_json) VALUES (?, ?, ?)")
+        .run(w, name, JSON.stringify(cleanFilters(b.filters)));
+      const row = db.query("SELECT * FROM saved_views WHERE id = ?").get(Number(r.lastInsertRowid)) as any;
+      return json({ view: { ...row, filters: JSON.parse(row.filters_json) } }, 201);
+    }
+    const savedViewId = path.match(/^\/api\/saved-views\/(\d+)$/);
+    if (savedViewId && method === "PATCH") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const b = await readBody(req);
+      const cur = db
+        .query("SELECT * FROM saved_views WHERE id = ? AND workspace_id = ?")
+        .get(Number(savedViewId[1]), w) as any;
+      if (!cur) return json({ error: "not found" }, 404);
+      const sets: string[] = [];
+      const vals: unknown[] = [];
+      if (b.name !== undefined && String(b.name).trim()) {
+        sets.push("name = ?");
+        vals.push(String(b.name).trim());
+      }
+      if (b.filters !== undefined) {
+        sets.push("filters_json = ?");
+        vals.push(JSON.stringify(cleanFilters(b.filters)));
+      }
+      if (sets.length) {
+        db.prepare(`UPDATE saved_views SET ${sets.join(", ")} WHERE id = ?`)
+          .run(...vals, Number(savedViewId[1]));
+      }
+      const row = db.query("SELECT * FROM saved_views WHERE id = ?").get(Number(savedViewId[1])) as any;
+      return json({ view: { ...row, filters: JSON.parse(row.filters_json) } });
+    }
+    if (savedViewId && method === "DELETE") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const hit = db.prepare("DELETE FROM saved_views WHERE id = ? AND workspace_id = ?")
+        .run(Number(savedViewId[1]), w);
+      if (!hit.changes) return json({ error: "not found" }, 404);
+      return json({ ok: true });
+    }
+
+    // ---- bulk deal actions ----------------------------------------------------
+    // POST /api/deals/bulk { ids: [...], action: "move_stage"|"set_owner"|"set_source"|"delete", value?, confirm? }
+    if (path === "/api/deals/bulk" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const b = await readBody(req);
+      const ids = Array.isArray(b.ids) ? [...new Set(b.ids.map(Number).filter((n) => n > 0))] : [];
+      if (!ids.length) return json({ error: "ids must be a non-empty array" }, 400);
+      const found = db
+        .query(`SELECT id, stage, title FROM deals WHERE id IN (${ids.map(() => "?").join(",")}) AND workspace_id = ?`)
+        .all(...ids, w) as any[];
+      if (found.length !== ids.length) {
+        return json({ error: "some deals were not found in this workspace" }, 400);
+      }
+      const action = b.action;
+      const byId = new Map(found.map((d) => [d.id, d]));
+      if (action === "move_stage") {
+        const to = validStage(w, b.value);
+        const upd = db.prepare("UPDATE deals SET stage = ?, updated_at = datetime('now') WHERE id = ?");
+        let moved = 0;
+        for (const id of ids) {
+          const d = byId.get(id);
+          if (d.stage !== to) {
+            upd.run(to, id);
+            logStageChange(id, d.stage, to, w);
+            moved++;
+          }
+        }
+        const stageName = (db.query("SELECT name FROM stages WHERE workspace_id = ? AND slug = ?").get(w, to) as any)?.name || to;
+        logActivity("deal", `Bulk-moved ${moved} deal(s) to ${stageName}`, w);
+        return json({ ok: true, affected: moved });
+      }
+      if (action === "set_owner") {
+        const n = db.prepare("UPDATE deals SET owner = ?, updated_at = datetime('now') WHERE id = ? AND workspace_id = ?");
+        ids.forEach((id) => n.run(String(b.value ?? ""), id, w));
+        return json({ ok: true, affected: ids.length });
+      }
+      if (action === "set_source") {
+        const n = db.prepare("UPDATE deals SET source = ?, updated_at = datetime('now') WHERE id = ? AND workspace_id = ?");
+        ids.forEach((id) => n.run(String(b.value ?? "").trim(), id, w));
+        return json({ ok: true, affected: ids.length });
+      }
+      if (action === "delete") {
+        if (b.confirm !== true) {
+          return json({ error: `bulk delete of ${ids.length} deal(s) is destructive — pass { confirm: true }` }, 400);
+        }
+        db.prepare(`DELETE FROM deal_stage_history WHERE deal_id IN (${ids.map(() => "?").join(",")})`).run(...ids);
+        const n = db.prepare(`DELETE FROM deals WHERE id IN (${ids.map(() => "?").join(",")}) AND workspace_id = ?`).run(...ids, w);
+        logActivity("deal", `Bulk-deleted ${n.changes} deal(s)`, w);
+        return json({ ok: true, affected: n.changes });
+      }
+      return json({ error: 'action must be one of: move_stage, set_owner, set_source, delete' }, 400);
+    }
+
+    return json({ error: "not found" }, 404);
 
     return json({ error: "not found" }, 404);
   },

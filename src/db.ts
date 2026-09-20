@@ -170,6 +170,27 @@ CREATE TABLE IF NOT EXISTS custom_values (
   value TEXT DEFAULT '',
   UNIQUE(entity, record_id, field_id)
 );
+CREATE TABLE IF NOT EXISTS saved_views (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER REFERENCES workspaces(id),
+  name TEXT NOT NULL,
+  filters_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS deal_stage_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  deal_id INTEGER REFERENCES deals(id),
+  workspace_id INTEGER REFERENCES workspaces(id),
+  from_stage TEXT DEFAULT '',
+  to_stage TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS task_dependencies (
+  task_id INTEGER NOT NULL REFERENCES tasks(id),
+  depends_on_task_id INTEGER NOT NULL REFERENCES tasks(id),
+  workspace_id INTEGER REFERENCES workspaces(id),
+  PRIMARY KEY (task_id, depends_on_task_id)
+);
 `;
 
 export function openDb(path: string): Database {
@@ -250,6 +271,39 @@ export function openDb(path: string): Database {
   if (!whCols.some((c) => c.name === "headers")) {
     db.exec("ALTER TABLE webhooks ADD COLUMN headers TEXT DEFAULT '{}'");
   }
+  // migration: deals gained a free-text source field (lead origin), and the
+  // batch-5 tables: deal_stage_history, task_dependencies, saved_views.
+  const dealCols = db.query("PRAGMA table_info(deals)").all() as any[];
+  if (!dealCols.some((c) => c.name === "source")) {
+    db.exec("ALTER TABLE deals ADD COLUMN source TEXT DEFAULT ''");
+  }
+  for (const [t, sql] of [
+    ["deal_stage_history", `CREATE TABLE deal_stage_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      deal_id INTEGER REFERENCES deals(id),
+      workspace_id INTEGER REFERENCES workspaces(id),
+      from_stage TEXT DEFAULT '',
+      to_stage TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')))`,],
+    ["task_dependencies", `CREATE TABLE task_dependencies (
+      task_id INTEGER NOT NULL REFERENCES tasks(id),
+      depends_on_task_id INTEGER NOT NULL REFERENCES tasks(id),
+      workspace_id INTEGER REFERENCES workspaces(id),
+      PRIMARY KEY (task_id, depends_on_task_id))`,],
+    ["saved_views", `CREATE TABLE saved_views (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      workspace_id INTEGER REFERENCES workspaces(id),
+      name TEXT NOT NULL,
+      filters_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT DEFAULT (datetime('now')))`,],
+  ] as [string, string][]) {
+    const exists = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(t);
+    if (!exists) db.exec(sql);
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_stage_history_deal ON deal_stage_history(deal_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_stage_history_ws ON deal_stage_history(workspace_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_task_deps_ws ON task_dependencies(workspace_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_saved_views_ws ON saved_views(workspace_id)");
   // migration: pipeline stages are editable per workspace (Milton schema editing).
   // deals.stage stays a TEXT slug; the stages table owns the per-workspace
   // ordered schema. Legacy DBs get the table created and seeded below.

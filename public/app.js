@@ -563,8 +563,12 @@ async function vDashboard() {
    badge so the board reads as the cross-campaign pipeline. Deal cards are
    wired by initDealDrag (drag between columns persists via PATCH /api/deals/:id;
    plain click opens the deal editor). */
-function boardHtml(deals, campNameById) {
+function boardHtml(deals, campNameById, selSet, selectable) {
   const closedStages = ["closed_won", "closed_lost"];
+  const sel = selSet || new Set();
+  // the campaigns-overview board is selectable for bulk actions; the
+  // campaign-badge column keeps badges, selection only when asked for
+  const canSel = selectable === undefined ? !campNameById : selectable;
   // stages not in the workspace order still get their own column so their
   // deals never vanish from the board (same convention as the strip)
   const extra = [...new Set(deals.map((d) => d.stage))].filter((s) => !state.stages.includes(s));
@@ -578,48 +582,179 @@ function boardHtml(deals, campNameById) {
           <div class="cname">${esc(state.labels[s] || s)}</div>
           <div class="ctotal">${ds.length} · ${moneyShort(tot)}</div></div>
         ${ds.map((d) => `
-          <div class="deal-card" data-id="${d.id}">
+          <div class="deal-card${canSel && sel.has(d.id) ? " selected" : ""}" data-id="${d.id}">
+            ${canSel ? `<input type="checkbox" class="sel" data-id="${d.id}" title="Select" ${sel.has(d.id) ? "checked" : ""}>` : ""}
             <div class="trow"><span class="sdot" style="background:${stageFunnelColor(s)}"></span><div class="t">${esc(d.title)}</div></div>
             <div class="co">${esc(d.company_name || "—")}${d.contact_name ? " · " + esc(d.contact_name) : ""}</div>
             ${campNameById ? `<div style="margin-top:6px"><span class="pill" style="background:var(--border-soft);color:var(--text-2)">${esc(campNameById.get(d.campaign_id) || "No campaign")}</span></div>` : ""}
-            <div class="row"><div class="val">${money(d.value)}</div><div class="prob">${d.probability}%</div></div>
+            ${d.source ? `<div style="margin-top:6px"><span class="pill" style="background:var(--ctp-surface1);color:var(--text-2)">${esc(d.source)}</span></div>` : ""}
+            <div class="row"><div class="val">${money(d.value)}</div><div class="prob">${d.probability}%${d.owner ? " · " + esc(d.owner) : ""}</div></div>
           </div>`).join("")}
       </div>`;
     }).join("")}
   </div>`;
 }
 
-async function vPipeline() {
-  const { deals } = await GET("/api/deals");
-  const open = deals.filter((d) => !["closed_won", "closed_lost"].includes(d.stage));
-  const closedStages = ["closed_won", "closed_lost"];
-  view.innerHTML = `
-    <div class="toolbar">
-      <div class="seg">
-        <button data-pv="board" class="${pipeView === "board" ? "on" : ""}">Board</button>
-        <button data-pv="timeline" class="${pipeView === "timeline" ? "on" : ""}">Timeline</button>
-      </div>
-      <div class="spacer"></div>
-      ${pipeView === "timeline" ? `
-      <div class="seg small">
-        <button data-gz="fit" class="${ganttZoom === "fit" ? "on" : ""}">Fit</button>
-        <button data-gz="3m" class="${ganttZoom === "3m" ? "on" : ""}">3M</button>
-        <button data-gz="6m" class="${ganttZoom === "6m" ? "on" : ""}">6M</button>
-        <button data-gz="1y" class="${ganttZoom === "1y" ? "on" : ""}">1Y</button>
-      </div>` : `
-      <span style="color:var(--text-2)">${open.length} open deals · ${money(open.reduce((a, d) => a + d.value, 0))} pipeline</span>`}
-      <button class="btn" id="new-deal">+ New deal</button>
-    </div>
-    ${pipeView === "board" ? boardHtml(deals) : ganttHtml(open)}
-`;
+/* ---------- pipeline board: filters, saved views, bulk selection ----------
+   The live board lives inside the campaigns overview (vCampaigns); these
+   helpers render and wire its filter toolbar, saved views and bulk bar. */
+let pipeFilters = { search: "", owner: "", stage: "", source: "", min_value: "" };
+let bulkSel = new Set(); // selected deal ids across re-renders
+let savedViewsCache = [];
+let dealSourcesCache = [];
+let dealOwnersCache = [];
 
-  document.querySelectorAll("[data-pv]").forEach((b) =>
-    (b.onclick = () => { pipeView = b.dataset.pv; route(); }));
-  document.querySelectorAll("[data-gz]").forEach((b) =>
-    (b.onclick = () => { ganttZoom = b.dataset.gz; route(); }));
-  $("#new-deal").onclick = () => newDealModal();
-  if (pipeView === "board") initDealDrag(deals);
-  else wireGantt(open);
+// client-side mirror of the /api/deals filter params (the overview needs the
+// full deal list for the per-campaign strips, so the board filters locally)
+function applyPipeFilters(deals) {
+  const f = pipeFilters;
+  return (deals || []).filter((d) => {
+    if (f.owner && (d.owner || "") !== f.owner) return false;
+    if (f.stage && d.stage !== f.stage) return false;
+    if (f.source && (d.source || "") !== f.source) return false;
+    if (f.min_value && (Number(d.value) || 0) < Number(f.min_value)) return false;
+    if (f.search) {
+      const q = f.search.toLowerCase();
+      if (!((d.title || "").toLowerCase().includes(q) ||
+            (d.company_name || "").toLowerCase().includes(q))) return false;
+    }
+    return true;
+  });
+}
+
+function savedViewsHtml() {
+  return `
+    <select id="view-sel" title="Saved views">
+      <option value="">Saved views…</option>
+      ${savedViewsCache.map((v) => `<option value="${v.id}">${esc(v.name)}</option>`).join("")}
+    </select>
+    <button class="btn ghost small" id="view-save">Save view</button>
+    <button class="btn ghost small" id="view-del" title="Delete the selected saved view">Delete view</button>`;
+}
+
+function dealFiltersHtml() {
+  return `
+    <div class="filters">
+      <input id="f-search" placeholder="Search deals…" value="${esc(pipeFilters.search)}">
+      <select id="f-owner"><option value="">All owners</option>
+        ${dealOwnersCache.map((o) => `<option value="${esc(o)}" ${pipeFilters.owner === o ? "selected" : ""}>${esc(o)}</option>`).join("")}
+      </select>
+      <select id="f-stage"><option value="">All stages</option>
+        ${state.stages.map((s) => `<option value="${esc(s)}" ${pipeFilters.stage === s ? "selected" : ""}>${esc(state.labels[s] || s)}</option>`).join("")}
+      </select>
+      <select id="f-source"><option value="">All sources</option>
+        ${dealSourcesCache.map((s) => `<option value="${esc(s)}" ${pipeFilters.source === s ? "selected" : ""}>${esc(s)}</option>`).join("")}
+      </select>
+      <input id="f-min" type="number" min="0" placeholder="Min $" value="${esc(pipeFilters.min_value)}">
+      <button class="btn ghost small" id="f-clear">Clear</button>
+    </div>`;
+}
+
+function wirePipeControls() {
+  const applyFilters = () => {
+    pipeFilters.search = $("#f-search").value.trim();
+    pipeFilters.owner = $("#f-owner").value;
+    pipeFilters.stage = $("#f-stage").value;
+    pipeFilters.source = $("#f-source").value;
+    pipeFilters.min_value = $("#f-min").value.trim();
+    route();
+  };
+  let searchT = null;
+  const si = $("#f-search");
+  if (si) si.oninput = () => { clearTimeout(searchT); searchT = setTimeout(applyFilters, 400); };
+  ["#f-owner", "#f-stage", "#f-source", "#f-min"].forEach((s) => {
+    const el = $(s);
+    if (el) el.onchange = applyFilters;
+  });
+  const fc = $("#f-clear");
+  if (fc) fc.onclick = () => {
+    pipeFilters = { search: "", owner: "", stage: "", source: "", min_value: "" };
+    route();
+  };
+  const vs = $("#view-sel");
+  if (vs) vs.onchange = (e) => {
+    const v = savedViewsCache.find((x) => x.id === Number(e.target.value));
+    if (!v) return;
+    pipeFilters = { search: "", owner: "", stage: "", source: "", min_value: "", ...v.filters };
+    route();
+  };
+  const sv = $("#view-save");
+  if (sv) sv.onclick = () => openModal("Save current view", `
+    <div class="field"><label>Name</label><input name="name" placeholder="e.g. Enterprise Q4"></div>`,
+    async (d) => {
+      await POST("/api/saved-views", { name: d.name, filters: pipeFilters });
+      route();
+    });
+  const dv = $("#view-del");
+  if (dv) dv.onclick = async () => {
+    const id = Number($("#view-sel").value);
+    if (!id) { toast("Pick a saved view first", "err"); return; }
+    const v = savedViewsCache.find((x) => x.id === id);
+    if (!confirm(`Delete the saved view "${v ? v.name : id}"?`)) return;
+    await DEL(`/api/saved-views/${id}`);
+    route();
+  };
+}
+
+function renderBulkBar() {
+  const host = $("#bulkbar-host");
+  if (!host) return;
+  if (!bulkSel.size) { host.innerHTML = ""; return; }
+  const stageOpts = state.stages.map((s) => `<option value="${esc(s)}">${esc(state.labels[s] || s)}</option>`).join("");
+  host.innerHTML = `
+    <div class="bulkbar">
+      <b>${bulkSel.size} selected</b>
+      <select id="b-stage">${stageOpts}</select>
+      <button class="btn ghost small" id="b-move">Move stage</button>
+      <input id="b-owner" placeholder="Owner">
+      <button class="btn ghost small" id="b-owner-go">Set owner</button>
+      <input id="b-source" placeholder="Source" list="bulk-sources">
+      <datalist id="bulk-sources">${dealSourcesCache.map((s) => `<option value="${esc(s)}">`).join("")}</datalist>
+      <button class="btn ghost small" id="b-source-go">Set source</button>
+      <button class="btn danger small" id="b-del">Delete</button>
+      <button class="btn ghost small" id="b-clear">Clear</button>
+    </div>`;
+  $("#b-move").onclick = async () => {
+    await POST("/api/deals/bulk", { ids: [...bulkSel], action: "move_stage", value: $("#b-stage").value });
+    bulkSel.clear();
+    route();
+  };
+  $("#b-owner-go").onclick = async () => {
+    await POST("/api/deals/bulk", { ids: [...bulkSel], action: "set_owner", value: $("#b-owner").value.trim() });
+    bulkSel.clear();
+    route();
+  };
+  $("#b-source-go").onclick = async () => {
+    await POST("/api/deals/bulk", { ids: [...bulkSel], action: "set_source", value: $("#b-source").value.trim() });
+    bulkSel.clear();
+    route();
+  };
+  $("#b-del").onclick = () => {
+    const n = bulkSel.size;
+    openModal(`Delete ${n} deal${n > 1 ? "s" : ""}?`, `
+      <p style="color:var(--text-2)">This is destructive. Type <b>DELETE</b> to confirm.</p>
+      <div class="field"><input name="ack" placeholder="DELETE"></div>`,
+      async (d) => {
+        if (d.ack !== "DELETE") throw new Error("confirmation text didn't match");
+        await POST("/api/deals/bulk", { ids: [...bulkSel], action: "delete", confirm: true });
+        bulkSel.clear();
+        route();
+      }, "Delete");
+  };
+  $("#b-clear").onclick = () => { bulkSel.clear(); route(); };
+}
+
+function wireBulkBar(deals) {
+  const board = $("#board");
+  if (!board) return;
+  board.addEventListener("change", (e) => {
+    if (!e.target.classList.contains("sel")) return;
+    const id = Number(e.target.dataset.id);
+    if (e.target.checked) bulkSel.add(id);
+    else bulkSel.delete(id);
+    e.target.closest(".deal-card")?.classList.toggle("selected", e.target.checked);
+    renderBulkBar();
+  });
 }
 
 /* Per-deal Gantt: bar runs from created_at to expected_close.
@@ -771,6 +906,7 @@ function initDealDrag(deals) {
   board.querySelectorAll(".deal-card").forEach((card) => {
     card.addEventListener("pointerdown", (e) => {
       if (e.button !== 0) return;
+      if (e.target.classList.contains("sel")) return; // selection checkbox: not a drag
       e.preventDefault();
       drag = {
         card, id: card.dataset.id, sx: e.clientX, sy: e.clientY,
@@ -826,9 +962,10 @@ function initDealDrag(deals) {
 }
 
 async function editDealModal(d) {
-  const { companies } = await GET("/api/companies");
-  const { contacts } = await GET("/api/contacts");
-  const { campaigns } = await GET("/api/campaigns");
+  const [{ companies }, { contacts }, { campaigns }, { sources }] = await Promise.all([
+    GET("/api/companies"), GET("/api/contacts"), GET("/api/campaigns"),
+    GET("/api/deal-sources").catch(() => ({ sources: [] })),
+  ]);
   const close = openModal("Edit deal", `
     <div class="formgrid">
       ${field("Title", input("title", d.title))}
@@ -840,7 +977,9 @@ async function editDealModal(d) {
       ${field("Probability %", input("probability", d.probability, "number"))}
       ${field("Expected close", input("expected_close", d.expected_close || "", "date"))}
       ${field("Owner", input("owner", d.owner || ""))}
+      ${field("Source", `<input name="source" list="deal-sources" value="${esc(d.source || "")}"><datalist id="deal-sources">${sources.map((s) => `<option value="${esc(s)}">`).join("")}</datalist>`)}
     </div>
+    <div class="journey"><h3>Journey</h3><div id="deal-journey"><div class="empty">Loading…</div></div></div>
     <div class="field"><label>Calendar</label><div id="deal-cal"><div class="empty">Loading…</div></div></div>`,
     async (data) => {
       if (data.company_id === "") data.company_id = null;
@@ -866,6 +1005,24 @@ async function editDealModal(d) {
         (items.length ? "" : `<div class="empty" style="margin-top:6px">No dates set — add an expected close date or task due dates.</div>`);
     } catch { /* calendar is decorative; never block the editor */ }
   })();
+  // stage-transition journey timeline
+  (async () => {
+    try {
+      const { history } = await GET(`/api/deals/${d.id}/history`);
+      const host = document.querySelector("#deal-journey");
+      if (!host) return;
+      host.innerHTML = history.length
+        ? history.map((h) => `
+          <div class="j-item">
+            <div><b>${esc(h.from_name || "Opened")}</b> → <b>${esc(h.to_name)}</b></div>
+            <div class="jd">${esc((h.created_at || "").replace(" ", " · ").slice(0, 20))}</div>
+          </div>`).join("")
+        : `<div class="empty">No history yet.</div>`;
+    } catch {
+      const host = document.querySelector("#deal-journey");
+      if (host) host.innerHTML = `<div class="empty">Couldn't load history.</div>`;
+    }
+  })();
   const actions = document.querySelector("#modal-root .modal .actions");
   if (actions) {
     const del = document.createElement("button");
@@ -884,9 +1041,10 @@ async function editDealModal(d) {
 }
 
 async function newDealModal() {
-  const { companies } = await GET("/api/companies");
-  const { contacts } = await GET("/api/contacts");
-  const { campaigns } = await GET("/api/campaigns");
+  const [{ companies }, { contacts }, { campaigns }, { sources }] = await Promise.all([
+    GET("/api/companies"), GET("/api/contacts"), GET("/api/campaigns"),
+    GET("/api/deal-sources").catch(() => ({ sources: [] })),
+  ]);
   openModal("New deal", `
     <div class="formgrid">
       ${field("Title", input("title", "", "text", "required"))}
@@ -898,6 +1056,7 @@ async function newDealModal() {
       ${field("Probability %", input("probability", "20", "number"))}
       ${field("Expected close", input("expected_close", "", "date"))}
       ${field("Owner", input("owner", "You"))}
+      ${field("Source", `<input name="source" list="deal-sources"><datalist id="deal-sources">${sources.map((s) => `<option value="${esc(s)}">`).join("")}</datalist>`)}
     </div>`,
     async (d) => { await POST("/api/deals", d); route(); }, "Create deal");
 }
@@ -930,6 +1089,7 @@ async function vContacts() {
       <input class="search" id="q" placeholder="Search name or email…" value="${esc(q)}">
       <button class="btn ghost" id="go">Search</button>
       <div class="spacer"></div>
+      <button class="btn ghost" id="dupes">Duplicates</button>
       <button class="btn" id="new-contact">+ New contact</button>
     </div>
     <p class="hint">Tip: click any cell to edit it in place — Enter saves, Esc cancels.</p>
@@ -950,6 +1110,82 @@ async function vContacts() {
   $("#q").addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
   wireContactCells(contacts, companies);
   $("#new-contact").onclick = () => newContactModal();
+  $("#dupes").onclick = () => { dupMode = true; route(); };
+}
+
+/* ---------- duplicate detection & merge UI ---------- */
+let dupMode = false;
+let dupType = "contact";
+
+async function vDuplicates() {
+  const { pairs } = await GET(`/api/duplicates?type=${dupType}`);
+  view.innerHTML = `
+    <div class="toolbar">
+      <button class="btn ghost" id="dup-back">← Contacts</button>
+      <div class="seg small">
+        <button data-dt="contact" class="${dupType === "contact" ? "on" : ""}">Contacts</button>
+        <button data-dt="company" class="${dupType === "company" ? "on" : ""}">Companies</button>
+      </div>
+      <div class="spacer"></div>
+      <span style="color:var(--text-2)">${pairs.length} possible duplicate${pairs.length === 1 ? "" : "s"}</span>
+    </div>
+    ${pairs.length ? pairs.map((p, i) => dupPairHtml(p, i)).join("") :
+      `<div class="empty">No duplicates found — clean.</div>`}`;
+  $("#dup-back").onclick = () => { dupMode = false; route(); };
+  document.querySelectorAll("[data-dt]").forEach((b) =>
+    (b.onclick = () => { dupType = b.dataset.dt; route(); }));
+  document.querySelectorAll(".dup-col input[type=radio]").forEach((r) =>
+    (r.onchange = () => {
+      const pair = r.closest(".dup-pair");
+      pair.querySelectorAll(".dup-col").forEach((c) =>
+        c.classList.toggle("keep", c.querySelector("input").checked));
+    }));
+  document.querySelectorAll("[data-merge]").forEach((b) =>
+    (b.onclick = () => dupMergeModal(pairs[Number(b.dataset.merge)], Number(b.dataset.merge))));
+}
+
+function dupPairHtml(p, i) {
+  const isC = dupType === "contact";
+  const fieldsHtml = (r) => isC
+    ? `<div class="fname">${esc(r.name)}</div>
+       <div class="frow">${esc(r.title || "—")}${r.company_name ? " · " + esc(r.company_name) : ""}</div>
+       <div class="frow">${esc(r.email || "—")}</div>
+       <div class="frow">${esc(r.phone || "—")}</div>`
+    : `<div class="fname">${esc(r.name)}</div>
+       <div class="frow">${esc(r.industry || "—")}</div>
+       <div class="frow">${esc(r.website || "—")}</div>`;
+  return `<div class="dup-pair">
+    <span class="pill" style="background:var(--ctp-surface1);color:var(--text-2)">${esc(p.reason)}</span>
+    <div class="dup-cols">
+      <div class="dup-col keep"><label class="keep-pick"><input type="radio" name="win-${i}" value="a" checked> Keep</label>${fieldsHtml(p.a)}</div>
+      <div class="dup-col"><label class="keep-pick"><input type="radio" name="win-${i}" value="b"> Keep</label>${fieldsHtml(p.b)}</div>
+    </div>
+    <button class="btn danger small" data-merge="${i}">Merge…</button>
+  </div>`;
+}
+
+function dupMergeModal(p, i) {
+  const isC = dupType === "contact";
+  const keepA = document.querySelector(`.dup-pair input[name="win-${i}"]:checked`)?.value !== "b";
+  const winner = keepA ? p.a : p.b;
+  const loser = keepA ? p.b : p.a;
+  openModal("Merge duplicates", `
+    <p style="color:var(--text-2)">This is destructive — one record is deleted and all its
+    ${isC ? "deals, captures, custom values and activities" : "deals, contacts, custom values and activities"}
+    move to the survivor. Winner keeps its fields.</p>
+    <div class="dup-cols">
+      <div class="dup-col keep"><label class="keep-pick">Keep</label><div class="fname">${esc(winner.name)}</div><div class="frow">id ${winner.id}</div></div>
+      <div class="dup-col"><label class="keep-pick">Merge & delete</label><div class="fname">${esc(loser.name)}</div><div class="frow">id ${loser.id}</div></div>
+    </div>
+    <p style="color:var(--text-2)">Type <b>MERGE</b> to confirm.</p>
+    <div class="field"><input name="ack" placeholder="MERGE"></div>`,
+    async (d) => {
+      if (d.ack !== "MERGE") throw new Error("confirmation text didn't match");
+      await POST("/api/duplicates/merge", {
+        type: dupType, winner_id: winner.id, loser_id: loser.id, confirm: true,
+      });
+      route();
+    }, "Merge");
 }
 
 async function editContactModal(c) {
@@ -1082,9 +1318,14 @@ function filterBoardDeals(deals, filter) {
 }
 
 async function vCampaigns() {
-  const [{ campaigns }, { companies }, { deals }] = await Promise.all([
+  const [{ campaigns }, { companies }, { deals }, { sources }, { views }] = await Promise.all([
     GET("/api/campaigns"), GET("/api/companies"), GET("/api/deals"),
+    GET("/api/deal-sources").catch(() => ({ sources: [] })),
+    GET("/api/saved-views").catch(() => ({ views: [] })),
   ]);
+  savedViewsCache = views;
+  dealSourcesCache = sources;
+  dealOwnersCache = [...new Set((deals || []).map((d) => d.owner).filter(Boolean))].sort();
   const dealsByCamp = new Map();
   for (const d of deals || []) {
     if (d.campaign_id == null) continue;
@@ -1092,10 +1333,12 @@ async function vCampaigns() {
     dealsByCamp.get(d.campaign_id).push(d);
   }
   /* Pipeline board below the list: all workspace deals as a cross-campaign
-     kanban, filtered client-side by campaign. */
+     kanban, filtered client-side by campaign, then by the board filters. */
   const campNameById = new Map(campaigns.map((c) => [c.id, c.name]));
   const allDeals = deals || [];
-  const boardDeals = filterBoardDeals(allDeals, campBoardFilter);
+  const boardDeals = applyPipeFilters(filterBoardDeals(allDeals, campBoardFilter));
+  // selection only survives for deals still visible
+  bulkSel = new Set([...bulkSel].filter((id) => boardDeals.some((d) => d.id === id)));
   const boardOpen = boardDeals.filter((d) => !["closed_won", "closed_lost"].includes(d.stage));
   const boardValue = boardOpen.reduce((a, d) => a + (Number(d.value) || 0), 0);
   view.innerHTML = `
@@ -1117,18 +1360,26 @@ async function vCampaigns() {
           ${campaigns.map((c) => `<option value="${c.id}" ${String(campBoardFilter) === String(c.id) ? "selected" : ""}>${esc(c.name)}</option>`).join("")}
           <option value="none" ${campBoardFilter === "none" ? "selected" : ""}>No campaign</option>
         </select>
+        ${savedViewsHtml()}
         <span style="color:var(--text-2);font-size:12.5px">${boardOpen.length} open deals · ${money(boardValue)} pipeline</span>
         <div class="spacer"></div>
         <button class="btn" id="new-deal">+ New deal</button>
       </div>
-      ${boardHtml(boardDeals, campNameById)}
+      ${dealFiltersHtml()}
+      ${boardHtml(boardDeals, campNameById, bulkSel, true)}
+      <div id="bulkbar-host"></div>
     </div>`;
   document.querySelectorAll("#view tr.clickable").forEach((tr) => {
     tr.onclick = () => { location.hash = `#/campaigns/${tr.dataset.id}`; };
   });
   $("#board-camp-filter").onchange = (e) => { campBoardFilter = e.target.value; route(); };
   $("#new-deal").onclick = () => newDealModal();
-  if ($("#board")) initDealDrag(allDeals);
+  wirePipeControls();
+  if ($("#board")) {
+    initDealDrag(allDeals);
+    wireBulkBar();
+    renderBulkBar();
+  }
   $("#new-campaign").onclick = async () => {
     const fields = await getSchemaFields("campaign");
     openModal("New campaign", `
@@ -1399,7 +1650,7 @@ function renderCampaignDetail(c, tasks, deals, camp) {
 function taskRow(t) {
   return `<div class="task ${t.done ? "done" : ""}">
     <input type="checkbox" data-id="${t.id}" ${t.done ? "checked" : ""}>
-    <div><div class="tt">${esc(t.title)}</div>
+    <div><div class="tt">${esc(t.title)}${t.is_blocked && !t.done ? `<span class="blocked-badge">Blocked</span>` : ""}</div>
       <div class="meta">${t.deal_title ? esc(t.deal_title) + " · " : ""}${t.due_date ? "due " + esc(t.due_date) + " · " : ""}${esc(t.owner)}</div>${cfReadonlyHtml(t.custom_fields)}</div>
     <div class="spacer"></div>
     <button class="btn ghost small" data-edit="${t.id}">Edit</button>
@@ -1407,7 +1658,20 @@ function taskRow(t) {
 }
 function wireTaskRows(tasks, deals) {
   document.querySelectorAll('#view .task input[type="checkbox"]').forEach((cb) => {
-    cb.onchange = async () => { await POST(`/api/tasks/${cb.dataset.id}/toggle`); route(); };
+    cb.onchange = async () => {
+      const t = tasks.find((x) => x.id === Number(cb.dataset.id));
+      if (t && !t.done) {
+        const openDeps = (t.blocked_by || []).filter((p) => !p.done);
+        if (openDeps.length) {
+          if (!confirm(`"${t.title}" still has unfinished predecessors: ${openDeps.map((p) => p.title).join(", ")}. Complete it anyway?`)) {
+            cb.checked = false;
+            return;
+          }
+        }
+      }
+      await POST(`/api/tasks/${cb.dataset.id}/toggle`);
+      route();
+    };
   });
   document.querySelectorAll("#view [data-edit]").forEach((b) => {
     b.onclick = () => {
@@ -1798,7 +2062,9 @@ function editCaptureModal(c, contacts) {
 }
 
 async function editTaskModal(t, deals) {
-  const fields = await getSchemaFields("task");
+  const [fields, { tasks }] = await Promise.all([getSchemaFields("task"), GET("/api/tasks")]);
+  const depIds = new Set((t.blocked_by || []).map((x) => x.id));
+  const others = tasks.filter((x) => x.id !== t.id);
   openModal("Edit task", `
     ${field("Title", input("title", t.title))}
     <div class="formgrid">
@@ -1806,8 +2072,21 @@ async function editTaskModal(t, deals) {
       ${field("Due date", input("due_date", t.due_date || "", "date"))}
     </div>
     ${field("Owner", input("owner", t.owner))}
+    <div class="field"><label>Blocked by (finish these first)</label>
+      <div class="dep-list">
+        ${others.length ? others.map((o) => `
+          <label class="dep"><input type="checkbox" name="depends_on" value="${o.id}" ${depIds.has(o.id) ? "checked" : ""}> ${esc(o.title)}${o.done ? " ✓" : ""}</label>`).join("")
+          : `<div class="empty">No other tasks.</div>`}
+      </div>
+    </div>
     ${cfFieldsHtml(fields, t.custom)}`,
-    async (d) => { await PATCH(`/api/tasks/${t.id}`, d); route(); }, "Save changes");
+    async (d) => {
+      const deps = (d.depends_on || []).map(Number).filter((n) => n > 0);
+      await POST(`/api/tasks/${t.id}/dependencies`, { depends_on: deps });
+      delete d.depends_on;
+      await PATCH(`/api/tasks/${t.id}`, d);
+      route();
+    }, "Save changes");
 }
 
 function webhookFormHtml(w, events) {
@@ -2270,7 +2549,8 @@ async function route() {
       await vCampaignDetail(Number(parts[1]));
     } else {
       $("#page-title").textContent = TITLES[name];
-      await { dashboard: vDashboard, feed: vFeed, calendar: vCalendar, contacts: vContacts,
+      await { dashboard: vDashboard, feed: vFeed, calendar: vCalendar,
+        contacts: () => (dupMode ? vDuplicates() : vContacts()),
         companies: vCompanies, campaigns: vCampaigns, captures: vCaptures,
         automations: vAutomations, schema: vSchema, milton: vMilton }[name]();
     }

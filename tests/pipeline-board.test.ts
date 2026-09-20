@@ -70,7 +70,7 @@ const stageFunnelColorT = (s: string) => {
 const board = (deals: any[], campNameById?: Map<number, string>) =>
   new Function(
     "esc", "money", "moneyShort", "stageColor", "stageFunnelColor", "state", "deals", "campNameById",
-    extractFn(appSrc, "boardHtml") + "\nreturn boardHtml(deals, campNameById);"
+    extractFn(appSrc, "boardHtml") + "\nreturn boardHtml(deals, campNameById, new Set(), true);"
   )(escT, moneyT, moneyShortT, stageColorT, stageFunnelColorT, stateT, deals, campNameById) as string;
 
 const campMap = new Map<number, string>([[7, "Q4 Launch"], [9, "Beta Test"]]);
@@ -122,7 +122,7 @@ describe("vCampaigns wires the board", () => {
 
   test("overview renders the board below the campaign list with badges", () => {
     const src = fn();
-    expect(src).toContain("boardHtml(boardDeals, campNameById)");
+    expect(src).toContain("boardHtml(boardDeals, campNameById, bulkSel, true)");
     expect(src).toContain('id="board-camp-filter"');
     // per-campaign summary strips stay as the glanceable layer
     expect(src).toContain("campaignPipelineStrip(dealsByCamp.get(c.id) || [])");
@@ -274,22 +274,38 @@ describe("vCampaigns DOM-stubbed render", () => {
     const $stub = () => ({}) as any;
     const docStub = { querySelectorAll: () => [] } as any;
     const dragCalls: any[][] = [];
+    const bulkCalls: any[][] = [];
     const stubs = {
       GET: async (p: string) =>
-        p === "/api/campaigns" ? { campaigns } : p === "/api/companies" ? { companies: [] } : { deals },
+        p === "/api/campaigns" ? { campaigns } : p === "/api/companies" ? { companies: [] } :
+        p === "/api/deal-sources" ? { sources: [] } : p === "/api/saved-views" ? { views: [] } :
+        { deals },
       route: async () => {},
       newDealModal: () => {},
       initDealDrag: (...a: any[]) => { dragCalls.push(a); },
       getSchemaFields: async () => [], openModal: () => {}, field: () => "", input: () => "",
       select: () => "", CAMPAIGN_STATUSES: [], cfFieldsHtml: () => "",
       wireDraftRows: () => {}, draftContactRowHtml: () => "", draftCompanyRowHtml: () => "",
+      wireBulkBar: (...a: any[]) => { bulkCalls.push(a); }, renderBulkBar: () => {},
     };
+    const pipeFiltersT = { search: "", owner: "", stage: "", source: "", min_value: "" };
+    const applyPipeFiltersT = new Function(
+      "pipeFilters",
+      extractFn(appSrc, "applyPipeFilters") + "\nreturn (deals) => applyPipeFilters(deals);"
+    )(pipeFiltersT) as (deals: any[]) => any[];
+    const savedViewsHtmlT = () => "";
+    const dealFiltersHtmlT = () => "";
+    const wirePipeControlsT = () => {};
+    const bulkSelT = new Set<number>();
     await new Function(
       "GET", "view", "esc", "money", "moneyShort", "statusPill", "campaignPipelineStrip",
       "boardHtml", "filterBoardDeals", "campBoardFilter", "route", "newDealModal",
       "initDealDrag", "getSchemaFields", "openModal", "field", "input", "select",
       "CAMPAIGN_STATUSES", "cfFieldsHtml", "wireDraftRows", "draftContactRowHtml",
       "draftCompanyRowHtml", "state", "$", "document", "POST",
+      "applyPipeFilters", "savedViewsHtml", "dealFiltersHtml", "wirePipeControls",
+      "wireBulkBar", "renderBulkBar", "bulkSel", "pipeFilters",
+      "savedViewsCache", "dealSourcesCache", "dealOwnersCache",
       extractFn(appSrc, "vCampaigns") + "\nreturn vCampaigns();"
     )(
       stubs.GET, view, escT, moneyT, moneyShortT, statusPillT, stripT,
@@ -297,7 +313,10 @@ describe("vCampaigns DOM-stubbed render", () => {
       stubs.initDealDrag, stubs.getSchemaFields, stubs.openModal, stubs.field, stubs.input,
       stubs.select, stubs.CAMPAIGN_STATUSES, stubs.cfFieldsHtml, stubs.wireDraftRows,
       stubs.draftContactRowHtml, stubs.draftCompanyRowHtml,
-      stateT, $stub, docStub, async () => ({})
+      stateT, $stub, docStub, async () => ({}),
+      applyPipeFiltersT, savedViewsHtmlT, dealFiltersHtmlT, wirePipeControlsT,
+      stubs.wireBulkBar, stubs.renderBulkBar, bulkSelT, pipeFiltersT,
+      [], [], []
     );
     return { html, dragCalls };
   };

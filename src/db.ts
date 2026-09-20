@@ -182,6 +182,7 @@ CREATE TABLE IF NOT EXISTS sandbox_batches (
   workspace_id INTEGER REFERENCES workspaces(id),
   name TEXT NOT NULL,
   filename TEXT DEFAULT '',
+  source TEXT DEFAULT 'csv',
   status TEXT DEFAULT 'open',
   row_count INTEGER DEFAULT 0,
   created_at TEXT DEFAULT (datetime('now')),
@@ -203,6 +204,7 @@ CREATE TABLE IF NOT EXISTS sandbox_rows (
   dup_of_contact_id INTEGER DEFAULT 0,
   dup_of_row_id INTEGER DEFAULT 0,
   flags TEXT DEFAULT '[]',
+  extra_flags TEXT DEFAULT '[]',
   created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS deal_stage_history (
@@ -304,6 +306,17 @@ export function openDb(path: string): Database {
   const dealCols = db.query("PRAGMA table_info(deals)").all() as any[];
   if (!dealCols.some((c) => c.name === "source")) {
     db.exec("ALTER TABLE deals ADD COLUMN source TEXT DEFAULT ''");
+  }
+  // migration: sandbox batches gained a source type ('csv' or 'vcf'), and
+  // sandbox rows gained extra_flags (source-specific flags that survive
+  // re-analysis, e.g. vCard multi-email notes).
+  const sbBatchCols = db.query("PRAGMA table_info(sandbox_batches)").all() as any[];
+  if (!sbBatchCols.some((c) => c.name === "source")) {
+    db.exec("ALTER TABLE sandbox_batches ADD COLUMN source TEXT DEFAULT 'csv'");
+  }
+  const sbRowCols = db.query("PRAGMA table_info(sandbox_rows)").all() as any[];
+  if (!sbRowCols.some((c) => c.name === "extra_flags")) {
+    db.exec("ALTER TABLE sandbox_rows ADD COLUMN extra_flags TEXT DEFAULT '[]'");
   }
   for (const [t, sql] of [
     ["deal_stage_history", `CREATE TABLE deal_stage_history (

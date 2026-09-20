@@ -2158,18 +2158,21 @@ async function vSandbox(root) {
       <a class="btn ghost small" href="/api/contacts/import/template">CSV template</a>
     </div>
     <div class="sb-drop" id="sb-drop">
-      <div><b>Drop a contacts CSV here</b> or <label class="link" for="sb-file" style="cursor:pointer">choose a file</label></div>
-      <div class="sb-hint">Columns: name, email, phone, company, title, notes — extra columns are ignored. Staged rows stay out of your contacts until you approve them.</div>
-      <input type="file" id="sb-file" accept=".csv,text/csv" hidden>
+      <div><b>Drop a contacts file here</b> or <label class="link" for="sb-file" style="cursor:pointer">choose a file</label></div>
+      <div class="sb-hint">CSV or VCF (vCard) — columns: name, email, phone, company, title, notes; extra columns are ignored. Staged rows stay out of your contacts until you approve them.</div>
+      <input type="file" id="sb-file" accept=".csv,.vcf,text/csv,text/vcard" hidden>
     </div>
     <div id="sb-status"></div>
     <div class="sb-list">
       ${batches.map((b) => {
         const s = b.summary || {};
+        const srcBadge = b.source === "vcf"
+          ? `<span class="feed-pill" style="border-color:var(--brand);color:var(--brand)">VCF</span>`
+          : `<span class="feed-pill" style="border-color:var(--text-3);color:var(--text-3)">CSV</span>`;
         return `
         <div class="sb-card">
           <div class="info">
-            <div class="name">${esc(b.name)} ${b.status === "complete" ? `<span class="feed-pill" style="border-color:var(--ok);color:var(--ok)">imported</span>` : `<span class="feed-pill" style="border-color:var(--brand);color:var(--brand)">open</span>`}</div>
+            <div class="name">${esc(b.name)} ${srcBadge} ${b.status === "complete" ? `<span class="feed-pill" style="border-color:var(--ok);color:var(--ok)">imported</span>` : `<span class="feed-pill" style="border-color:var(--brand);color:var(--brand)">open</span>`}</div>
             <div class="sb-meta">${b.filename ? esc(b.filename) + " · " : ""}${esc((b.created_at || "").slice(0, 16).replace("T", " "))}</div>
             <div class="sb-counts"><span><b>${s.total || 0}</b> rows</span><span style="color:var(--ok)">${s.clean || 0} clean</span><span style="color:var(--urgent)">${s.duplicates || 0} duplicates</span><span style="color:var(--ctp-yellow)">${s.flagged || 0} flagged</span></div>
           </div>
@@ -2178,7 +2181,7 @@ async function vSandbox(root) {
             <button class="btn danger small" data-sb-del="${b.id}">Delete</button>
           </div>
         </div>`;
-      }).join("") || `<div class="empty">No imports yet — drop a CSV above to stage your first batch.</div>`}
+      }).join("") || `<div class="empty">No imports yet — drop a CSV or VCF above to stage your first batch.</div>`}
     </div>`;
 
   const readAndStage = (file) => {
@@ -2187,11 +2190,11 @@ async function vSandbox(root) {
     rd.onload = async () => {
       $("#sb-status").innerHTML = `<div class="empty">Analyzing ${esc(file.name)}…</div>`;
       try {
-        const { batch } = await POST("/api/sandbox/batches", {
-          name: file.name.replace(/\.csv$/i, ""),
-          filename: file.name,
-          csv: String(rd.result || ""),
-        });
+        const text = String(rd.result || "");
+        const isVcf = /\.vcf$/i.test(file.name) || /^\s*BEGIN:VCARD/im.test(text.slice(0, 500));
+        const payload = { name: file.name.replace(/\.(csv|vcf)$/i, ""), filename: file.name };
+        if (isVcf) payload.vcf = text; else payload.csv = text;
+        const { batch } = await POST("/api/sandbox/batches", payload);
         sbOpenBatch = batch.id;
         route();
       } catch (err) {
@@ -2233,7 +2236,7 @@ async function vSandboxDetail(el, batchId) {
       <button class="btn danger small" id="sb-del">Delete batch</button>` : ``}
     </div>
     <div class="camp-head">
-      <h2 style="margin:0">${esc(batch.name)}</h2>
+      <h2 style="margin:0">${esc(batch.name)} ${batch.source === "vcf" ? `<span class="feed-pill" style="border-color:var(--brand);color:var(--brand)">VCF</span>` : `<span class="feed-pill" style="border-color:var(--text-3);color:var(--text-3)">CSV</span>`}</h2>
       <div class="sb-meta">${batch.filename ? esc(batch.filename) + " · " : ""}staged ${esc((batch.created_at || "").slice(0, 16).replace("T", " "))}${batch.status === "complete" ? " · imported " + esc((batch.completed_at || "").slice(0, 16).replace("T", " ")) : ""}</div>
       <div class="sb-summary">
         <span><b>${s.total || 0}</b> rows</span>

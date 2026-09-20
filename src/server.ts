@@ -710,6 +710,149 @@ function parseCsv(text: string): string[][] {
   return rows.filter((r) => r.some((f) => f.trim() !== ""));
 }
 
+// ---- zero-dependency vCard parser (VCF 2.1 / 3.0 / 4.0) ----------------------
+// Deliberately written without TypeScript annotations so tests can eval the
+// extracted source directly. Returns one staged-row-shaped object per vCard:
+// { name, title, email, phone, company, notes, extraFlags }. Malformed input
+// never throws — bad cards produce rows flagged "malformed".
+function sbDecodeQP(s) {
+  // quoted-printable: strip soft line breaks, then decode =XX hex bytes.
+  // Bytes are re-assembled as UTF-8 (falling back to Latin-1) so
+  // =C3=BC decodes to ü rather than mojibake.
+  var bytes = [];
+  String(s || "").replace(/=\r?\n/g, "").replace(/=([0-9A-Fa-f]{2})|[\s\S]/g, function (m, h) {
+    bytes.push(h ? parseInt(h, 16) : m.charCodeAt(0) & 0xff);
+    return "";
+  });
+  var u8 = new Uint8Array(bytes);
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(u8); }
+  catch (e) {
+    var out = "";
+    for (var i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+    return out;
+  }
+}
+function sbB64decode(s) {
+  try { return atob(String(s || "").replace(/\s+/g, "")); }
+  catch (e) { return String(s || ""); }
+}
+function parseVcf(text) {
+  var norm = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  // Line unfolding: a line starting with a space or tab continues the
+  // previous line (RFC 2426 §5.8.1).
+  var lines = [];
+  var raw = norm.split("\n");
+  for (var li = 0; li < raw.length; li++) {
+    var rl = raw[li];
+    if (/^[ \t]/.test(rl) && lines.length) lines[lines.length - 1] += rl.slice(1);
+    else lines.push(rl);
+  }
+  // Split into cards. A BEGIN without a matching END (or a new BEGIN before
+  // the previous END) is parsed anyway and flagged malformed below — cards
+  // are never silently dropped.
+  var cards = [];
+  var cur = null;
+  for (var i = 0; i < lines.length; i++) {
+    var ln = lines[i];
+    if (/^BEGIN:VCARD/i.test(ln)) {
+      if (cur && cur.lines.length) { cur.bad = true; cards.push(cur); }
+      cur = { lines: [], bad: false };
+      continue;
+    }
+    if (/^END:VCARD/i.test(ln)) { if (cur) { cards.push(cur); cur = null; } continue; }
+    if (cur) cur.lines.push(ln);
+  }
+  if (cur && cur.lines.length) { cur.bad = true; cards.push(cur); }
+  var out = [];
+  for (var ci = 0; ci < cards.length; ci++) {
+    var props = cards[ci].lines;
+    var cardBad = cards[ci].bad;
+    var fn = "", n = "", org = "", title = "", noteParts = [];
+    var emails = [], phones = [];
+    var extraFlags = [];
+    for (var pi = 0; pi < props.length; pi++) {
+      var line = props[pi];
+      var cidx = line.indexOf(":");
+      if (cidx < 0) continue; // not a property line
+      var head = line.slice(0, cidx);
+      var val = line.slice(cidx + 1);
+      var parts = head.split(";");
+      var prop = parts[0].toUpperCase();
+      var params = {};
+      for (var qi = 1; qi < parts.length; qi++) {
+        var p = parts[qi];
+        var eq = p.indexOf("=");
+        if (eq < 0) {
+          // vCard 2.1 bare type, e.g. TEL;HOME;VOICE:555
+          params.TYPE = (params.TYPE ? params.TYPE + "," : "") + p.toUpperCase();
+        } else {
+          var k = p.slice(0, eq).toUpperCase();
+          var v = p.slice(eq + 1).toUpperCase();
+          params[k] = params[k] ? params[k] + "," + v : v;
+        }
+      }
+      if (prop === "PHOTO" || prop === "LOGO" || prop === "SOUND" || prop === "KEY") {
+        continue; // payloads are never stored
+      }
+      var enc = params.ENCODING || "";
+      if (enc === "QUOTED-PRINTABLE" || enc === "Q") val = sbDecodeQP(val);
+      else if (enc === "B" || enc === "BASE64") val = sbB64decode(val);
+      val = val.replace(/\\n/gi, "\n").replace(/\\,/g, ",").replace(/\\;/g, ";").replace(/\\\\/g, "\\");
+      if (prop === "FN") { if (!fn) fn = val.trim(); }
+      else if (prop === "N") { if (!n) n = val; }
+      else if (prop === "ORG") { if (!org) org = val.split(";")[0].trim(); }
+      else if (prop === "TITLE") { if (!title) title = val.trim(); }
+      else if (prop === "NOTE") { if (val.trim()) noteParts.push(val.trim()); }
+      else if (prop === "URL") { if (val.trim()) noteParts.push("Website: " + val.trim()); }
+      else if (prop === "ADR") {
+        var ac = val.split(";").map(function (x) { return x.trim(); }).filter(Boolean);
+        if (ac.length) noteParts.push("Address: " + ac.join(", "));
+      }
+      else if (prop === "EMAIL" && val.trim()) { emails.push({ value: val.trim(), type: params.TYPE || "" }); }
+      else if ((prop === "TEL" || prop === "X-ABPHONE") && val.trim()) { phones.push({ value: val.trim(), type: params.TYPE || "" }); }
+    }
+    var name = fn;
+    if (!name && n) {
+      var np = n.split(";");
+      name = [np[3] || "", np[1] || "", np[2] || "", np[0] || "", np[4] || ""]
+        .map(function (x) { return x.trim(); }).filter(Boolean).join(" ");
+    }
+    function pickPref(list, prefTypes) {
+      for (var t = 0; t < prefTypes.length; t++) {
+        for (var j = 0; j < list.length; j++) {
+          if (list[j].type.indexOf(prefTypes[t]) >= 0) return list[j];
+        }
+      }
+      return list[0] || null;
+    }
+    var emailPick = pickPref(emails, ["WORK", "INTERNET", "PREF"]);
+    var phonePick = pickPref(phones, ["CELL", "MOBILE", "WORK", "PREF", "VOICE"]);
+    var email = emailPick ? emailPick.value : "";
+    var phone = phonePick ? phonePick.value : "";
+    var notes = noteParts.join("\n");
+    if (emails.length > 1) {
+      var others = emails.filter(function (e) { return e !== emailPick; })
+        .map(function (e) { return e.value + (e.type ? " (" + e.type.toLowerCase() + ")" : ""); });
+      if (others.length) notes = (notes ? notes + "\n" : "") + "Other emails: " + others.join(", ");
+      extraFlags.push({ code: "multi-email", reason: "vCard has " + emails.length + " emails — kept " + email + ", noted the rest." });
+    }
+    if (phones.length > 1) {
+      var ophones = phones.filter(function (e) { return e !== phonePick; })
+        .map(function (e) { return e.value + (e.type ? " (" + e.type.toLowerCase() + ")" : ""); });
+      if (ophones.length) notes = (notes ? notes + "\n" : "") + "Other phones: " + ophones.join(", ");
+      extraFlags.push({ code: "multi-phone", reason: "vCard has " + phones.length + " phones — kept " + phone + ", noted the rest." });
+    }
+    if (cardBad) {
+      extraFlags.push({ code: "malformed", reason: "vCard is missing its END:VCARD line — parsed what could be read." });
+    }
+    if (!name && !email) {
+      extraFlags.push({ code: "unusable", reason: "No usable name or email — nothing to import from this card." });
+    }
+    out.push({ name: name, title: title, email: email, phone: phone, company: org, notes: notes, extraFlags: extraFlags });
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- server
 const server = Bun.serve({
   port: PORT,
@@ -1417,7 +1560,7 @@ const server = Bun.serve({
           dupContact = existing.find((c: any) => sbNamesMatch(c.name, r.name)) || null;
           if (!dupContact) dupRow = seen.find((s: any) => sbNamesMatch(s.name, r.name)) || null;
         }
-        const flags = sbFlagRow(r);
+        const flags = sbFlagRow(r).concat(JSON.parse(r.extra_flags || "[]"));
         const status = dupContact || dupRow ? "duplicate" : flags.length ? "flagged" : "clean";
         upd.run(status, dupContact ? dupContact.id : 0, dupRow ? dupRow.id : 0, JSON.stringify(flags), r.id);
         seen.push(r);
@@ -1442,43 +1585,62 @@ const server = Bun.serve({
       return s;
     }
     // POST /api/sandbox/batches { name?, filename?, csv } — stage a CSV import
+    // or { name?, filename?, vcf } — stage a vCard (.vcf) import. The filename
+    // may also carry the .vcf extension with the payload in `csv` (robustness).
     if (path === "/api/sandbox/batches" && method === "POST") {
       const w = needWs(req, url);
       if (w instanceof Response) return w;
       const b = await readBody(req);
-      const csv = String(b.csv || "");
-      if (csv.length > 5 * 1024 * 1024) return json({ error: "CSV is too large (5 MB max)" }, 400);
+      const rawCsv = String(b.csv || "");
+      const rawVcf = String(b.vcf || "");
+      const fname = String(b.filename || "");
+      const wantVcf = rawVcf.length > 0 || (/\.vcf$/i.test(fname) && /^\s*BEGIN:VCARD/mi.test(rawCsv));
+      const raw = wantVcf ? (rawVcf || rawCsv) : rawCsv;
+      if (!raw) return json({ error: "empty upload" }, 400);
+      if (raw.length > 5 * 1024 * 1024) return json({ error: `${wantVcf ? "VCF" : "CSV"} is too large (5 MB max)` }, 400);
       const warnings: string[] = [];
-      if (csv.includes("�")) warnings.push("Some characters could not be decoded — check the file encoding (UTF-8 works best).");
-      const firstLine = csv.split(/\r?\n/, 1)[0] || "";
-      if (firstLine && !firstLine.includes(",") && (firstLine.includes(";") || firstLine.includes("\t"))) {
-        return json({ error: "This looks like a semicolon/tab-delimited file — please export it as comma-separated CSV and try again." }, 400);
+      if (raw.includes("�")) warnings.push("Some characters could not be decoded — check the file encoding (UTF-8 works best).");
+      let staged: { name: string; title: string; email: string; phone: string; company: string; notes: string; extraFlags: SbFlag[] }[];
+      if (wantVcf) {
+        staged = parseVcf(raw);
+        if (!staged.length) return json({ error: "no vCards found in this file" }, 400);
+        if (staged.length > 5000) return json({ error: "too many vCards (5,000 max per batch)" }, 400);
+      } else {
+        const firstLine = raw.split(/\r?\n/, 1)[0] || "";
+        if (firstLine && !firstLine.includes(",") && (firstLine.includes(";") || firstLine.includes("\t"))) {
+          return json({ error: "This looks like a semicolon/tab-delimited file — please export it as comma-separated CSV and try again." }, 400);
+        }
+        const rows = parseCsv(raw);
+        if (!rows.length) return json({ error: "empty CSV" }, 400);
+        if (rows.length - 1 > 5000) return json({ error: "too many rows (5,000 max per batch)" }, 400);
+        const header = rows[0].map((h) => h.trim().toLowerCase());
+        const col = (...names: string[]) => {
+          for (const n of names) { const i = header.indexOf(n); if (i >= 0) return i; }
+          return -1;
+        };
+        const iName = col("name", "full name", "contact", "contact name", "fullname");
+        const iTitle = col("title", "job title", "role", "position");
+        const iCompany = col("company", "company name", "organization", "organisation");
+        const iEmail = col("email", "e-mail", "email address");
+        const iPhone = col("phone", "phone number", "tel", "mobile", "cell");
+        const iNotes = col("notes", "note", "comments", "comment", "memo");
+        const cell = (r: string[], i: number) => (i >= 0 ? (r[i] || "").trim() : "");
+        staged = rows.slice(1).map((r) => ({
+          name: cell(r, iName), title: cell(r, iTitle), email: cell(r, iEmail),
+          phone: cell(r, iPhone), company: cell(r, iCompany), notes: cell(r, iNotes),
+          extraFlags: [] as SbFlag[],
+        }));
       }
-      const rows = parseCsv(csv);
-      if (!rows.length) return json({ error: "empty CSV" }, 400);
-      if (rows.length - 1 > 5000) return json({ error: "too many rows (5,000 max per batch)" }, 400);
-      const header = rows[0].map((h) => h.trim().toLowerCase());
-      const col = (...names: string[]) => {
-        for (const n of names) { const i = header.indexOf(n); if (i >= 0) return i; }
-        return -1;
-      };
-      const iName = col("name", "full name", "contact", "contact name", "fullname");
-      const iTitle = col("title", "job title", "role", "position");
-      const iCompany = col("company", "company name", "organization", "organisation");
-      const iEmail = col("email", "e-mail", "email address");
-      const iPhone = col("phone", "phone number", "tel", "mobile", "cell");
-      const iNotes = col("notes", "note", "comments", "comment", "memo");
-      const cell = (r: string[], i: number) => (i >= 0 ? (r[i] || "").trim() : "");
       const name = String(b.name || "").trim() || `Import ${new Date().toISOString().slice(0, 10)}`;
       const batchId = Number(
-        db.prepare("INSERT INTO sandbox_batches (workspace_id, name, filename) VALUES (?, ?, ?)")
-          .run(w, name, String(b.filename || "").slice(0, 200)).lastInsertRowid
+        db.prepare("INSERT INTO sandbox_batches (workspace_id, name, filename, source) VALUES (?, ?, ?, ?)")
+          .run(w, name, fname.slice(0, 200), wantVcf ? "vcf" : "csv").lastInsertRowid
       );
       const ins = db.prepare(
-        "INSERT INTO sandbox_rows (batch_id, workspace_id, row_num, name, title, email, phone, company, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO sandbox_rows (batch_id, workspace_id, row_num, name, title, email, phone, company, notes, extra_flags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
       );
-      rows.slice(1).forEach((r, n) => {
-        ins.run(batchId, w, n + 1, cell(r, iName), cell(r, iTitle), cell(r, iEmail), cell(r, iPhone), cell(r, iCompany), cell(r, iNotes));
+      staged.forEach((s, n) => {
+        ins.run(batchId, w, n + 1, s.name, s.title, s.email, s.phone, s.company, s.notes, JSON.stringify(s.extraFlags || []));
       });
       sbAnalyzeBatch(batchId, w);
       const batch = db.query("SELECT * FROM sandbox_batches WHERE id = ?").get(batchId);
@@ -1547,7 +1709,11 @@ const server = Bun.serve({
       if (b.action === "approve-clean") {
         changed = Number(db.prepare("UPDATE sandbox_rows SET decision = 'approved' WHERE batch_id = ? AND workspace_id = ? AND status = 'clean' AND decision = 'pending'").run(batch.id, w).changes);
       } else if (b.action === "reject-duplicates") {
-        changed = Number(db.prepare("UPDATE sandbox_rows SET decision = 'rejected' WHERE batch_id = ? AND workspace_id = ? AND status = 'duplicate' AND decision = 'pending'").run(batch.id, w).changes);
+        // Also rejects vCard rows flagged unusable (no name and no email) —
+        // there is nothing worth importing in them.
+        changed = Number(db.prepare(
+          "UPDATE sandbox_rows SET decision = 'rejected' WHERE batch_id = ? AND workspace_id = ? AND decision = 'pending' AND (status = 'duplicate' OR flags LIKE '%\"code\":\"unusable\"%')"
+        ).run(batch.id, w).changes);
       } else {
         return json({ error: 'unknown action (use "approve-clean" or "reject-duplicates")' }, 400);
       }

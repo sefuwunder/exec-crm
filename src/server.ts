@@ -450,9 +450,12 @@ function defaultDashboardWidgets(w: number) {
   const weightedTotal = stages.reduce((a, s) => a + (byStage[s]?.wv || 0), 0);
 
   const forecast = {
-    kind: "bars", title: "Forecast by stage", source: "exec-crm:defaults", created_at: now,
+    kind: "bars", title: "Forecast", source: "exec-crm:defaults", created_at: now,
     payload: {
       format: "currency",
+      summary: mwMoneyShort(Math.round(weightedTotal)),
+      summary_label: "probability-weighted open pipeline",
+      summary_sub: `${deals.length} open deal${deals.length === 1 ? "" : "s"}`,
       items: stages.map((s) => ({ label: names[s] || s, value: Math.round(byStage[s]?.wv || 0) })),
     },
   };
@@ -513,11 +516,7 @@ function defaultDashboardWidgets(w: number) {
       ]),
     },
   };
-  return [
-    { kind: "stat", title: "Weighted forecast", source: "exec-crm:defaults", created_at: now,
-      payload: { value: mwMoneyShort(Math.round(weightedTotal)), label: "probability-weighted open pipeline", delta: `${deals.length} open deals` } },
-    forecast, analysis, hygiene, top,
-  ];
+  return [forecast, analysis, hygiene, top];
 }
 
 // Talk to Milton's existing chat API (session workspace pinned first so the
@@ -545,8 +544,10 @@ async function miltonChat(session: string, message: string, w: number, timeoutMs
   }
 }
 
-// Daily feed payload: structured suggestion sections from workspace data plus
-// Milton's "morning brief" take when reachable.
+// Daily feed payload: one chronological stream of CRM-derived suggestions
+// (blocked, due, prep, hygiene) plus Milton's "morning brief" take when
+// reachable. Dated items sort first, ascending; undated nudges follow.
+// A task that is both blocked and due appears once, as Blocked.
 async function dailyFeed(w: number) {
   const today = mwToday();
   const plus7 = (() => {
@@ -590,13 +591,13 @@ async function dailyFeed(w: number) {
   const prepDeals = new Map<number, any>();
   for (const t of plan) {
     const d = deals.find((x) => x.id === t.deal_id);
-    if (d) prepDeals.set(d.id, { deal: d, reason: `task due: ${t.title}` });
+    if (d) prepDeals.set(d.id, { deal: d, reason: `task due ${t.due_date}: ${t.title}`, date: t.due_date });
   }
   for (const d of closingSoon)
-    if (!prepDeals.has(d.id)) prepDeals.set(d.id, { deal: d, reason: `closes ${d.expected_close}` });
+    if (!prepDeals.has(d.id)) prepDeals.set(d.id, { deal: d, reason: `closes ${d.expected_close}`, date: d.expected_close });
   const seen = new Set<string>();
   const prep: any[] = [];
-  for (const { deal: d, reason } of prepDeals.values()) {
+  for (const { deal: d, reason, date } of prepDeals.values()) {
     const contact = d.contact_id
       ? (db.query("SELECT id, name, title, email, phone FROM contacts WHERE id = ? AND workspace_id = ?").get(d.contact_id, w) as any)
       : null;
@@ -605,33 +606,45 @@ async function dailyFeed(w: number) {
       : null;
     if (contact && !seen.has(`c${contact.id}`)) {
       seen.add(`c${contact.id}`);
-      prep.push({ kind: "contact", id: contact.id, name: contact.name,
+      prep.push({ kind: "contact", id: contact.id, name: contact.name, date,
         sub: [contact.title, contact.email].filter(Boolean).join(" · ") || "—",
         reason: `${d.title} — ${reason}` });
     }
     if (company && !seen.has(`o${company.id}`)) {
       seen.add(`o${company.id}`);
-      prep.push({ kind: "company", id: company.id, name: company.name,
+      prep.push({ kind: "company", id: company.id, name: company.name, date,
         sub: company.industry || company.website || "—",
         reason: `${d.title} — ${reason}` });
     }
   }
   const brief = await miltonChat("exec-crm-feed", "morning brief", w);
+  // One chronological stream: blocked > due > prep > hygiene rank breaks
+  // date ties; tasks that are both blocked and due appear once as Blocked.
+  const rank: Record<string, number> = { Blocked: 0, Plan: 1, Prep: 2, Hygiene: 3 };
+  const items: any[] = [];
+  const blockedIds = new Set(blocked.map((t: any) => t.id));
+  for (const t of blocked) items.push({
+    type: "task", label: "Blocked", date: t.due_date || null, task: taskOut(t),
+    blocked_by: (t.blocked_by || []).filter((b: any) => !b.done).map((b: any) => ({ id: b.id, title: b.title })),
+  });
+  for (const t of plan.filter((t: any) => !blockedIds.has(t.id))) items.push({
+    type: "task", label: "Plan", date: t.due_date || null, task: taskOut(t),
+  });
+  for (const p of prep) items.push({ type: "prep", label: "Prep", date: p.date || null, prep: p });
+  for (const d of hygieneDeals) items.push({
+    type: "deal", label: "Hygiene", date: d.expected_close || null, note: d.note, deal: d,
+  });
+  items.sort((a, b) => {
+    const da = a.date || "", db = b.date || "";
+    if (da && db && da !== db) return da < db ? -1 : 1;
+    if (!!da !== !!db) return da ? -1 : 1;
+    return (rank[a.label] ?? 9) - (rank[b.label] ?? 9);
+  });
   return {
     generated_at: new Date().toISOString(),
     milton: { available: !!brief, take: brief?.text || null },
-    sections: [
-      { id: "plan", title: "Today's plan",
-        items: plan.map((t: any) => ({ kind: "task", task: taskOut(t) })) },
-      { id: "prep", title: "Meeting prep", items: prep.map((p) => ({ kind: "prep", ...p })) },
-      { id: "hygiene", title: "Hygiene nudges",
-        items: hygieneDeals.map((d) => ({ kind: "deal", deal: d, note: d.note })) },
-      { id: "blocked", title: "Blocked tasks",
-        items: blocked.map((t: any) => ({
-          kind: "task", task: taskOut(t),
-          blocked_by: (t.blocked_by || []).filter((b: any) => !b.done).map((b: any) => ({ id: b.id, title: b.title })),
-        })) },
-    ],
+    due_count: plan.length,
+    items,
   };
 }
 // Deal/task shapes the feed frontend can hand straight to the edit modals.

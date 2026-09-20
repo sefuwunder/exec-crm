@@ -145,6 +145,157 @@ describe("data workshop (DOM-stubbed)", () => {
   });
 });
 
+describe("schema tab: pipeline stage CRUD (DOM-stubbed)", () => {
+  const esc = (s: any) =>
+    String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
+  const stages = [
+    { slug: "qualification", name: "Qualification", color: "#aaaaaa", deals: 0 },
+    { slug: "proposal", name: "Proposal", color: "#bbbbbb", deals: 2 },
+  ];
+  const setup = async () => {
+    let html = "";
+    const handlers: Record<string, any> = {};
+    const calls: { patch: any[]; del: string[]; modal: any[][]; stageModal: any[][] } =
+      { patch: [], del: [], modal: [], stageModal: [] };
+    const mk = (dataset: any) => ({
+      dataset,
+      set onclick(f: any) { handlers[JSON.stringify(dataset)] = f; },
+    });
+    const s: any = {
+      esc,
+      schemaEntity: "deal",
+      SCHEMA_ENTITIES: [["deal", "Deals"]],
+      view: { set innerHTML(v: string) { html = v; }, get innerHTML() { return html; } },
+      GET: async (p: string) => p === "/api/stages" ? { stages } : { fields: [] },
+      $: (sel: string) => mk({ id: sel }),
+      document: {
+        querySelectorAll: (sel: string) => {
+          if (sel === "#schema-seg button") return [];
+          if (sel === "[data-stage-move]") return stages.flatMap((st) =>
+            [mk({ stageMove: "-1", slug: st.slug }), mk({ stageMove: "1", slug: st.slug })]);
+          if (sel === "[data-stage-rename]") return stages.map((st) => mk({ stageRename: st.slug }));
+          if (sel === "[data-stage-del]") return stages.map((st) => mk({ stageDel: st.slug }));
+          return [];
+        },
+      },
+      route: () => {},
+      loadMeta: async () => {},
+      openModal: (...a: any[]) => { calls.modal.push(a); },
+      stageModal: (...a: any[]) => { calls.stageModal.push(a); },
+      field: (l: string, i: string) => l + i,
+      select: () => "select",
+      input: () => "input",
+      PATCH: async (p: string, b: any) => { calls.patch.push([p, b]); },
+      DEL: async (p: string) => { calls.del.push(p); },
+      confirm: () => true,
+    };
+    const fn = new Function(...Object.keys(s), `${extractFn(appSrc, "vSchema")}; return vSchema;`)(...Object.values(s));
+    await fn();
+    return { html, handlers, calls };
+  };
+  const key = (d: any) => JSON.stringify(d);
+  test("stages render with counts, move, rename and delete controls", async () => {
+    const { html } = await setup();
+    expect(html).toContain("Pipeline stages");
+    expect(html).toContain("Qualification");
+    expect(html).toContain("Proposal");
+    expect(html).toContain("2 deals");
+    expect(html).toContain('data-stage-del="proposal"');
+    expect(html).toContain('data-stage-rename="qualification"');
+    expect(html).toContain('data-stage-move="-1"');
+    expect(html).toContain("+ New stage");
+  });
+  test("reorder issues PATCH with before/after", async () => {
+    const { handlers, calls } = await setup();
+    await handlers[key({ stageMove: "-1", slug: "proposal" })](); // move Proposal above Qualification
+    expect(calls.patch).toEqual([["/api/stages/proposal", { before: "qualification" }]]);
+    await handlers[key({ stageMove: "1", slug: "qualification" })]();
+    expect(calls.patch[1]).toEqual(["/api/stages/qualification", { after: "proposal" }]);
+  });
+  test("rename opens the stage modal", async () => {
+    const { handlers, calls } = await setup();
+    await handlers[key({ stageRename: "proposal" })]();
+    expect(calls.stageModal).toHaveLength(1);
+    expect(calls.stageModal[0][0].slug).toBe("proposal");
+  });
+  test("+ New stage button opens the add modal", async () => {
+    const { handlers, calls } = await setup();
+    await handlers[key({ id: "#new-stage" })]();
+    expect(calls.stageModal).toHaveLength(1);
+    expect(calls.stageModal[0][0]).toBeNull(); // add mode
+    expect(calls.stageModal[0][1]).toHaveLength(2); // current stages for positioning
+  });
+  test("deleting an empty stage confirms and DELETEs directly", async () => {
+    const { handlers, calls } = await setup();
+    await handlers[key({ stageDel: "qualification" })]();
+    expect(calls.del).toEqual(["/api/stages/qualification"]);
+    expect(calls.modal).toHaveLength(0);
+  });
+  test("deleting a populated stage asks for move_to first, then DELETEs with it", async () => {
+    const { handlers, calls } = await setup();
+    await handlers[key({ stageDel: "proposal" })]();
+    expect(calls.del).toHaveLength(0); // no direct delete
+    expect(calls.modal).toHaveLength(1); // move_to picker instead
+    const onSubmit = calls.modal[0][2];
+    await onSubmit({ move_to: "qualification" });
+    expect(calls.del).toEqual(["/api/stages/proposal?move_to=qualification"]);
+  });
+});
+
+describe("stageModal submit (DOM-stubbed)", () => {
+  const esc = (s: any) =>
+    String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
+  const stages = [
+    { slug: "qualification", name: "Qualification", color: "#aaaaaa", deals: 0 },
+    { slug: "proposal", name: "Proposal", color: "#bbbbbb", deals: 2 },
+  ];
+  const setup = () => {
+    const calls: { openModal: any[][]; post: any[]; patch: any[]; meta: number; routed: number } =
+      { openModal: [], post: [], patch: [], meta: 0, routed: 0 };
+    const s: any = {
+      esc,
+      field: (l: string, i: string) => l + i,
+      select: () => "select",
+      input: () => "input",
+      ctp: () => "#0000ff",
+      openModal: (...a: any[]) => { calls.openModal.push(a); },
+      POST: async (p: string, b: any) => { calls.post.push([p, b]); },
+      PATCH: async (p: string, b: any) => { calls.patch.push([p, b]); },
+      loadMeta: async () => { calls.meta++; },
+      route: () => { calls.routed++; },
+    };
+    const stageModal = new Function(...Object.keys(s),
+      `${extractFn(appSrc, "stageModal")}; return stageModal;`)(...Object.values(s));
+    return { stageModal, calls };
+  };
+  test("add mode posts name, honoring before/after position", async () => {
+    const { stageModal, calls } = setup();
+    stageModal(null, stages);
+    expect(calls.openModal).toHaveLength(1);
+    expect(calls.openModal[0][0]).toBe("New pipeline stage");
+    expect(calls.openModal[0][3]).toBe("Add stage");
+    const onSubmit = calls.openModal[0][2];
+    await onSubmit({ name: "Discovery", position: "end" });
+    expect(calls.post).toEqual([["/api/stages", { name: "Discovery" }]]);
+    await onSubmit({ name: "Discovery", position: "before:qualification" });
+    expect(calls.post[1]).toEqual(["/api/stages", { name: "Discovery", before: "qualification" }]);
+    await onSubmit({ name: "Discovery", position: "after:proposal" });
+    expect(calls.post[2]).toEqual(["/api/stages", { name: "Discovery", after: "proposal" }]);
+    expect(calls.meta).toBe(3);
+    expect(calls.routed).toBe(3);
+  });
+  test("rename mode patches name and color", async () => {
+    const { stageModal, calls } = setup();
+    stageModal(stages[1], stages);
+    expect(calls.openModal[0][0]).toBe('Rename stage "Proposal"');
+    expect(calls.openModal[0][3]).toBe("Save");
+    await calls.openModal[0][2]({ name: "Closing", color: "#ff0000" });
+    expect(calls.patch).toEqual([["/api/stages/proposal", { name: "Closing", color: "#ff0000" }]]);
+    expect(calls.meta).toBe(1);
+    expect(calls.routed).toBe(1);
+  });
+});
+
 describe("dashboard widgets (DOM-stubbed)", () => {
   const esc = (s: any) =>
     String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
@@ -155,7 +306,8 @@ describe("dashboard widgets (DOM-stubbed)", () => {
     return "$" + Math.round(n);
   };
   const mwRelTime = () => "just now";
-  const scope: any = { esc, moneyShort, mwRelTime };
+  const mwFormatBarValue = (v: any, format: string) => format === "currency" ? moneyShort(Number(v) || 0) : String(v);
+  const scope: any = { esc, moneyShort, mwRelTime, mwFormatBarValue };
   const load = (name: string) => {
     const fn = new Function(...Object.keys(scope), `${extractFn(appSrc, name)}; return ${name};`)(...Object.values(scope));
     scope[name] = fn;
@@ -177,20 +329,56 @@ describe("dashboard widgets (DOM-stubbed)", () => {
       $: (sel: string) => (sel === "#dash-widgets"
         ? { set innerHTML(v: string) { html = v; }, get innerHTML() { return html; }, querySelectorAll: () => [] }
         : null),
-      GET: async (p: string) => p === "/api/milton/widgets"
-        ? { widgets: [{ id: 7, kind: "stat", title: "Pinned one", created_at: Date.now(), payload: { value: "x", label: "y" } }] }
-        : { widgets: [{ kind: "bars", title: "Forecast by stage", created_at: Date.now(), payload: { format: "currency", items: [] } }] },
+      GET: async () => ({
+        widgets: [
+          { id: 7, kind: "stat", title: "Pinned one", created_at: Date.now(), payload: { value: "x", label: "y" } },
+          { kind: "bars", title: "Forecast", created_at: Date.now(), payload: { format: "currency", items: [] } },
+        ],
+      }),
     };
     const fn = new Function(...Object.keys(s), `${extractFn(appSrc, "loadDashboardWidgets")}; return loadDashboardWidgets;`)(...Object.values(s));
     await fn();
     expect(html).toContain("Pinned");
     expect(html).toContain("Suggested");
     expect(html).toContain("Pinned one");
-    expect(html).toContain("Forecast by stage");
+    expect(html).toContain("Forecast");
     expect(html).toContain('data-mw-del="7"');
     // the suggested widget must not carry a delete button
     const suggested = html.slice(html.indexOf("Suggested"));
     expect(suggested).not.toContain("data-mw-del");
+  });
+  test("loadDashboardWidgets: pinned widgets render exactly once", async () => {
+    const mwCardHtml = load("mwCardHtml");
+    let html = "";
+    const s: any = {
+      ...scope,
+      $: () => ({ set innerHTML(v: string) { html = v; }, get innerHTML() { return html; }, querySelectorAll: () => [] }),
+      GET: async () => ({
+        widgets: [
+          { id: 7, kind: "stat", title: "Pinned one", created_at: Date.now(), payload: { value: "x", label: "y" } },
+          { kind: "list", title: "Hygiene summary", created_at: Date.now(), payload: { items: [] } },
+        ],
+      }),
+    };
+    const fn = new Function(...Object.keys(s), `${extractFn(appSrc, "loadDashboardWidgets")}; return loadDashboardWidgets;`)(...Object.values(s));
+    await fn();
+    // pinned appears once (in the Pinned group), never duplicated into Suggested
+    expect(html.match(/Pinned one/g)!.length).toBe(1);
+    expect(html.indexOf("Pinned one")).toBeLessThan(html.indexOf("Suggested"));
+  });
+  test("mwCardHtml: bars widget with summary renders the weighted total", () => {
+    const mwCardHtml = load("mwCardHtml");
+    const w = {
+      kind: "bars", title: "Forecast", created_at: Date.now(),
+      payload: { format: "currency", summary: "$25k", summary_label: "probability-weighted pipeline",
+        summary_sub: "1 open deal", items: [{ label: "Proposal", value: 25000 }] },
+    };
+    const html = mwCardHtml(w);
+    expect(html).toContain("mw-bars-summary");
+    expect(html).toContain("$25k");
+    expect(html).toContain("probability-weighted pipeline");
+    expect(html).toContain("Proposal");
+    expect(html).not.toContain("data-mw-del");
   });
   test("loadDashboardWidgets: API failure degrades to an empty state", async () => {
     let html = "";
@@ -211,26 +399,35 @@ describe("daily feed (DOM-stubbed)", () => {
   const money = (n: any) => "$" + Math.round(Number(n) || 0).toLocaleString("en-US");
   const toISODate = (d: Date) =>
     `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-  const stageFunnelColor = () => "var(--phase-early)";
-  const taskRow = (t: any) => `<div class="task"><input type="checkbox" data-id="${t.id}"><span>${esc(t.title)}</span></div>`;
+  // chronological stream: dated first by date, label rank breaks ties
   const feed = {
     milton: { available: true, take: "**2 open deals** worth **$50k**.\nDue today: Call Acme" },
-    sections: [
-      { id: "plan", title: "Today's plan", items: [{ kind: "task", task: { id: 1, title: "Call Acme", done: false, due_date: "2026-09-20", owner: "You" } }] },
-      { id: "prep", title: "Meeting prep", items: [{ kind: "prep", name: "Dana", sub: "CEO", reason: "Acme deal — closes 2026-09-25" }] },
-      { id: "hygiene", title: "Hygiene nudges", items: [{ kind: "deal", note: "untouched 45 days", deal: { id: 3, title: "Stale deal", value: 1000, stage: "proposal", stage_name: "Proposal", expected_close: "", company_name: "Acme" } }] },
-      { id: "blocked", title: "Blocked tasks", items: [{ kind: "task", blocked_by: [{ id: 9, title: "First step" }], task: { id: 2, title: "Blocked thing", done: false, owner: "You" } }] },
+    due_count: 2,
+    items: [
+      { type: "task", label: "Blocked", date: "2026-09-19",
+        task: { id: 2, title: "Blocked thing", done: false, owner: "You", due_date: "2026-09-19" },
+        blocked_by: [{ id: 9, title: "First step" }] },
+      { type: "task", label: "Plan", date: "2026-09-20",
+        task: { id: 1, title: "Call Acme", done: false, due_date: "2026-09-20", owner: "You" } },
+      { type: "prep", label: "Prep", date: "2026-09-25",
+        prep: { kind: "contact", id: 4, name: "Dana", sub: "CEO", reason: "Acme deal \u2014 closes 2026-09-25" } },
+      { type: "deal", label: "Hygiene", date: null, note: "untouched 45 days",
+        deal: { id: 3, title: "Stale deal", value: 1000, stage: "proposal", stage_name: "Proposal", expected_close: "", company_name: "Acme" } },
     ],
   };
   const runFeed = async (feedPayload: any) => {
     let html = "";
-    const handlers: Record<string, any> = {};
+    const FEED_LABEL_STYLE = {
+      Blocked: "var(--ctp-red)", Plan: "var(--phase-middle)",
+      Prep: "var(--phase-early)", Hygiene: "var(--ctp-yellow)",
+    };
     const s: any = {
-      esc, money, toISODate, stageFunnelColor, taskRow,
+      esc, money, toISODate, FEED_LABEL_STYLE,
       view: { set innerHTML(v: string) { html = v; }, get innerHTML() { return html; } },
       GET: async (p: string) => p === "/api/daily-feed" ? feedPayload : { deals: [] },
       POST: async () => ({}),
-      wireTaskRows: () => {},
+      toggleTask: async () => null,
+      editTaskModal: () => {},
       editDealModal: () => {},
       route: () => {},
       $: (sel: string) => sel === "#qa-title"
@@ -239,35 +436,46 @@ describe("daily feed (DOM-stubbed)", () => {
       document: { querySelectorAll: () => [] },
       location: { hash: "" },
     };
-    const fn = new Function(...Object.keys(s), `${extractFn(appSrc, "vFeed")}; return vFeed;`)(...Object.values(s));
+    const fn = new Function(...Object.keys(s),
+      `${extractFn(appSrc, "feedItemHtml")}\n${extractFn(appSrc, "vFeed")}; return vFeed;`)(...Object.values(s));
     await fn();
     return html;
   };
-  test("feed renders Milton take + all four sections with items", async () => {
+  test("feed renders one chronological stream with label pills", async () => {
     const html = await runFeed(feed);
     expect(html).toContain("Milton's take");
     expect(html).toContain("<b>2 open deals</b>");
-    expect(html).toContain("Today&#39;s plan");
-    expect(html).toContain("Meeting prep");
-    expect(html).toContain("Hygiene nudges");
-    expect(html).toContain("Blocked tasks");
-    expect(html).toContain("Call Acme");
-    expect(html).toContain("Stale deal");
-    expect(html).toContain("untouched 45 days");
+    expect(html).toContain("Today's stream");
+    // one stream, not four sections
+    expect(html).not.toContain("Today's plan");
+    expect(html).not.toContain("Meeting prep");
+    // label pills present
+    for (const label of ["Blocked", "Plan", "Prep", "Hygiene"]) expect(html).toContain(label);
+    expect(html).toContain("feed-pill");
+    // chronological: blocked (2026-09-19) before plan (2026-09-20) before prep (2026-09-25), undated hygiene last
+    // (scoped to the stream panel — the Milton take above also names these tasks)
+    const stream = html.slice(html.indexOf("Today's stream"));
+    const order = ["Blocked thing", "Call Acme", "Dana", "Stale deal"].map((t) => stream.indexOf(t));
+    expect(order.every((i) => i >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
     expect(html).toContain("blocked by First step");
-    expect(html).toContain("Dana");
+    expect(html).toContain("untouched 45 days");
+    expect(html).toContain("data-task-id");
+    expect(html).toContain("data-deal-open");
+    expect(html).toContain("Quick add a task");
+    // header counts due tasks
+    expect(html).toContain("<b>2</b>");
   });
   test("Milton down: feed degrades to a plain unavailable note", async () => {
     const html = await runFeed({ ...feed, milton: { available: false, take: null } });
     expect(html).toContain("Milton is unreachable");
-    expect(html).toContain("Today&#39;s plan");
     expect(html).toContain("Call Acme");
+    expect(html).toContain("Stale deal");
   });
-  test("feedSection helper finds sections by id", () => {
-    const s: any = { esc };
-    const fn = new Function(...Object.keys(s), `${extractFn(appSrc, "feedSection")}; return feedSection;`)(...Object.values(s));
-    expect(fn(feed, "prep").title).toBe("Meeting prep");
-    expect(fn(feed, "missing").items).toEqual([]);
+  test("empty stream renders the all-clear state", async () => {
+    const html = await runFeed({ milton: { available: false, take: null }, due_count: 0, items: [] });
+    expect(html).toContain("Nothing due");
+    expect(html).toContain("clear runway");
   });
 });
 
@@ -332,18 +540,19 @@ describe("menu restructure API", () => {
     const { status, data } = await api("GET", "/api/dashboard/widgets", undefined, wsId);
     expect(status).toBe(200);
     const titles = data.widgets.map((w: any) => w.title);
-    expect(titles).toContain("Forecast by stage");
-    expect(titles).toContain("Pipeline analysis");
-    expect(titles).toContain("Hygiene summary");
-    expect(titles).toContain("Top deals");
-    expect(titles).toContain("Weighted forecast");
+    // one merged forecast card, four defaults total
+    expect(titles).toEqual(["Forecast", "Pipeline analysis", "Hygiene summary", "Top deals"]);
     for (const w of data.widgets) {
       expect(["stat", "table", "bars", "list"]).toContain(w.kind);
       expect(w.payload).toBeTruthy();
     }
-    const forecast = data.widgets.find((w: any) => w.title === "Forecast by stage");
+    const forecast = data.widgets.find((w: any) => w.title === "Forecast");
     expect(forecast.payload.items.length).toBeGreaterThan(0);
     expect(forecast.payload.format).toBe("currency");
+    // weighted total rides on the merged card
+    expect(forecast.payload.summary).toMatch(/\$/);
+    expect(forecast.payload.summary_label).toContain("probability-weighted");
+    expect(forecast.payload.summary_sub).toMatch(/open deals?/);
     const top = data.widgets.find((w: any) => w.title === "Top deals");
     expect(top.payload.headers).toEqual(["Deal", "Company", "Stage", "Value"]);
   });
@@ -366,7 +575,7 @@ describe("menu restructure API", () => {
     expect(camps[0].date).toMatch(/^2026-10-/);
   });
 
-  test("daily-feed: sections render, Milton down degrades gracefully", async () => {
+  test("daily-feed: one chronological stream, Milton down degrades gracefully", async () => {
     const today = new Date();
     const iso = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
     const todayS = iso(today);
@@ -390,15 +599,33 @@ describe("menu restructure API", () => {
     expect(ms).toBeLessThan(10000); // Milton unreachable must not hang the feed
     expect(data.milton.available).toBe(false);
     expect(data.milton.take).toBeNull();
-    const byId = Object.fromEntries(data.sections.map((s: any) => [s.id, s]));
-    expect(Object.keys(byId).sort()).toEqual(["blocked", "hygiene", "plan", "prep"]);
-    expect(byId.plan.items.map((i: any) => i.task.title)).toContain("Feed task today");
-    expect(byId.plan.items.map((i: any) => i.task.title)).toContain("Feed task overdue");
-    const blockedItem = byId.blocked.items.find((i: any) => i.task.title === "Feed blocked task");
+    expect(data.due_count).toBeGreaterThanOrEqual(3);
+    const items = data.items;
+    expect(Array.isArray(items)).toBe(true);
+    expect(items.length).toBeGreaterThan(0);
+    // one stream: dated items first, ascending; undated nudges last
+    const dated = items.filter((i: any) => i.date);
+    const undated = items.filter((i: any) => !i.date);
+    expect(dated.length + undated.length).toBe(items.length);
+    const dates = dated.map((i: any) => i.date);
+    expect([...dates].sort()).toEqual(dates);
+    if (undated.length) expect(items.slice(-undated.length)).toEqual(undated);
+    // a task that is both blocked and due appears once, as Blocked
+    const blockedItem = items.find((i: any) => i.type === "task" && i.task?.title === "Feed blocked task");
     expect(blockedItem).toBeTruthy();
+    expect(blockedItem.label).toBe("Blocked");
+    expect(items.filter((i: any) => i.type === "task" && i.task?.title === "Feed blocked task")).toHaveLength(1);
     expect(blockedItem.blocked_by.map((b: any) => b.title)).toContain("Feed predecessor");
-    expect(byId.hygiene.items.some((i: any) => i.deal.title === "Feed stale deal")).toBe(true);
-    expect(byId.prep.items.some((p: any) => p.name === "Feed Contact")).toBe(true);
+    // due tasks present in the stream
+    const planItems = items.filter((i: any) => i.type === "task");
+    expect(planItems.map((i: any) => i.task.title)).toContain("Feed task today");
+    expect(planItems.map((i: any) => i.task.title)).toContain("Feed task overdue");
+    // prep + hygiene entries
+    expect(items.some((i: any) => i.type === "deal" && i.deal?.title === "Feed stale deal")).toBe(true);
+    const prepItem = items.find((i: any) => i.type === "prep" && i.prep?.name === "Feed Contact");
+    expect(prepItem).toBeTruthy();
+    expect(prepItem.date).toBeTruthy(); // prep carries its relevant date
+    expect(items.some((i: any) => i.type === "deal" && i.deal?.title === "Feed closing deal")).toBe(false);
     expect(t1.id).toBeGreaterThan(0);
     expect(closing.id).toBeGreaterThan(0);
   });

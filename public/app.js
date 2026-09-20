@@ -598,21 +598,22 @@ async function vDashboard() {
 /* Dashboard widget section: user-pinned Milton widgets first, then the default
    set (forecast, pipeline analysis, hygiene, top deals) computed server-side.
    The defaults always render — no Milton round-trip required. */
+/* Dashboard Milton widgets: single source GET /api/dashboard/widgets. Pinned
+   widgets (Milton-saved, carry ids) render first and are deletable; the
+   server-computed defaults render after, without delete buttons. */
 async function loadDashboardWidgets() {
   const root = $("#dash-widgets");
   if (!root) return;
-  let pinned = [], defaults = [];
+  let widgets = [];
   try {
-    const [p, d] = await Promise.all([
-      GET("/api/milton/widgets"),
-      GET("/api/dashboard/widgets"),
-    ]);
-    pinned = p.widgets || [];
-    defaults = d.widgets || [];
+    const d = await GET("/api/dashboard/widgets");
+    widgets = d.widgets || [];
   } catch (e) {
     root.innerHTML = `<div class="empty">Couldn't load widgets: ${esc(e.message)}</div>`;
     return;
   }
+  const pinned = widgets.filter((w) => w.id != null);
+  const defaults = widgets.filter((w) => w.id == null);
   const group = (label, ws, deletable) => ws.length ? `
     <div class="mw-sub">${esc(label)}</div>
     <div class="mw-grid">${ws.map((w) => mwCardHtml(w, { deletable })).join("")}</div>` : "";
@@ -2001,115 +2002,110 @@ async function vCalendar() {
   await mountCalendar($("#cal-root"), "global", null, { onItem: openCalItem });
 }
 
-/* ---------- daily feed: what needs you today ---------- */
-async function vFeed() {
-  const now = new Date();
-  const today = toISODate(now);
-  const h = now.getHours();
-  const greet = h < 5 ? "Still up" : h < 12 ? "Good morning" : h < 17 ? "Good afternoon" : "Good evening";
-  let feed;
-  try {
-    feed = await GET("/api/daily-feed");
-  } catch (e) {
-    view.innerHTML = `<div class="empty">Couldn't load the daily feed: ${esc(e.message)}</div>`;
-    return;
+/* ---------- daily feed: what needs you today ----------
+   One chronological stream (blocked → due → prep → hygiene) of CRM-derived
+   suggestions, plus Milton's take when reachable. Dated items sort first,
+   ascending; undated nudges follow. Task cards keep the same
+   checkbox/edit-modal behavior as the Tasks view. */
+const FEED_LABEL_STYLE = {
+  Blocked: "var(--urgent)",
+  Plan: "var(--phase-middle)",
+  Prep: "var(--phase-early)",
+  Hygiene: "var(--ctp-yellow)",
+};
+function feedItemHtml(it) {
+  const pillColor = FEED_LABEL_STYLE[it.label] || "var(--text-3)";
+  const pill = `<span class="feed-pill" style="border-color:${pillColor};color:${pillColor}">${esc(it.label)}</span>`;
+  let main = "", actions = "";
+  if (it.type === "task") {
+    const t = it.task || {};
+    const blocked = Array.isArray(it.blocked_by) && it.blocked_by.length
+      ? `blocked by ${esc(it.blocked_by.map((b) => b.title).join(", "))}` : "";
+    const today = toISODate(new Date());
+    const when = !t.due_date ? "no due date"
+      : t.due_date < today ? `overdue since ${esc(t.due_date)}`
+      : `due ${esc(t.due_date)}`;
+    const sub = [blocked, when, t.owner ? esc(t.owner) : ""].filter(Boolean).join(" · ");
+    main = `<b>${esc(t.title)}</b><br>
+      <span style="color:var(--text-3);font-size:12.5px">${sub}</span>`;
+    actions = `<input type="checkbox" data-task-id="${t.id}" ${t.done ? "checked" : ""} aria-label="Mark done">
+      <button class="btn ghost small" data-edit="${t.id}">Edit</button>`;
+  } else if (it.type === "prep") {
+    const p = it.prep || {};
+    const href = p.kind === "company" ? `#/companies?q=${encodeURIComponent(p.name || "")}` : `#/contacts?q=${encodeURIComponent(p.name || "")}`;
+    // the reason already carries its relevant date ("task due 2026-09-11: …" / "closes 2026-09-25")
+    main = `<b>${esc(p.name)}</b><br>
+      <span style="color:var(--text-3);font-size:12.5px">${esc(p.sub || "")} · ${esc(p.reason || "")}</span>`;
+    actions = `<a class="btn ghost small" style="text-decoration:none" href="${href}">Open</a>`;
+  } else if (it.type === "deal") {
+    const d = it.deal || {};
+    main = `<b>${esc(d.title)}</b>${d.company_name ? ` · ${esc(d.company_name)}` : ""}<br>
+      <span style="color:var(--text-3);font-size:12.5px">${money(d.value)} · ${esc(d.stage_name || d.stage || "")} · ${esc(it.note || "")}</span>`;
+    actions = `<button class="btn ghost small" data-deal-open="${d.id}">Open</button>`;
   }
-  const byId = Object.fromEntries(feed.sections.map((s) => [s.id, s]));
-  const planTasks = (byId.plan?.items || []).map((i) => i.task).filter(Boolean);
-  const blockedTasks = (byId.blocked?.items || []).map((i) => i.task).filter(Boolean);
-  const allTasks = [...new Map([...planTasks, ...blockedTasks].map((t) => [t.id, t])).values()];
-  const [{ deals }] = await Promise.all([GET("/api/deals")]).catch(() => [{ deals: [] }]);
-
-  // Milton's chat text uses **bold** — tiny inline renderer for the take card.
-  const md = (s) => esc(s || "")
-    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
-    .replace(/\n/g, "<br>");
-  const takeHtml = feed.milton.available && feed.milton.take
-    ? `<div class="panel feed-take"><h2>\u2726 Milton's take</h2><div class="feed-take-text">${md(feed.milton.take)}</div></div>`
-    : `<div class="panel feed-take"><h2>\u2726 Milton's take</h2>
-        <div class="empty">Milton is unreachable right now — the suggestions below are computed from your CRM data.</div></div>`;
-
-  const dealRow = (d, note) => `
-    <div class="feed-item">
-      <div class="dot" style="background:${stageFunnelColor(d.stage)}"></div>
-      <div class="text"><b>${esc(d.title)}</b> · ${esc(d.company_name || "")}<br>
-        <span style="color:var(--text-3);font-size:12.5px">${money(d.value)} · ${esc(d.stage_name || d.stage)}${d.expected_close ? ` · closes ${esc(d.expected_close)}` : ""}${note ? ` · ${esc(note)}` : ""}</span></div>
-      <div class="spacer"></div>
-      <button class="btn ghost small" data-deal-open="${d.id}">Open</button>
-    </div>`;
-
-  const blockedRow = (item) => {
-    const t = item.task;
-    return `
-    <div class="feed-item">
-      <div class="dot" style="background:var(--ctp-red)"></div>
-      <div class="text"><b>${esc(t.title)}</b><br>
-        <span style="color:var(--text-3);font-size:12.5px">blocked by ${item.blocked_by.map((b) => esc(b.title)).join(", ") || "—"}</span></div>
-      <div class="spacer"></div>
-      <button class="btn ghost small" data-edit="${t.id}">Edit</button>
-    </div>`;
-  };
-
-  const prepRow = (p) => `
-    <div class="feed-item">
-      <div class="dot" style="background:var(--phase-early)"></div>
-      <div class="text"><b>${esc(p.name)}</b><br>
-        <span style="color:var(--text-3);font-size:12.5px">${esc(p.sub || "")}${p.reason ? ` · ${esc(p.reason)}` : ""}</span></div>
-      <div class="spacer"></div>
-      <a class="btn ghost small" style="text-decoration:none" href="#/${p.kind === "company" ? "companies" : "contacts"}${p.kind === "contact" ? `?q=${encodeURIComponent(p.name)}` : ""}">Open</a>
-    </div>`;
-
-  const section = (s, body, emptyMsg) => `
-    <div class="panel"><h2>${esc(s.title)} <span class="count">${s.items.length}</span></h2>
-      ${s.items.length ? body : `<div class="empty">${emptyMsg}</div>`}
-    </div>`;
-
+  return `<div class="feed-item">
+    <div class="feed-item-main">${pill}<div class="text">${main}</div></div>
+    <div class="spacer"></div>
+    ${actions}
+  </div>`;
+}
+async function vFeed() {
+  const feed = await GET("/api/daily-feed").catch(() => ({
+    milton: { available: false, take: null }, due_count: 0, items: [],
+  }));
+  const items = Array.isArray(feed.items) ? feed.items : [];
+  const now = new Date();
+  const dow = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][now.getDay()];
+  const hr = now.getHours();
+  const greet = hr < 12 ? "Good morning" : hr < 18 ? "Good afternoon" : "Good evening";
   view.innerHTML = `
     <div class="feed-head">
       <div>
         <div class="feed-greet">${greet}</div>
-        <div class="feed-sub">${now.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })} ·
-          ${planTasks.length ? `<b>${planTasks.length}</b> thing${planTasks.length === 1 ? "" : "s"} need${planTasks.length === 1 ? "s" : ""} you today` : "nothing due — clear runway"}</div>
+        <div class="feed-sub">${dow}, ${now.toLocaleDateString(undefined, { month: "long", day: "numeric" })} ·
+          <b>${feed.due_count || 0}</b> things need you today</div>
       </div>
       <div class="feed-add">
-        <input id="qa-title" placeholder="Quick add a task for today\u2026" autocomplete="off">
+        <input id="qa-title" placeholder="Quick add a task for today…" autocomplete="off">
         <button class="btn" id="qa-add">Add</button>
       </div>
     </div>
-    ${takeHtml}
-    <div class="cols2">
-      <div>
-        ${section(byId.plan || { title: "Today's plan", items: [] }, planTasks.map(taskRow).join(""), "Nothing due today.")}
-        ${section(byId.blocked || { title: "Blocked tasks", items: [] }, (byId.blocked?.items || []).map(blockedRow).join(""), "Nothing blocked.")}
-      </div>
-      <div>
-        ${section(byId.prep || { title: "Meeting prep", items: [] }, (byId.prep?.items || []).map(prepRow).join(""), "No meetings on today's radar.")}
-        ${section(byId.hygiene || { title: "Hygiene nudges", items: [] }, (byId.hygiene?.items || []).map((i) => dealRow(i.deal, i.note)).join(""), "Pipeline is clean.")}
-      </div>
+    <div class="panel feed-take"><h2>✦ Milton's take</h2>${feed.milton?.available && feed.milton?.take
+      ? `<div class="feed-take-text">${feed.milton.take.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/\n/g, "<br>")}</div>`
+      : `<div class="empty">Milton is unreachable — showing the CRM-derived stream only.</div>`}</div>
+    <div class="panel">
+      <h2>Today's stream <span class="count">${items.length}</span></h2>
+      ${items.length ? items.map(feedItemHtml).join("") : `<div class="empty">Nothing due — a clear runway. Add a task above to seed it.</div>`}
     </div>`;
-
-  wireTaskRows(allTasks, deals);
-  const dealById = Object.fromEntries((byId.hygiene?.items || []).map((i) => [i.deal.id, i.deal]));
-  document.querySelectorAll("#view [data-deal-open]").forEach((b) => {
-    b.onclick = () => { const d = dealById[Number(b.dataset.dealOpen)]; if (d) editDealModal(d); };
+  // task completion + edit wiring (same flow as the Tasks view)
+  document.querySelectorAll("[data-task-id]").forEach((cb) => {
+    cb.onchange = async () => {
+      const it = items.find((x) => x.type === "task" && x.task && String(x.task.id) === cb.dataset.taskId);
+      await toggleTask(cb.dataset.taskId, cb, it ? it.task : null);
+      if (!cb.disabled) { /* stays in place; change persisted server-side */ }
+      route();
+    };
   });
-
+  document.querySelectorAll("[data-edit]").forEach((b) => {
+    b.onclick = () => {
+      const it = items.find((x) => x.type === "task" && x.task && String(x.task.id) === b.dataset.edit);
+      if (it) editTaskModal(it.task);
+    };
+  });
+  document.querySelectorAll("[data-deal-open]").forEach((b) => {
+    b.onclick = () => editDealModal({ id: Number(b.dataset.dealOpen) });
+  });
   const add = async () => {
     const title = $("#qa-title").value.trim();
     if (!title) return;
-    await POST("/api/tasks", { title, due_date: today, owner: "You" });
+    await POST("/api/tasks", { title, due_date: toISODate(new Date()), owner: "You" });
     route();
   };
   $("#qa-add").onclick = add;
   $("#qa-title").addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
 }
 
-/* pure helper: feed section lookup, unit-testable */
-function feedSection(feed, id) {
-  return (feed.sections || []).find((s) => s.id === id) || { id, title: id, items: [] };
-}
-
-/* ---------- data workshop: captures · schema · automation in one place ---------- */
+/* ---------- data workshop: captures · schema · automation in one place ---------- *//* ---------- data workshop: captures · schema · automation in one place ---------- */
 const WORKSHOP_TABS = [
   ["captures", "Captures"],
   ["schema", "Schema"],
@@ -2279,7 +2275,12 @@ function mwCardHtml(w, opts = {}) {
   } else if (w.kind === "bars") {
     const items = Array.isArray(p.items) ? p.items : [];
     const max = Math.max(1, ...items.map((i) => Number(i.value) || 0));
-    body = `<div class="mw-bars">${items.map((i) => {
+    const summary = p.summary
+      ? `<div class="mw-bars-summary"><div class="mw-stat-val">${esc(p.summary)}</div>
+        ${p.summary_label ? `<div class="mw-stat-label">${esc(p.summary_label)}</div>` : ""}
+        ${p.summary_sub ? `<div class="mw-delta">${esc(p.summary_sub)}</div>` : ""}</div>`
+      : "";
+    body = summary + `<div class="mw-bars">${items.map((i) => {
       const v = Number(i.value) || 0;
       const pct = Math.max(2, Math.round((v / max) * 100));
       return `<div class="mw-bar-row">
@@ -2472,9 +2473,34 @@ let schemaEntity = "contact";
 
 async function vSchema(root) {
   const el = root || view;
-  const { fields } = await GET(`/api/schema/${schemaEntity}`);
+  const [{ fields }, { stages }] = await Promise.all([
+    GET(`/api/schema/${schemaEntity}`),
+    GET("/api/stages"),
+  ]);
   const entLabel = SCHEMA_ENTITIES.find(([e]) => e === schemaEntity)[1];
   el.innerHTML = `
+    <div class="panel">
+      <div style="display:flex;align-items:center;gap:10px">
+        <h2 style="margin:0">Pipeline stages <span class="count">${stages.length}</span></h2>
+        <div class="spacer"></div>
+        <button class="btn" id="new-stage">+ New stage</button>
+      </div>
+      <p style="color:var(--text-2);margin:8px 0 4px">Stages are workspace-wide and drive the pipeline board, dashboard and feed. Renames keep existing deals in place.</p>
+      ${stages.map((s, i) => `
+        <div class="schema-field">
+          <div class="info">
+            <div class="name"><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${esc(s.color || "var(--ctp-overlay0)")}"></span> ${esc(s.name)}
+              ${s.deals ? `<span class="pill">${s.deals} deal${s.deals === 1 ? "" : "s"}</span>` : ""}</div>
+            <div class="url">${esc(s.slug)}</div>
+          </div>
+          <div class="schema-actions">
+            <button class="btn ghost small" data-stage-move="-1" data-slug="${esc(s.slug)}" ${i === 0 ? "disabled" : ""}>\u2191</button>
+            <button class="btn ghost small" data-stage-move="1" data-slug="${esc(s.slug)}" ${i === stages.length - 1 ? "disabled" : ""}>\u2193</button>
+            <button class="btn ghost small" data-stage-rename="${esc(s.slug)}">Rename</button>
+            <button class="btn danger small" data-stage-del="${esc(s.slug)}">Delete</button>
+          </div>
+        </div>`).join("") || `<div class="empty">No stages.</div>`}
+    </div>
     <div class="toolbar">
       <div class="seg" id="schema-seg">
         ${SCHEMA_ENTITIES.map(([e, l]) => `<button data-ent="${e}" class="${e === schemaEntity ? "on" : ""}">${l}</button>`).join("")}
@@ -2504,6 +2530,49 @@ async function vSchema(root) {
     </div>`;
   document.querySelectorAll("#schema-seg button").forEach((b) => {
     b.onclick = () => { schemaEntity = b.dataset.ent; route(); };
+  });
+  // ---- pipeline stages ----
+  const refreshStages = async () => { await loadMeta(); route(); };
+  $("#new-stage").onclick = () => stageModal(null, stages);
+  document.querySelectorAll("[data-stage-move]").forEach((b) => {
+    b.onclick = async () => {
+      const slug = b.dataset.slug;
+      const i = stages.findIndex((s) => s.slug === slug);
+      const j = i + Number(b.dataset.stageMove);
+      if (i < 0 || j < 0 || j >= stages.length) return;
+      await PATCH(`/api/stages/${slug}`, Number(b.dataset.stageMove) < 0
+        ? { before: stages[j].slug } : { after: stages[j].slug });
+      refreshStages();
+    };
+  });
+  document.querySelectorAll("[data-stage-rename]").forEach((b) => {
+    b.onclick = () => {
+      const s = stages.find((x) => x.slug === b.dataset.stageRename);
+      if (s) stageModal(s, stages);
+    };
+  });
+  document.querySelectorAll("[data-stage-del]").forEach((b) => {
+    b.onclick = async () => {
+      const s = stages.find((x) => x.slug === b.dataset.stageDel);
+      if (!s) return;
+      if (s.deals > 0) {
+        // populated stage: pick the receiving stage first, then confirm
+        const targets = stages.filter((x) => x.slug !== s.slug);
+        openModal(`Delete stage "${s.name}"`, `
+          <p style="color:var(--text-2);font-size:13px">This stage holds <b>${s.deals}</b> deal${s.deals === 1 ? "" : "s"}. Move them to another stage before deleting.</p>
+          ${field("Move deals to", select("move_to", targets.map((t) => [t.slug, t.name]), targets[0].slug))}`,
+          async (d) => {
+            if (!confirm(`Move ${s.deals} deal${s.deals === 1 ? "" : "s"} to "${d.move_to}" and delete "${s.name}"?`)) return;
+            await DEL(`/api/stages/${s.slug}?move_to=${encodeURIComponent(d.move_to)}`);
+            refreshStages();
+          }, "Move & delete");
+        return;
+      }
+      if (confirm(`Delete stage "${s.name}"?`)) {
+        await DEL(`/api/stages/${s.slug}`);
+        refreshStages();
+      }
+    };
   });
   document.querySelectorAll("[data-move]").forEach((b) => {
     b.onclick = async () => {
@@ -2566,6 +2635,33 @@ function fieldModal(f) {
   };
   $('[name="type"]').onchange = syncOpts;
   syncOpts();
+}
+
+/* Pipeline stage add/rename modal. Follows the openModal conventions of the
+   other schema modals; delete-with-move_to asks for the receiving stage first. */
+function stageModal(s, stages) {
+  const isNew = !s;
+  const others = stages.filter((x) => !s || x.slug !== s.slug);
+  openModal(isNew ? "New pipeline stage" : `Rename stage "${s.name}"`, `
+    ${field("Name", input("name", s ? s.name : "", "text", "required"))}
+    ${isNew ? field("Position", select("position", [["end", "At the end"]].concat(
+        others.flatMap((t) => [[`before:${t.slug}`, `Before ${t.name}`], [`after:${t.slug}`, `After ${t.name}`]])), "end"))
+      : ""}
+    ${!isNew ? field("Color", `<input name="color" type="color" value="${esc(s.color || ctp("blue"))}" style="width:48px;height:32px;padding:2px">`) : ""}`,
+    async (d) => {
+      if (isNew) {
+        const body = { name: d.name };
+        if (d.position !== "end") {
+          const [key, ref] = d.position.split(":");
+          body[key] = ref;
+        }
+        await POST("/api/stages", body);
+      } else {
+        await PATCH(`/api/stages/${s.slug}`, { name: d.name, color: d.color });
+      }
+      await loadMeta();
+      route();
+    }, isNew ? "Add stage" : "Save");
 }
 
 /* ---------- command palette (⌘K quick find) ---------- */

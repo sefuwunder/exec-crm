@@ -656,6 +656,22 @@ td { transition: background 0.12s ease; }
 .feed-item:last-child { border-bottom: none; }
 .feed-item .dot { width: 8px; height: 8px; border-radius: 50%; margin-top: 5px; flex-shrink: 0; }
 .feed-item .text { flex: 1; line-height: 1.45; }
+/* chronological stream cards: label pill + main text, actions right */
+.feed-item-main { display: flex; gap: 10px; align-items: flex-start; flex: 1; min-width: 0; }
+.feed-item-main .text { flex: 1; min-width: 0; }
+.feed-pill {
+  display: inline-block; flex-shrink: 0; margin-top: 1px;
+  font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px;
+  border: 1px solid; border-radius: 20px; padding: 1px 8px; white-space: nowrap;
+}
+/* the global input{width:100%} rule would stretch stream checkboxes across the row */
+.feed-item input[type="checkbox"] { width: 18px; height: 18px; margin-top: 2px; accent-color: var(--brand); flex-shrink: 0; }
+/* merged forecast card: weighted total above the per-stage bars */
+.mw-bars-summary { margin-bottom: 12px; }
+@media (max-width: 640px) {
+  .feed-item { flex-wrap: wrap; }
+  .feed-item-main { flex: 1 1 100%; }
+}
 
 /* ---------- dashboard widget groups ---------- */
 .mw-sub { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-3); margin: 14px 0 2px; }
@@ -769,4 +785,24 @@ button.cal-chip:hover { filter: brightness(0.94); }
 }
 @media (prefers-reduced-motion: reduce) {
   .deal-card.selected { outline-offset: 0; }
+}
+
+/* ---------- narrow screens: icon-rail nav + compact topbar ---------- */
+@media (max-width: 640px) {
+  .sidebar { width: 58px; }
+  .brand { padding: 16px 0 12px; justify-content: center; }
+  .brand .word { display: none; }
+  .nav { padding: 4px 8px; align-items: stretch; }
+  .nav a { justify-content: center; padding: 11px 0; font-size: 0; gap: 0; }
+  .nav a svg { width: 20px; height: 20px; }
+  .side-foot { display: none; }
+  .topbar { padding: 10px 14px; gap: 10px; }
+  .cmdk { min-width: 0; }
+  .cmdk span, .cmdk kbd { display: none; }
+  .topbar .date { display: none; }
+  .view { padding: 16px 14px; }
+  .kpis { grid-template-columns: repeat(2, 1fr); gap: 10px; }
+  .kpi { padding: 14px; }
+  .kpi .value { font-size: 22px; }
+  .feed-add input { width: auto; flex: 1; min-width: 0; }
 }

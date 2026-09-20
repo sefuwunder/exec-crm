@@ -32,7 +32,7 @@ const wsParam = (p) => {
 };
 const TITLES = {
   dashboard: "Dashboard", feed: "Daily Feed", calendar: "Calendar",
-  companies: "Companies", campaigns: "Campaigns", captures: "Captures",
+  companies: "Companies", contacts: "Contacts", campaigns: "Campaigns", captures: "Captures",
   automations: "Automations", schema: "Schema", milton: "Milton",
 };
 $("#today").textContent = new Date(Date.now()).toLocaleDateString(undefined, {

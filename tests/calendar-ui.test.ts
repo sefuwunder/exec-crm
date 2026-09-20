@@ -236,7 +236,7 @@ describe("stageFunnelColor", () => {
     expect(stageFunnelColor("prospecting")).toBe("var(--phase-early)");
     expect(stageFunnelColor("proposal")).toBe("var(--phase-middle)");
     expect(stageFunnelColor("closed_won")).toBe("var(--phase-end)");
-    expect(stageFunnelColor("mystery")).toBe("#999");
+    expect(stageFunnelColor("mystery")).toBe("var(--ctp-overlay0)");
     state.colors = { mystery: "#123456" };
     expect(stageFunnelColor("mystery")).toBe("#123456");
     state.stages = [...DEFAULT_STAGES]; state.colors = {};
@@ -373,9 +373,9 @@ describe("calendar nav wiring", () => {
     const navBlock = appSrc.match(/const NAV = \[[\s\S]*?\];/)![0];
     expect(navBlock).toContain('["Calendar", "#/calendar"]');
   });
-  test("urgent styling uses terracotta, not alarm red", () => {
+  test("urgent styling uses terracotta (peach), not alarm red", () => {
     const css = readFileSync(join(new URL(".", import.meta.url).pathname, "..", "public", "styles.css"), "utf8");
-    expect(css).toContain("--urgent: #b5543f");
+    expect(css).toContain("--urgent: var(--ctp-peach)");
     expect(css).not.toMatch(/\.cal-[^{]*\{[^}]*#e5484d/);
   });
   test("grid click handlers are bound once per mount, not per draw", () => {

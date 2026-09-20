@@ -2,6 +2,19 @@
 const $ = (s, el = document) => el.querySelector(s);
 const view = $("#view");
 
+/* ---------- Catppuccin auto theme ---------- */
+// Latte applies under prefers-color-scheme: light, Mocha otherwise (pure CSS,
+// no toggle). JS-side colors always go through CSS custom properties so a live
+// OS switch repaints via the stylesheet; the listener below re-renders the
+// current view so any JS-computed markup picks up the new scheme too.
+const ctpScheme = () =>
+  typeof matchMedia === "function" && matchMedia("(prefers-color-scheme: light)").matches ? "latte" : "mocha";
+const ctp = (name) =>
+  getComputedStyle(document.documentElement).getPropertyValue("--ctp-" + name).trim();
+if (typeof matchMedia === "function") {
+  matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => route());
+}
+
 /* ---------- workspaces ---------- */
 const WS_KEY = "exec-crm-workspace";
 let workspaces = [];
@@ -171,12 +184,13 @@ const cfFieldsHtml = (fields, values = {}) => {
 };
 const getSchemaFields = async (entity) => (await GET(`/api/schema/${entity}`)).fields;
 const statusPill = (s) => {
-  const colors = { draft: "#9aa1b3", active: "#18a058", paused: "#e6a23c", completed: "#2f62f0" };
-  return `<span class="pill" style="background:${colors[s] || "#9aa1b3"}22;color:${colors[s] || "#9aa1b3"}">${esc(s)}</span>`;
+  const colors = { draft: "var(--ctp-overlay0)", active: "var(--ctp-green)", paused: "var(--ctp-yellow)", completed: "var(--ctp-blue)" };
+  const c = colors[s] || "var(--ctp-overlay0)";
+  return `<span class="pill" style="background:color-mix(in srgb, ${c} 14%, transparent);color:${c}">${esc(s)}</span>`;
 };
 
 /* ---------- workspace switcher ---------- */
-const WS_COLORS = ["#579bfc", "#00ca72", "#ffcb00", "#d974b9", "#784bd1", "#ff8a5c", "#20c5d2", "#8b9cf0"];
+const WS_COLORS = ["#1e66f5", "#40a02b", "#df8e1d", "#ea76cb", "#8839ef", "#fe640b", "#179299", "#7287fd"];
 
 async function initWorkspaces() {
   const { workspaces: list } = await GET("/api/workspaces");
@@ -205,7 +219,7 @@ function setWorkspace(id) {
 
 function renderWsSwitcher() {
   const w = workspaces.find((x) => x.id === wsId);
-  $("#ws-dot").style.background = (w && w.color) || "#999";
+  $("#ws-dot").style.background = (w && w.color) || "var(--ctp-overlay0)";
   $("#ws-name").textContent = (w && w.name) || "—";
   const menu = $("#ws-menu");
   menu.innerHTML =
@@ -460,7 +474,7 @@ async function loadMeta() {
   state.colors = res?.colors || {};
 }
 function stageColor(s) {
-  return state.colors[s] || { prospecting: "#4c8dff", qualification: "#8b9cf0", proposal: "#8b7cf6", negotiation: "#f5b83d", closed_won: "#22c07a", closed_lost: "#f06a7a" }[s] || "#999";
+  return state.colors[s] || { prospecting: "var(--phase-early)", qualification: "var(--ctp-lavender)", proposal: "var(--phase-middle)", negotiation: "var(--ctp-yellow)", closed_won: "var(--phase-end)", closed_lost: "var(--ctp-maroon)" }[s] || "var(--ctp-overlay0)";
 }
 /* Funnel-phase color coding: the workspace's ordered stages are split into
    thirds by position (early / middle / end), so the coding survives stage
@@ -492,16 +506,16 @@ async function vDashboard() {
     .slice(0, 6);
   view.innerHTML = `
     <div class="kpis">
-      <div class="kpi"><div class="kpi-top"><span class="kpi-dot" style="background:#4c8dff"></span><div class="label">Open pipeline</div></div>
+      <div class="kpi"><div class="kpi-top"><span class="kpi-dot" style="background:var(--phase-early)"></span><div class="label">Open pipeline</div></div>
         <div class="value">${money(k.pipeline_value)}</div>
         <div class="sub">${k.open_deals} active deals</div></div>
-      <div class="kpi"><div class="kpi-top"><span class="kpi-dot" style="background:#8b7cf6"></span><div class="label">Weighted pipeline</div></div>
+      <div class="kpi"><div class="kpi-top"><span class="kpi-dot" style="background:var(--phase-middle)"></span><div class="label">Weighted pipeline</div></div>
         <div class="value">${money(k.weighted_value)}</div>
         <div class="sub">probability-adjusted</div></div>
-      <div class="kpi"><div class="kpi-top"><span class="kpi-dot" style="background:#22c07a"></span><div class="label">Won this quarter</div></div>
+      <div class="kpi"><div class="kpi-top"><span class="kpi-dot" style="background:var(--phase-end)"></span><div class="label">Won this quarter</div></div>
         <div class="value">${money(k.won_this_quarter)}</div>
         <div class="sub">closed won since Jul 1</div></div>
-      <div class="kpi"><div class="kpi-top"><span class="kpi-dot" style="background:#f5b83d"></span><div class="label">Open tasks</div></div>
+      <div class="kpi"><div class="kpi-top"><span class="kpi-dot" style="background:var(--ctp-yellow)"></span><div class="label">Open tasks</div></div>
         <div class="value">${k.tasks_open}</div>
         <div class="sub">need attention</div></div>
     </div>
@@ -527,7 +541,7 @@ async function vDashboard() {
       <div class="panel"><h2>Recent activity</h2>
         ${acts.map((a) => `
           <div class="activity">
-            <div class="dot" style="background:${a.kind === "deal" ? "#22c07a" : a.kind === "task" ? "#f5b83d" : "#4c8dff"}"></div>
+            <div class="dot" style="background:${a.kind === "deal" ? "var(--phase-end)" : a.kind === "task" ? "var(--ctp-yellow)" : "var(--phase-early)"}"></div>
             <div class="text">${esc(a.text)}<div class="time">${esc(a.created_at.slice(0, 16).replace("T", " "))}</div></div>
           </div>`).join("")}
       </div>
@@ -1264,8 +1278,8 @@ function renderCampaignDetail(c, tasks, deals, camp) {
         <div><div class="w-num">${pct}%</div><div class="w-label">complete</div></div>
       </div>
       <div class="widget"><div><div class="w-num">${open.length}</div><div class="w-label">open</div></div></div>
-      <div class="widget"><div><div class="w-num" style="color:#e5484d">${overdue.length}</div><div class="w-label">overdue</div></div></div>
-      <div class="widget"><div><div class="w-num" style="color:#18a058">${done.length}</div><div class="w-label">done</div></div></div>
+      <div class="widget"><div><div class="w-num" style="color:var(--danger)">${overdue.length}</div><div class="w-label">overdue</div></div></div>
+      <div class="widget"><div><div class="w-num" style="color:var(--ok)">${done.length}</div><div class="w-label">done</div></div></div>
       ${next ? `<div class="widget wide"><div><div class="w-label">next up</div>
         <div class="w-next">${esc(next.title)}</div><div class="w-due">due ${esc(next.due_date)}</div></div></div>` : ""}
     </div>
@@ -1919,7 +1933,7 @@ async function vAutomations() {
       </div>
       ${hooks.map((h) => `
         <div class="hook"><div class="info"><div class="name">${esc(h.name)}
-            <span class="tag"><span class="ws-dot" style="background:${esc(h.workspace_color || "#999")}"></span>${esc(h.workspace_name || "—")}</span></div>
+            <span class="tag"><span class="ws-dot" style="background:${esc(h.workspace_color || "var(--ctp-overlay0)")}"></span>${esc(h.workspace_name || "—")}</span></div>
           <div class="url">${esc(base)}/api/hooks/in/${esc(h.key)}</div></div>
           <select data-hws="${h.id}" title="Move hook to another workspace">${workspaces.map((x) => `<option value="${x.id}" ${x.id === h.workspace_id ? "selected" : ""}>→ ${esc(x.name)}</option>`).join("")}</select>
           <button class="btn ghost small" data-copy="${esc(base)}/api/hooks/in/${esc(h.key)}">Copy URL</button>
@@ -1986,7 +2000,7 @@ Content-Type: application/json
   $("#add-hook").onclick = () => {
     const w = workspaces.find((x) => x.id === wsId);
     openModal("New incoming hook",
-      `<p style="color:var(--text-2);font-size:13px;margin:0 0 8px">Creates in <span class="tag"><span class="ws-dot" style="background:${esc((w && w.color) || "#999")}"></span>${esc((w && w.name) || "—")}</span> — switch workspaces in the topbar to change it.</p>` +
+      `<p style="color:var(--text-2);font-size:13px;margin:0 0 8px">Creates in <span class="tag"><span class="ws-dot" style="background:${esc((w && w.color) || "var(--ctp-overlay0)")}"></span>${esc((w && w.name) || "—")}</span> — switch workspaces in the topbar to change it.</p>` +
       field("Name", input("name", "n8n deal intake")),
       async (d) => { const r = await POST("/api/hooks", d); alert("Hook URL:\n" + location.origin + "/api/hooks/in/" + r.hook.key); route(); }, "Create hook");
   };
@@ -2042,7 +2056,7 @@ async function vSchema() {
         try { opts = JSON.parse(f.options || "[]"); } catch {}
         return `<div class="schema-field">
           <div class="info">
-            <div class="name">${esc(f.label)} ${f.required ? `<span class="pill" style="background:#e5484d22;color:#e5484d">required</span>` : ""}</div>
+            <div class="name">${esc(f.label)} ${f.required ? `<span class="pill" style="background:var(--danger-soft);color:var(--danger)">required</span>` : ""}</div>
             <div class="url">${esc(f.name)} · ${FIELD_TYPES.find(([t]) => t === f.type)?.[1] || f.type}${opts.length ? ` · ${esc(opts.join(", "))}` : ""}</div>
           </div>
           <div class="schema-actions">

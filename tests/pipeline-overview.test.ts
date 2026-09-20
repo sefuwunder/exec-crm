@@ -47,7 +47,7 @@ const moneyShortT = (n: any) => {
   return "$" + Math.round(n);
 };
 const stageColorT = (s: string) =>
-  ({ prospecting: "#4c8dff", negotiation: "#f5b83d" } as Record<string, string>)[s] || "#999";
+  ({ prospecting: "var(--phase-early)", negotiation: "var(--ctp-yellow)" } as Record<string, string>)[s] || "var(--ctp-overlay0)";
 const stateT = { stages: ["prospecting", "qualification", "proposal", "negotiation", "closed_won", "closed_lost"], labels: { prospecting: "Prospecting", negotiation: "Negotiation" } as Record<string, string> };
 // Mirror of the app's funnel-phase logic over the same workspace order.
 const stageFunnelColorT = (s: string) => {
@@ -90,7 +90,7 @@ describe("campaignPipelineStrip", () => {
   test("a stage outside the workspace stage order still renders", () => {
     const html = strip([{ stage: "custom_stage", value: 2000 }]);
     expect(html).toContain("custom_stage");
-    expect(html).toContain('background:#999');
+    expect(html).toContain('background:var(--ctp-overlay0)');
     expect(html).toContain("1 · <b>$2k</b>");
   });
 

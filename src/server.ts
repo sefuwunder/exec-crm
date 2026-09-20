@@ -237,6 +237,64 @@ async function readBody(req: Request): Promise<any> {
   }
 }
 
+// ---------------------------------------------------------------- milton widgets
+const MILTON_WIDGET_KINDS = ["stat", "table", "bars", "list"];
+const isStr = (v: any) => typeof v === "string";
+const isNum = (v: any) => typeof v === "number" && Number.isFinite(v);
+// Validate a widget payload for its kind; returns an error string or null.
+function miltonWidgetPayloadErr(kind: string, payload: any): string | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return "payload must be an object";
+  }
+  if (kind === "stat") {
+    if (!isStr(payload.value) || !payload.value.trim()) return "stat payload needs value (string)";
+    if (!isStr(payload.label) || !payload.label.trim()) return "stat payload needs label (string)";
+    if (payload.delta !== undefined && !isStr(payload.delta)) return "stat delta must be a string";
+    return null;
+  }
+  if (kind === "table") {
+    if (!Array.isArray(payload.headers) || payload.headers.length < 1 || payload.headers.length > 6 ||
+        !payload.headers.every(isStr)) return "table payload needs headers: string[1..6]";
+    if (!Array.isArray(payload.rows) || payload.rows.length > 12) return "table payload needs rows: array (max 12)";
+    for (const r of payload.rows) {
+      if (!Array.isArray(r) || r.length !== payload.headers.length || !r.every(isStr)) {
+        return "table rows must be string arrays matching the headers length";
+      }
+    }
+    return null;
+  }
+  if (kind === "bars") {
+    if (!Array.isArray(payload.items) || payload.items.length < 1 || payload.items.length > 10) {
+      return "bars payload needs items: [{label, value}][1..10]";
+    }
+    for (const it of payload.items) {
+      if (!it || typeof it !== "object" || !isStr(it.label) || !isNum(it.value)) {
+        return "bars items need {label: string, value: number}";
+      }
+    }
+    if (payload.format !== undefined && !["currency", "number", "percent"].includes(payload.format)) {
+      return "bars format must be currency, number, or percent";
+    }
+    return null;
+  }
+  // list
+  if (!Array.isArray(payload.items) || payload.items.length < 1 || payload.items.length > 15) {
+    return "list payload needs items: [{text, sub?}][1..15]";
+  }
+  for (const it of payload.items) {
+    if (!it || typeof it !== "object" || !isStr(it.text) || !it.text.trim()) {
+      return "list items need {text: string, sub?: string}";
+    }
+    if (it.sub !== undefined && !isStr(it.sub)) return "list item sub must be a string";
+  }
+  return null;
+}
+function miltonWidgetOut(r: any) {
+  let payload: any = null;
+  try { payload = JSON.parse(r.payload); } catch { payload = null; }
+  return { id: r.id, kind: r.kind, title: r.title, payload, source: r.source, created_at: r.created_at };
+}
+
 // ---------------------------------------------------------------- workspaces
 function allWorkspaces() {
   return db.query("SELECT * FROM workspaces ORDER BY id").all() as any[];
@@ -406,7 +464,7 @@ const server = Bun.serve({
       for (const f of capFiles) {
         try { await Bun.$`rm -f ${UPLOAD_DIR}/${f.filename}`.quiet(); } catch {}
       }
-      for (const t of ["activities", "captures", "tasks", "deals", "contacts", "campaigns", "companies", "stages"]) {
+      for (const t of ["activities", "captures", "tasks", "deals", "contacts", "campaigns", "companies", "stages", "milton_widgets"]) {
         db.prepare(`DELETE FROM ${t} WHERE workspace_id = ?`).run(ws.id);
       }
       db.prepare("DELETE FROM workspaces WHERE id = ?").run(ws.id);
@@ -1545,6 +1603,50 @@ const server = Bun.serve({
       const hit = db.prepare("DELETE FROM incoming_hooks WHERE id = ? AND workspace_id = ?")
         .run(Number(hookDel[1]), w);
       if (!hit.changes) return json({ error: "not found" }, 404);
+      return json({ ok: true });
+    }
+
+    // ---- milton widgets (published by the Milton chat bot, rendered on the Milton tab)
+    if (path === "/api/milton/widgets" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const rows = db
+        .query("SELECT * FROM milton_widgets WHERE workspace_id = ? ORDER BY created_at DESC, id DESC")
+        .all(w) as any[];
+      return json({ widgets: rows.map(miltonWidgetOut) });
+    }
+    if (path === "/api/milton/widgets" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const b = await readBody(req);
+      const kind = String(b.kind || "");
+      const title = String(b.title || "").trim();
+      const source = b.source == null ? null : String(b.source).slice(0, 120);
+      if (!MILTON_WIDGET_KINDS.includes(kind)) {
+        return json({ error: `kind must be one of: ${MILTON_WIDGET_KINDS.join(", ")}` }, 400);
+      }
+      if (!title) return json({ error: "title is required" }, 400);
+      if (title.length > 80) return json({ error: "title must be at most 80 characters" }, 400);
+      const payloadErr = miltonWidgetPayloadErr(kind, b.payload);
+      if (payloadErr) return json({ error: payloadErr }, 400);
+      const now = Date.now();
+      const res = db
+        .prepare("INSERT INTO milton_widgets (workspace_id, kind, title, payload, source, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(w, kind, title, JSON.stringify(b.payload), source, now);
+      // bound growth: keep the 50 newest per workspace
+      db.prepare(`DELETE FROM milton_widgets WHERE workspace_id = ? AND id NOT IN (
+        SELECT id FROM milton_widgets WHERE workspace_id = ? ORDER BY created_at DESC, id DESC LIMIT 50
+      )`).run(w, w);
+      const row = db.query("SELECT * FROM milton_widgets WHERE id = ?").get(res.lastInsertRowid) as any;
+      return json({ widget: miltonWidgetOut(row) }, 201);
+    }
+    const mwDel = path.match(/^\/api\/milton\/widgets\/(\d+)$/);
+    if (mwDel && method === "DELETE") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const hit = db.prepare("DELETE FROM milton_widgets WHERE id = ? AND workspace_id = ?")
+        .run(Number(mwDel[1]), w);
+      if (!hit.changes) return json({ error: "widget not found" }, 404);
       return json({ ok: true });
     }
     const hookIn = path.match(/^\/api\/hooks\/in\/([A-Za-z0-9]+)$/);

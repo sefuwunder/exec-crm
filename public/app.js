@@ -20,7 +20,7 @@ const wsParam = (p) => {
 const TITLES = {
   dashboard: "Dashboard", feed: "Daily Feed", calendar: "Calendar",
   companies: "Companies", campaigns: "Campaigns", captures: "Captures",
-  automations: "Automations", schema: "Schema",
+  automations: "Automations", schema: "Schema", milton: "Milton",
 };
 $("#today").textContent = new Date(Date.now()).toLocaleDateString(undefined, {
   weekday: "long", year: "numeric", month: "long", day: "numeric",
@@ -1794,6 +1794,92 @@ function webhookFormHtml(w, events) {
       ${headersEditorHtml(w.headers || [])}`;
 }
 
+/* ---------- Milton widgets tab ----------
+   Renders widgets published by the Milton chat bot (POST /api/milton/widgets).
+   Pure HTML builders — no DOM access, unit-testable. */
+function mwRelTime(ts) {
+  const d = Date.now() - Number(ts);
+  if (!Number.isFinite(d) || d < 0) return "just now";
+  const m = Math.floor(d / 60000);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const days = Math.floor(h / 24);
+  if (days < 7) return `${days}d ago`;
+  return new Date(Number(ts)).toLocaleDateString();
+}
+function mwFormatBarValue(v, format) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "—";
+  if (format === "percent") return `${Math.round(n * 100) / 100}%`;
+  if (format === "currency") return moneyShort(n);
+  return n.toLocaleString("en-US");
+}
+function mwCardHtml(w) {
+  const p = w.payload || {};
+  let body = "";
+  if (w.kind === "stat") {
+    body = `<div class="mw-stat">
+      <div class="mw-stat-val">${esc(p.value)}</div>
+      <div class="mw-stat-label">${esc(p.label)}</div>
+      ${p.delta ? `<div class="mw-delta">${esc(p.delta)}</div>` : ""}
+    </div>`;
+  } else if (w.kind === "table") {
+    const heads = Array.isArray(p.headers) ? p.headers : [];
+    const rows = Array.isArray(p.rows) ? p.rows : [];
+    body = `<div class="mw-scroll"><table class="mw-table"><thead><tr>${heads.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead>
+      <tbody>${rows.map((r) => `<tr>${(Array.isArray(r) ? r : []).map((c) => `<td>${esc(c)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+  } else if (w.kind === "bars") {
+    const items = Array.isArray(p.items) ? p.items : [];
+    const max = Math.max(1, ...items.map((i) => Number(i.value) || 0));
+    body = `<div class="mw-bars">${items.map((i) => {
+      const v = Number(i.value) || 0;
+      const pct = Math.max(2, Math.round((v / max) * 100));
+      return `<div class="mw-bar-row">
+        <span class="mw-bar-label">${esc(i.label)}</span>
+        <div class="mw-bar-track"><div class="mw-bar-fill" style="width:${pct}%"></div></div>
+        <span class="mw-bar-val">${esc(mwFormatBarValue(v, p.format))}</span>
+      </div>`;
+    }).join("")}</div>`;
+  } else if (w.kind === "list") {
+    const items = Array.isArray(p.items) ? p.items : [];
+    body = `<ul class="mw-list">${items.map((i) => `<li>
+      <div class="mw-list-text">${esc(i.text)}</div>
+      ${i.sub ? `<div class="mw-list-sub">${esc(i.sub)}</div>` : ""}
+    </li>`).join("")}</ul>`;
+  } else {
+    body = `<div class="empty">Unknown widget kind.</div>`;
+  }
+  return `<div class="mw-card">
+    <div class="mw-card-head">
+      <div class="mw-card-title">${esc(w.title)}</div>
+      <div class="spacer"></div>
+      <span class="mw-time">${esc(mwRelTime(w.created_at))}</span>
+      <button class="btn ghost small mw-x" data-mw-del="${w.id}" aria-label="Remove widget">×</button>
+    </div>
+    ${body}
+  </div>`;
+}
+
+async function vMilton() {
+  const { widgets } = await GET("/api/milton/widgets");
+  view.innerHTML = `
+    <div class="toolbar">
+      <span style="color:var(--text-2)">✦ ${widgets.length} pinned widget${widgets.length === 1 ? "" : "s"}</span>
+      <div class="spacer"></div>
+      <button class="btn ghost small" id="mw-refresh">↻ Refresh</button>
+    </div>
+    ${widgets.length
+      ? `<div class="mw-grid">${widgets.map(mwCardHtml).join("")}</div>`
+      : `<div class="empty" style="margin-top:24px">No widgets yet — ask Milton to pin one from chat.<br><span style="color:var(--text-3)">Try “top deals”, then “pin this as a widget”.</span></div>`}
+  `;
+  $("#mw-refresh").onclick = () => route();
+  document.querySelectorAll("[data-mw-del]").forEach((b) => {
+    b.onclick = async () => { await DEL(`/api/milton/widgets/${b.dataset.mwDel}`); route(); };
+  });
+}
+
 async function vAutomations() {
   const { webhooks, events } = await GET("/api/webhooks");
   const { deliveries } = await GET("/api/deliveries");
@@ -2157,7 +2243,7 @@ async function route() {
       $("#page-title").textContent = TITLES[name];
       await { dashboard: vDashboard, feed: vFeed, calendar: vCalendar, contacts: vContacts,
         companies: vCompanies, campaigns: vCampaigns, captures: vCaptures,
-        automations: vAutomations, schema: vSchema }[name]();
+        automations: vAutomations, schema: vSchema, milton: vMilton }[name]();
     }
   } catch (e) {
     view.innerHTML = `<div class="empty">Failed to load: ${esc(e.message)}</div>`;

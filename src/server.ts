@@ -1850,6 +1850,48 @@ const server = Bun.serve({
       ])[0];
       return json({ company: updatedCompany });
     }
+    if (companyId && method === "DELETE") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const b = await readBody(req);
+      const cid = Number(companyId[1]);
+      const co = db
+        .query("SELECT id, name FROM companies WHERE id = ? AND workspace_id = ?")
+        .get(cid, w) as any;
+      if (!co) return json({ error: "not found" }, 404);
+      const confirm = b.confirm === true || url.searchParams.get("confirm") === "true";
+      const contacts = Number(
+        (db.query("SELECT COUNT(*) AS n FROM contacts WHERE company_id = ? AND workspace_id = ?").get(cid, w) as any).n
+      );
+      const deals = Number(
+        (db.query("SELECT COUNT(*) AS n FROM deals WHERE company_id = ? AND workspace_id = ?").get(cid, w) as any).n
+      );
+      const campaigns = Number(
+        (db.query("SELECT COUNT(*) AS n FROM campaigns WHERE company_id = ? AND workspace_id = ?").get(cid, w) as any).n
+      );
+      const linked = contacts + deals + campaigns;
+      if (linked > 0 && !confirm) {
+        return json(
+          {
+            error: `company "${co.name}" has ${linked} linked record(s) — pass confirm:true to orphan and delete`,
+            contacts,
+            deals,
+            campaigns,
+            hint: "pass confirm:true to orphan and delete",
+          },
+          409
+        );
+      }
+      // Orphan linked records; never cascade-delete them.
+      db.prepare("UPDATE contacts SET company_id = NULL WHERE company_id = ? AND workspace_id = ?").run(cid, w);
+      db.prepare("UPDATE deals SET company_id = NULL WHERE company_id = ? AND workspace_id = ?").run(cid, w);
+      db.prepare("UPDATE campaigns SET company_id = NULL WHERE company_id = ? AND workspace_id = ?").run(cid, w);
+      db.prepare("DELETE FROM custom_values WHERE entity = 'company' AND record_id = ?").run(cid);
+      db.prepare("DELETE FROM companies WHERE id = ? AND workspace_id = ?").run(cid, w);
+      logActivity("company", `Deleted: ${co.name}${linked ? ` (${linked} linked record(s) orphaned)` : ""}`, w);
+      fireWebhooks("company.deleted", { id: cid, name: co.name, workspace_id: w }, w);
+      return json({ ok: true, orphaned: { contacts, deals, campaigns } });
+    }
 
     // ---- tasks
     if (path === "/api/tasks" && method === "GET") {

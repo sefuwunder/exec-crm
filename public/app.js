@@ -1312,11 +1312,44 @@ async function editCompanyModal(c) {
   openModal("Edit company", `
     ${field("Name", input("name", c.name))}
     <div class="formgrid">${field("Industry", input("industry", c.industry))}${field("Website", input("website", c.website))}${field("Campaign", select("campaign_id", [["", "—"]].concat(campaigns.map((x) => [x.id, x.name])), c.campaign_id || ""))}</div>
-    ${cfFieldsHtml(fields, c.custom)}`,
+    ${cfFieldsHtml(fields, c.custom)}
+    <div style="margin-top:14px"><button class="btn danger small" id="m-del-company">Delete company</button></div>`,
     async (d) => {
       if (d.campaign_id === "") d.campaign_id = null;
       await PATCH(`/api/companies/${c.id}`, d); route();
     }, "Save changes");
+  $("#m-del-company").onclick = () => deleteCompany(c);
+}
+
+/* Delete a company. First attempt goes without confirm; a 409 carries the
+   linked-record counts, which surface in a typed-DELETE confirm modal before
+   retrying with ?confirm=true. Linked records are orphaned, never deleted. */
+async function deleteCompany(c) {
+  const attempt = async (confirm) => {
+    const res = await fetch(wsParam(`/api/companies/${c.id}${confirm ? "?confirm=true" : ""}`), { method: "DELETE" });
+    if (res.status === 409) {
+      const j = await res.json().catch(() => ({}));
+      const parts = [];
+      if (j.contacts) parts.push(`${j.contacts} contact${j.contacts > 1 ? "s" : ""}`);
+      if (j.deals) parts.push(`${j.deals} deal${j.deals > 1 ? "s" : ""}`);
+      if (j.campaigns) parts.push(`${j.campaigns} campaign${j.campaigns > 1 ? "s" : ""}`);
+      openModal(`Delete "${c.name}"?`, `
+        <p style="color:var(--text-2)">This company is linked to <b>${parts.join(", ")}</b>. Deleting it will <b>orphan</b> those records — they'll lose their company link but stay in the CRM. Nothing else is deleted.</p>
+        <p style="color:var(--text-2)">This can't be undone. Type <b>DELETE</b> to confirm.</p>
+        <div class="field"><input name="ack" placeholder="DELETE"></div>`,
+        async (d) => {
+          if (d.ack !== "DELETE") throw new Error("confirmation text didn't match");
+          await attempt(true);
+          $("#modal-root").innerHTML = "";
+          route();
+        }, "Delete company");
+      return;
+    }
+    if (!res.ok) throw new Error(`delete company -> ${res.status}`);
+    $("#modal-root").innerHTML = "";
+    route();
+  };
+  return attempt(false);
 }
 
 /* ---------- campaigns ---------- */

@@ -1237,10 +1237,18 @@ const server = Bun.serve({
     if (taskToggle && method === "POST") {
       const w = needWs(req, url);
       if (w instanceof Response) return w;
+      const b = await readBody(req);
       const t = db
         .query("SELECT * FROM tasks WHERE id = ? AND workspace_id = ?")
         .get(Number(taskToggle[1]), w) as any;
       if (!t) return json({ error: "not found" }, 404);
+      if (!t.done) {
+        // Completing a task with unfinished predecessors needs an explicit override.
+        const open = (taskDepsJson(t.id, w).blocked_by as any[]).filter((p) => !p.done);
+        if (open.length && b.confirm !== true) {
+          return json({ error: "blocked", blocked_by: open.map((p) => ({ id: p.id, title: p.title })) }, 409);
+        }
+      }
       db.prepare("UPDATE tasks SET done = ? WHERE id = ?").run(t.done ? 0 : 1, t.id);
       const updated = db.query("SELECT * FROM tasks WHERE id = ?").get(t.id);
       if (!t.done) {
@@ -2146,6 +2154,7 @@ const server = Bun.serve({
         } else {
           move("deals", "UPDATE deals SET company_id = ? WHERE company_id = ? AND workspace_id = ?", winnerId, loserId, w);
           move("contacts", "UPDATE contacts SET company_id = ? WHERE company_id = ? AND workspace_id = ?", winnerId, loserId, w);
+          move("campaigns", "UPDATE campaigns SET company_id = ? WHERE company_id = ? AND workspace_id = ?", winnerId, loserId, w);
           db.prepare(
             `DELETE FROM custom_values WHERE entity = 'company' AND record_id = ?
              AND field_id IN (SELECT field_id FROM custom_values WHERE entity = 'company' AND record_id = ?)`

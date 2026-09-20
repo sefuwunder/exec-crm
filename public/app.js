@@ -70,6 +70,34 @@ const POST = (p, b) => api("POST", p, b);
 const PATCH = (p, b) => api("PATCH", p, b);
 const DEL = (p) => api("DELETE", p);
 
+// Toggle a task's done state. The server 409s when completing a blocked task;
+// prompt and retry with {confirm:true} on the explicit override.
+async function toggleTask(id, cb, task) {
+  const attempt = async (confirm) => {
+    const res = await fetch(wsParam(`/api/tasks/${id}/toggle`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(confirm ? { confirm: true } : {}),
+    });
+    if (res.status === 409) {
+      const j = await res.json().catch(() => ({}));
+      const names = (j.blocked_by || []).map((p) => p.title).join(", ");
+      const label = task ? task.title : "this task";
+      if (!confirm(`"${label}" still has unfinished predecessors: ${names}. Complete it anyway?`)) {
+        if (cb) cb.checked = !cb.checked;
+        return null;
+      }
+      return attempt(true);
+    }
+    if (!res.ok) {
+      if (cb) cb.checked = !cb.checked;
+      throw new Error(`toggle task -> ${res.status}`);
+    }
+    return res.json();
+  };
+  return attempt(false);
+}
+
 /* ---------- modal ---------- */
 function openModal(title, bodyHtml, onSubmit, submitLabel = "Save") {
   const root = $("#modal-root");
@@ -1603,8 +1631,8 @@ function renderCampaignDetail(c, tasks, deals, camp) {
   // done toggles
   document.querySelectorAll('#view input[data-toggle]').forEach((cb) => {
     cb.onchange = async () => {
-      await POST(`/api/tasks/${cb.dataset.toggle}/toggle`);
-      refreshCampaignDetail(c, deals);
+      const r = await toggleTask(cb.dataset.toggle, cb, null);
+      if (r) refreshCampaignDetail(c, deals);
     };
   });
   // full edit (custom fields)
@@ -1660,17 +1688,8 @@ function wireTaskRows(tasks, deals) {
   document.querySelectorAll('#view .task input[type="checkbox"]').forEach((cb) => {
     cb.onchange = async () => {
       const t = tasks.find((x) => x.id === Number(cb.dataset.id));
-      if (t && !t.done) {
-        const openDeps = (t.blocked_by || []).filter((p) => !p.done);
-        if (openDeps.length) {
-          if (!confirm(`"${t.title}" still has unfinished predecessors: ${openDeps.map((p) => p.title).join(", ")}. Complete it anyway?`)) {
-            cb.checked = false;
-            return;
-          }
-        }
-      }
-      await POST(`/api/tasks/${cb.dataset.id}/toggle`);
-      route();
+      const r = await toggleTask(cb.dataset.id, cb, t);
+      if (r) route();
     };
   });
   document.querySelectorAll("#view [data-edit]").forEach((b) => {

@@ -32,9 +32,11 @@ const wsParam = (p) => {
 };
 const TITLES = {
   dashboard: "Dashboard", feed: "Daily Feed", calendar: "Calendar",
-  companies: "Companies", contacts: "Contacts", campaigns: "Campaigns", captures: "Captures",
-  automations: "Automations", schema: "Schema", milton: "Milton",
+  companies: "Companies", contacts: "Contacts", campaigns: "Campaigns",
+  workshop: "Data Workshop", milton: "Milton",
 };
+// Old top-level sections now live inside the Data Workshop tabs.
+const LEGACY_ROUTES = { captures: "captures", automations: "automation", schema: "schema" };
 $("#today").textContent = new Date(Date.now()).toLocaleDateString(undefined, {
   weekday: "long", year: "numeric", month: "long", day: "numeric",
 });
@@ -556,6 +558,12 @@ async function vDashboard() {
         <div class="value">${k.tasks_open}</div>
         <div class="sub">need attention</div></div>
     </div>
+    <div class="panel"><h2>✦ Milton insights</h2>
+      <div id="dash-widgets"><div class="empty">Loading widgets…</div></div>
+    </div>
+    <div class="panel"><h2>Calendar</h2>
+      <div id="dash-cal"></div>
+    </div>
     <div class="cols2">
       <div>
         <div class="panel"><h2>Pipeline by stage</h2>
@@ -583,6 +591,38 @@ async function vDashboard() {
           </div>`).join("")}
       </div>
     </div>`;
+  loadDashboardWidgets();
+  await mountCalendar($("#dash-cal"), "global", null, { onItem: openCalItem });
+}
+
+/* Dashboard widget section: user-pinned Milton widgets first, then the default
+   set (forecast, pipeline analysis, hygiene, top deals) computed server-side.
+   The defaults always render — no Milton round-trip required. */
+async function loadDashboardWidgets() {
+  const root = $("#dash-widgets");
+  if (!root) return;
+  let pinned = [], defaults = [];
+  try {
+    const [p, d] = await Promise.all([
+      GET("/api/milton/widgets"),
+      GET("/api/dashboard/widgets"),
+    ]);
+    pinned = p.widgets || [];
+    defaults = d.widgets || [];
+  } catch (e) {
+    root.innerHTML = `<div class="empty">Couldn't load widgets: ${esc(e.message)}</div>`;
+    return;
+  }
+  const group = (label, ws, deletable) => ws.length ? `
+    <div class="mw-sub">${esc(label)}</div>
+    <div class="mw-grid">${ws.map((w) => mwCardHtml(w, { deletable })).join("")}</div>` : "";
+  root.innerHTML =
+    group("Pinned", pinned, true) +
+    group("Suggested", defaults, false) ||
+    `<div class="empty">No widgets yet — ask Milton to pin one from chat.</div>`;
+  root.querySelectorAll("[data-mw-del]").forEach((b) => {
+    b.onclick = async () => { await DEL(`/api/milton/widgets/${b.dataset.mwDel}`); loadDashboardWidgets(); };
+  });
 }
 
 /* Shared drag-and-drop pipeline kanban board: every deal grouped into a column
@@ -1809,10 +1849,14 @@ function weekGridHtml(anchorIso, byDate, opts = {}) {
 }
 /* One row in a calendar day-detail list. Carries data-cal-item for the shared binder. */
 function calDayRowHtml(it, today) {
-  const doneish = it.type === "task" ? !!it.done : ["closed_won", "closed_lost"].includes(it.stage);
+  const doneish = it.type === "task" ? !!it.done
+    : it.type === "campaign" ? it.status === "sent"
+    : ["closed_won", "closed_lost"].includes(it.stage);
   const od = !doneish && it.date < today;
   const meta = it.type === "deal"
     ? `${money(it.value)} · ${esc(it.stage_name || it.stage || "")}${it.company_name ? ` · ${esc(it.company_name)}` : ""}`
+    : it.type === "campaign"
+    ? `campaign ${it.edge === "ends" ? "ends" : "starts"}${it.company_name ? ` · ${esc(it.company_name)}` : ""}`
     : `${it.done ? "done" : `due ${esc(it.date)}`}${it.deal_title ? ` · ${esc(it.deal_title)}` : ""}`;
   return `<div class="cal-row${od ? " is-overdue" : ""}" data-cal-item="${it.type}:${it.id}" role="button" tabindex="0">` +
     `<span class="cal-dot ${it.type}"${it.type === "deal" ? ` style="background:${stageFunnelColor(it.stage)}"` : ""}></span>` +
@@ -1906,6 +1950,7 @@ async function mountCalendar(el, scope, id, opts = {}) {
         <div class="cal-legend">
           <span class="cal-legend-item"><span class="cal-dot deal"></span>Deal closes</span>
           <span class="cal-legend-item"><span class="cal-dot task"></span>Task due</span>
+          <span class="cal-legend-item"><span class="cal-dot campaign"></span>Campaign</span>
         </div>
       </div>`}
       ${grid}
@@ -1947,6 +1992,7 @@ function openCalItem(type, id, items, deals) {
   const it = items.find((x) => x.type === type && x.id === id);
   if (!it) return;
   if (type === "deal") editDealModal(it);
+  else if (type === "campaign") location.hash = `#/campaigns/${id}`;
   else editTaskModal(it, deals);
 }
 /* Global calendar view: nav-level month grid over the whole workspace. */
@@ -1957,26 +2003,65 @@ async function vCalendar() {
 
 /* ---------- daily feed: what needs you today ---------- */
 async function vFeed() {
-  const [{ tasks }, { deals }] = await Promise.all([GET("/api/tasks"), GET("/api/deals")]);
   const now = new Date();
   const today = toISODate(now);
-  const plus7 = toISODate(new Date(now.getTime() + 7 * 86400000));
   const h = now.getHours();
   const greet = h < 5 ? "Still up" : h < 12 ? "Good morning" : h < 17 ? "Good afternoon" : "Good evening";
-  const byDue = (a, b) => (a.due_date || "9999").localeCompare(b.due_date || "9999");
+  let feed;
+  try {
+    feed = await GET("/api/daily-feed");
+  } catch (e) {
+    view.innerHTML = `<div class="empty">Couldn't load the daily feed: ${esc(e.message)}</div>`;
+    return;
+  }
+  const byId = Object.fromEntries(feed.sections.map((s) => [s.id, s]));
+  const planTasks = (byId.plan?.items || []).map((i) => i.task).filter(Boolean);
+  const blockedTasks = (byId.blocked?.items || []).map((i) => i.task).filter(Boolean);
+  const allTasks = [...new Map([...planTasks, ...blockedTasks].map((t) => [t.id, t])).values()];
+  const [{ deals }] = await Promise.all([GET("/api/deals")]).catch(() => [{ deals: [] }]);
 
-  const open = tasks.filter((t) => !t.done);
-  const overdue = open.filter((t) => t.due_date && t.due_date < today).sort(byDue);
-  const todayTasks = open.filter((t) => !t.due_date || t.due_date === today).sort(byDue);
-  const upcoming = open.filter((t) => t.due_date > today && t.due_date <= plus7).sort(byDue);
-  const closing = deals
-    .filter((d) => !["closed_won", "closed_lost"].includes(d.stage) && d.expected_close >= today && d.expected_close <= plus7)
-    .sort((a, b) => a.expected_close.localeCompare(b.expected_close));
-  const needYou = overdue.length + todayTasks.length;
+  // Milton's chat text uses **bold** — tiny inline renderer for the take card.
+  const md = (s) => esc(s || "")
+    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+    .replace(/\n/g, "<br>");
+  const takeHtml = feed.milton.available && feed.milton.take
+    ? `<div class="panel feed-take"><h2>\u2726 Milton's take</h2><div class="feed-take-text">${md(feed.milton.take)}</div></div>`
+    : `<div class="panel feed-take"><h2>\u2726 Milton's take</h2>
+        <div class="empty">Milton is unreachable right now — the suggestions below are computed from your CRM data.</div></div>`;
 
-  const section = (title, rows, emptyMsg) => `
-    <div class="panel"><h2>${title} <span class="count">${rows.length}</span></h2>
-      ${rows.length ? rows.map(taskRow).join("") : `<div class="empty">${emptyMsg}</div>`}
+  const dealRow = (d, note) => `
+    <div class="feed-item">
+      <div class="dot" style="background:${stageFunnelColor(d.stage)}"></div>
+      <div class="text"><b>${esc(d.title)}</b> · ${esc(d.company_name || "")}<br>
+        <span style="color:var(--text-3);font-size:12.5px">${money(d.value)} · ${esc(d.stage_name || d.stage)}${d.expected_close ? ` · closes ${esc(d.expected_close)}` : ""}${note ? ` · ${esc(note)}` : ""}</span></div>
+      <div class="spacer"></div>
+      <button class="btn ghost small" data-deal-open="${d.id}">Open</button>
+    </div>`;
+
+  const blockedRow = (item) => {
+    const t = item.task;
+    return `
+    <div class="feed-item">
+      <div class="dot" style="background:var(--ctp-red)"></div>
+      <div class="text"><b>${esc(t.title)}</b><br>
+        <span style="color:var(--text-3);font-size:12.5px">blocked by ${item.blocked_by.map((b) => esc(b.title)).join(", ") || "—"}</span></div>
+      <div class="spacer"></div>
+      <button class="btn ghost small" data-edit="${t.id}">Edit</button>
+    </div>`;
+  };
+
+  const prepRow = (p) => `
+    <div class="feed-item">
+      <div class="dot" style="background:var(--phase-early)"></div>
+      <div class="text"><b>${esc(p.name)}</b><br>
+        <span style="color:var(--text-3);font-size:12.5px">${esc(p.sub || "")}${p.reason ? ` · ${esc(p.reason)}` : ""}</span></div>
+      <div class="spacer"></div>
+      <a class="btn ghost small" style="text-decoration:none" href="#/${p.kind === "company" ? "companies" : "contacts"}${p.kind === "contact" ? `?q=${encodeURIComponent(p.name)}` : ""}">Open</a>
+    </div>`;
+
+  const section = (s, body, emptyMsg) => `
+    <div class="panel"><h2>${esc(s.title)} <span class="count">${s.items.length}</span></h2>
+      ${s.items.length ? body : `<div class="empty">${emptyMsg}</div>`}
     </div>`;
 
   view.innerHTML = `
@@ -1984,28 +2069,30 @@ async function vFeed() {
       <div>
         <div class="feed-greet">${greet}</div>
         <div class="feed-sub">${now.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })} ·
-          ${needYou ? `<b>${needYou}</b> thing${needYou === 1 ? "" : "s"} need${needYou === 1 ? "s" : ""} you today` : "nothing due — clear runway"}</div>
+          ${planTasks.length ? `<b>${planTasks.length}</b> thing${planTasks.length === 1 ? "" : "s"} need${planTasks.length === 1 ? "s" : ""} you today` : "nothing due — clear runway"}</div>
       </div>
       <div class="feed-add">
-        <input id="qa-title" placeholder="Quick add a task for today…" autocomplete="off">
+        <input id="qa-title" placeholder="Quick add a task for today\u2026" autocomplete="off">
         <button class="btn" id="qa-add">Add</button>
       </div>
     </div>
+    ${takeHtml}
     <div class="cols2">
       <div>
-        ${section("Overdue", overdue, "Nothing overdue. Nice.")}
-        ${section("Today", todayTasks, "Nothing due today.")}
-        ${section("Coming up", upcoming, "Nothing on the horizon.")}
+        ${section(byId.plan || { title: "Today's plan", items: [] }, planTasks.map(taskRow).join(""), "Nothing due today.")}
+        ${section(byId.blocked || { title: "Blocked tasks", items: [] }, (byId.blocked?.items || []).map(blockedRow).join(""), "Nothing blocked.")}
       </div>
-      <div class="panel"><h2>Closing this week <span class="count">${closing.length}</span></h2>
-        ${closing.length ? closing.map((d) => `
-          <div class="activity"><div class="dot" style="background:${stageColor(d.stage)}"></div>
-            <div class="text"><b>${esc(d.title)}</b> · ${esc(d.company_name || "")}<br>
-            <span style="color:var(--text-3);font-size:12.5px">${money(d.value)} · ${d.probability}% · closes ${esc(d.expected_close)}</span></div>
-          </div>`).join("") : `<div class="empty">No deals closing in the next 7 days.</div>`}
+      <div>
+        ${section(byId.prep || { title: "Meeting prep", items: [] }, (byId.prep?.items || []).map(prepRow).join(""), "No meetings on today's radar.")}
+        ${section(byId.hygiene || { title: "Hygiene nudges", items: [] }, (byId.hygiene?.items || []).map((i) => dealRow(i.deal, i.note)).join(""), "Pipeline is clean.")}
       </div>
     </div>`;
-  wireTaskRows(tasks, deals);
+
+  wireTaskRows(allTasks, deals);
+  const dealById = Object.fromEntries((byId.hygiene?.items || []).map((i) => [i.deal.id, i.deal]));
+  document.querySelectorAll("#view [data-deal-open]").forEach((b) => {
+    b.onclick = () => { const d = dealById[Number(b.dataset.dealOpen)]; if (d) editDealModal(d); };
+  });
 
   const add = async () => {
     const title = $("#qa-title").value.trim();
@@ -2017,10 +2104,41 @@ async function vFeed() {
   $("#qa-title").addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
 }
 
-/* ---------- captures: business cards & client notes ---------- */
-async function vCaptures() {
-  const [{ captures }, { contacts }] = await Promise.all([GET("/api/captures"), GET("/api/contacts")]);
+/* pure helper: feed section lookup, unit-testable */
+function feedSection(feed, id) {
+  return (feed.sections || []).find((s) => s.id === id) || { id, title: id, items: [] };
+}
+
+/* ---------- data workshop: captures · schema · automation in one place ---------- */
+const WORKSHOP_TABS = [
+  ["captures", "Captures"],
+  ["schema", "Schema"],
+  ["automation", "Automation"],
+];
+async function vWorkshop(sub) {
+  const tab = WORKSHOP_TABS.some(([t]) => t === sub) ? sub : "captures";
   view.innerHTML = `
+    <div class="toolbar">
+      <div class="seg" id="ws-seg" role="tablist" aria-label="Data workshop">
+        ${WORKSHOP_TABS.map(([t, label]) =>
+          `<button data-tab="${t}" class="${t === tab ? "on" : ""}" role="tab" aria-selected="${t === tab}">${label}</button>`).join("")}
+      </div>
+    </div>
+    <div id="ws-body"></div>`;
+  document.querySelectorAll("#ws-seg button").forEach((b) => {
+    b.onclick = () => { location.hash = `#/workshop/${b.dataset.tab}`; };
+  });
+  const root = $("#ws-body");
+  if (tab === "schema") await vSchema(root);
+  else if (tab === "automation") await vAutomations(root);
+  else await vCaptures(root);
+}
+
+/* ---------- captures: business cards & client notes ---------- */
+async function vCaptures(root) {
+  const el = root || view;
+  const [{ captures }, { contacts }] = await Promise.all([GET("/api/captures"), GET("/api/contacts")]);
+  el.innerHTML = `
     <div class="toolbar">
       <span style="color:var(--text-2)">${captures.length} captured</span>
       <div class="spacer"></div>
@@ -2143,7 +2261,8 @@ function mwFormatBarValue(v, format) {
   if (format === "currency") return moneyShort(n);
   return n.toLocaleString("en-US");
 }
-function mwCardHtml(w) {
+function mwCardHtml(w, opts = {}) {
+  const deletable = opts.deletable !== false && w.id != null;
   const p = w.payload || {};
   let body = "";
   if (w.kind === "stat") {
@@ -2183,7 +2302,7 @@ function mwCardHtml(w) {
       <div class="mw-card-title">${esc(w.title)}</div>
       <div class="spacer"></div>
       <span class="mw-time">${esc(mwRelTime(w.created_at))}</span>
-      <button class="btn ghost small mw-x" data-mw-del="${w.id}" aria-label="Remove widget">×</button>
+      ${deletable ? `<button class="btn ghost small mw-x" data-mw-del="${w.id}" aria-label="Remove widget">×</button>` : ""}
     </div>
     ${body}
   </div>`;
@@ -2207,12 +2326,13 @@ async function vMilton() {
   });
 }
 
-async function vAutomations() {
+async function vAutomations(root) {
+  const el = root || view;
   const { webhooks, events } = await GET("/api/webhooks");
   const { deliveries } = await GET("/api/deliveries");
   const { hooks } = await GET(showAllHooks ? "/api/hooks?all=1" : "/api/hooks");
   const base = location.origin;
-  view.innerHTML = `
+  el.innerHTML = `
     <div class="panel">
       <h2>Outgoing webhooks <span style="color:var(--text-3);font-weight:400;font-size:13px">— CRM → Zapier / Make / n8n</span></h2>
       <p style="color:var(--text-2);margin-top:-6px">POSTs JSON on deal, contact, campaign, and task events. Point it at a Zapier Catch Hook, Make webhook, or n8n Webhook node.</p>
@@ -2350,10 +2470,11 @@ const SCHEMA_ENTITIES = [
 ];
 let schemaEntity = "contact";
 
-async function vSchema() {
+async function vSchema(root) {
+  const el = root || view;
   const { fields } = await GET(`/api/schema/${schemaEntity}`);
   const entLabel = SCHEMA_ENTITIES.find(([e]) => e === schemaEntity)[1];
-  view.innerHTML = `
+  el.innerHTML = `
     <div class="toolbar">
       <div class="seg" id="schema-seg">
         ${SCHEMA_ENTITIES.map(([e, l]) => `<button data-ent="${e}" class="${e === schemaEntity ? "on" : ""}">${l}</button>`).join("")}
@@ -2462,8 +2583,7 @@ function initPalette() {
     const NAV = [
       ["Dashboard", "#/dashboard"], ["Daily Feed", "#/feed"],
       ["Calendar", "#/calendar"], ["Campaigns", "#/campaigns"],
-      ["Captures", "#/captures"], ["Automations", "#/automations"],
-      ["Schema", "#/schema"],
+      ["Data Workshop", "#/workshop"], ["Milton", "#/milton"],
     ];
     const out = NAV.map(([label, hash]) => ({
       group: "Go to", kind: "view", label,
@@ -2556,6 +2676,9 @@ async function route() {
   const [hash] = location.hash.split("?");
   const parts = (hash.replace("#/", "") || "dashboard").split("/");
   const r = parts[0];
+  // Captures / Automations / Schema moved into the Data Workshop tabs —
+  // old bookmarks and links land on the right tab instead of 404ing.
+  if (LEGACY_ROUTES[r]) { location.hash = `#/workshop/${LEGACY_ROUTES[r]}`; return; }
   const name = TITLES[r] ? r : "dashboard";
   document.querySelectorAll("#nav a").forEach((a) =>
     a.classList.toggle("active", a.dataset.r === name));
@@ -2570,8 +2693,8 @@ async function route() {
       $("#page-title").textContent = TITLES[name];
       await { dashboard: vDashboard, feed: vFeed, calendar: vCalendar,
         contacts: () => (dupMode ? vDuplicates() : vContacts()),
-        companies: vCompanies, campaigns: vCampaigns, captures: vCaptures,
-        automations: vAutomations, schema: vSchema, milton: vMilton }[name]();
+        companies: vCompanies, campaigns: vCampaigns,
+        workshop: () => vWorkshop(parts[1]), milton: vMilton }[name]();
     }
   } catch (e) {
     view.innerHTML = `<div class="empty">Failed to load: ${esc(e.message)}</div>`;

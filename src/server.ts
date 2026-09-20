@@ -400,6 +400,258 @@ function miltonWidgetOut(r: any) {
   return { id: r.id, kind: r.kind, title: r.title, payload, source: r.source, created_at: r.created_at };
 }
 
+// ---------------------------------------------------------------- dashboard + daily feed
+const mwMoneyShort = (n: any) => {
+  n = Number(n) || 0;
+  if (Math.abs(n) >= 1e6) return "$" + (n / 1e6).toFixed(1) + "M";
+  if (Math.abs(n) >= 1e3) return "$" + Math.round(n / 1e3) + "k";
+  return "$" + Math.round(n);
+};
+const mwToday = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+function mwStageNames(w: number): Record<string, string> {
+  const names: Record<string, string> = {};
+  for (const s of db.query("SELECT slug, name FROM stages WHERE workspace_id = ?").all(w) as any[])
+    names[s.slug] = s.name;
+  return names;
+}
+function mwOpenDeals(w: number) {
+  return db
+    .query(
+      `SELECT d.*, c.name AS company_name, ct.name AS contact_name FROM deals d
+       LEFT JOIN companies c ON c.id = d.company_id
+       LEFT JOIN contacts ct ON ct.id = d.contact_id
+       WHERE d.workspace_id = ? AND d.stage NOT IN ('closed_won', 'closed_lost')
+       ORDER BY d.value DESC`
+    )
+    .all(w) as any[];
+}
+// Default dashboard widget set, computed from workspace data in Milton's
+// Widgetable shape ({kind, title, payload}) so the frontend renders defaults
+// and pinned widgets with the same card builder. Always available — no
+// Milton round-trip required.
+function defaultDashboardWidgets(w: number) {
+  const names = mwStageNames(w);
+  const deals = mwOpenDeals(w);
+  const now = Date.now();
+  const byStage: Record<string, { n: number; v: number; wv: number }> = {};
+  for (const d of deals) {
+    const s = byStage[d.stage] || (byStage[d.stage] = { n: 0, v: 0, wv: 0 });
+    s.n++;
+    s.v += Number(d.value) || 0;
+    s.wv += (Number(d.value) || 0) * (Number(d.probability) || 0) / 100;
+  }
+  const stageOrder = (db.query("SELECT slug FROM stages WHERE workspace_id = ? ORDER BY position, id").all(w) as any[])
+    .map((s: any) => s.slug)
+    .filter((s: string) => s !== "closed_won" && s !== "closed_lost");
+  const stages = [...stageOrder, ...Object.keys(byStage).filter((s) => !stageOrder.includes(s))];
+  const weightedTotal = stages.reduce((a, s) => a + (byStage[s]?.wv || 0), 0);
+
+  const forecast = {
+    kind: "bars", title: "Forecast by stage", source: "exec-crm:defaults", created_at: now,
+    payload: {
+      format: "currency",
+      items: stages.map((s) => ({ label: names[s] || s, value: Math.round(byStage[s]?.wv || 0) })),
+    },
+  };
+  const analysis = {
+    kind: "table", title: "Pipeline analysis", source: "exec-crm:defaults", created_at: now,
+    payload: {
+      headers: ["Stage", "Deals", "Value", "Weighted"],
+      rows: stages.map((s) => {
+        const r = byStage[s] || { n: 0, v: 0, wv: 0 };
+        return [names[s] || s, String(r.n), mwMoneyShort(r.v), mwMoneyShort(Math.round(r.wv))];
+      }),
+    },
+  };
+  const today = mwToday();
+  const staleDays = (iso: string) => {
+    const m = (iso || "").slice(0, 10).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!m) return null;
+    return Math.round((Date.now() - new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime()) / 86400000);
+  };
+  const staleList = deals
+    .map((d) => ({ d, days: staleDays(d.updated_at) }))
+    .filter((x) => x.days !== null && (x.days as number) >= 30)
+    .sort((a, b) => (b.days as number) - (a.days as number));
+  const noClose = deals.filter((d) => !d.expected_close);
+  const noValue = deals.filter((d) => !(Number(d.value) > 0));
+  const overdueTasks = (db.query(
+    "SELECT COUNT(*) AS n FROM tasks WHERE workspace_id = ? AND done = 0 AND due_date <> '' AND due_date < ?"
+  ).get(w, today) as any).n;
+  const hygieneItems: { text: string; sub?: string }[] = [];
+  if (staleList.length)
+    hygieneItems.push({
+      text: `🕸️ ${staleList.length} stale deal${staleList.length === 1 ? "" : "s"} untouched 30+ days`,
+      sub: staleList.slice(0, 3).map((x) => x.d.title).join("; "),
+    });
+  if (noClose.length)
+    hygieneItems.push({
+      text: `📅 ${noClose.length} deal${noClose.length === 1 ? "" : "s"} with no expected close date`,
+      sub: noClose.slice(0, 3).map((d) => d.title).join("; "),
+    });
+  if (noValue.length)
+    hygieneItems.push({ text: `💰 ${noValue.length} deal${noValue.length === 1 ? "" : "s"} with no value set` });
+  if (overdueTasks)
+    hygieneItems.push({ text: `⏰ ${overdueTasks} overdue task${overdueTasks === 1 ? "" : "s"}` });
+  const hygiene = {
+    kind: "list", title: "Hygiene summary", source: "exec-crm:defaults", created_at: now,
+    payload: {
+      items: hygieneItems.length
+        ? hygieneItems.slice(0, 8)
+        : [{ text: "✅ Pipeline is clean — every open deal has a close date, a value, and recent activity." }],
+    },
+  };
+  const top = {
+    kind: "table", title: "Top deals", source: "exec-crm:defaults", created_at: now,
+    payload: {
+      headers: ["Deal", "Company", "Stage", "Value"],
+      rows: deals.slice(0, 5).map((d) => [
+        d.title, d.company_name || "—", names[d.stage] || d.stage, mwMoneyShort(d.value),
+      ]),
+    },
+  };
+  return [
+    { kind: "stat", title: "Weighted forecast", source: "exec-crm:defaults", created_at: now,
+      payload: { value: mwMoneyShort(Math.round(weightedTotal)), label: "probability-weighted open pipeline", delta: `${deals.length} open deals` } },
+    forecast, analysis, hygiene, top,
+  ];
+}
+
+// Talk to Milton's existing chat API (session workspace pinned first so the
+// reply is scoped to this exec-crm workspace). One overall timeout; null when
+// Milton is unreachable — callers degrade, never 500.
+const MILTON_URL = process.env.MILTON_URL || "http://localhost:3009";
+async function miltonChat(session: string, message: string, w: number, timeoutMs = 7000): Promise<any | null> {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    await fetch(`${MILTON_URL}/api/session/workspace`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session, workspace_id: w }), signal: ctl.signal,
+    });
+    const r = await fetch(`${MILTON_URL}/api/chat`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session, message }), signal: ctl.signal,
+    });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// Daily feed payload: structured suggestion sections from workspace data plus
+// Milton's "morning brief" take when reachable.
+async function dailyFeed(w: number) {
+  const today = mwToday();
+  const plus7 = (() => {
+    const d = new Date(); d.setDate(d.getDate() + 7);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  })();
+  const names = mwStageNames(w);
+  const taskRows = attachTaskDeps(
+    attachCustom(
+      "task",
+      db.query(
+        `SELECT t.*, d.title AS deal_title FROM tasks t
+         LEFT JOIN deals d ON d.id = t.deal_id
+         WHERE t.workspace_id = ? ORDER BY t.done, t.due_date`
+      ).all(w) as any[]
+    ),
+    w
+  );
+  const deals = mwOpenDeals(w);
+  const open = taskRows.filter((t: any) => !t.done);
+  const plan = open.filter((t: any) => t.due_date && t.due_date <= today);
+  const blocked = open.filter((t: any) => t.is_blocked);
+  const closingSoon = deals.filter((d) => d.expected_close && d.expected_close >= today && d.expected_close <= plus7);
+  const staleDays = (iso: string) => {
+    const m = (iso || "").slice(0, 10).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!m) return null;
+    return Math.round((Date.now() - new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime()) / 86400000);
+  };
+  const hygieneDeals = [
+    ...deals
+      .map((d) => ({ d, days: staleDays(d.updated_at) }))
+      .filter((x) => x.days !== null && (x.days as number) >= 30)
+      .sort((a, b) => (b.days as number) - (a.days as number))
+      .slice(0, 5)
+      .map((x) => ({ ...dealOut(x.d, names), note: `untouched ${Math.round(x.days as number)} days` })),
+    ...deals.filter((d) => !d.expected_close).slice(0, 5)
+      .map((d) => ({ ...dealOut(d, names), note: "no expected close date" })),
+  ];
+  // Meeting prep: distinct contacts/companies behind today's tasks and this
+  // week's closing deals.
+  const prepDeals = new Map<number, any>();
+  for (const t of plan) {
+    const d = deals.find((x) => x.id === t.deal_id);
+    if (d) prepDeals.set(d.id, { deal: d, reason: `task due: ${t.title}` });
+  }
+  for (const d of closingSoon)
+    if (!prepDeals.has(d.id)) prepDeals.set(d.id, { deal: d, reason: `closes ${d.expected_close}` });
+  const seen = new Set<string>();
+  const prep: any[] = [];
+  for (const { deal: d, reason } of prepDeals.values()) {
+    const contact = d.contact_id
+      ? (db.query("SELECT id, name, title, email, phone FROM contacts WHERE id = ? AND workspace_id = ?").get(d.contact_id, w) as any)
+      : null;
+    const company = d.company_id
+      ? (db.query("SELECT id, name, industry, website FROM companies WHERE id = ? AND workspace_id = ?").get(d.company_id, w) as any)
+      : null;
+    if (contact && !seen.has(`c${contact.id}`)) {
+      seen.add(`c${contact.id}`);
+      prep.push({ kind: "contact", id: contact.id, name: contact.name,
+        sub: [contact.title, contact.email].filter(Boolean).join(" · ") || "—",
+        reason: `${d.title} — ${reason}` });
+    }
+    if (company && !seen.has(`o${company.id}`)) {
+      seen.add(`o${company.id}`);
+      prep.push({ kind: "company", id: company.id, name: company.name,
+        sub: company.industry || company.website || "—",
+        reason: `${d.title} — ${reason}` });
+    }
+  }
+  const brief = await miltonChat("exec-crm-feed", "morning brief", w);
+  return {
+    generated_at: new Date().toISOString(),
+    milton: { available: !!brief, take: brief?.text || null },
+    sections: [
+      { id: "plan", title: "Today's plan",
+        items: plan.map((t: any) => ({ kind: "task", task: taskOut(t) })) },
+      { id: "prep", title: "Meeting prep", items: prep.map((p) => ({ kind: "prep", ...p })) },
+      { id: "hygiene", title: "Hygiene nudges",
+        items: hygieneDeals.map((d) => ({ kind: "deal", deal: d, note: d.note })) },
+      { id: "blocked", title: "Blocked tasks",
+        items: blocked.map((t: any) => ({
+          kind: "task", task: taskOut(t),
+          blocked_by: (t.blocked_by || []).filter((b: any) => !b.done).map((b: any) => ({ id: b.id, title: b.title })),
+        })) },
+    ],
+  };
+}
+// Deal/task shapes the feed frontend can hand straight to the edit modals.
+function dealOut(d: any, names: Record<string, string>) {
+  return {
+    id: d.id, title: d.title, value: d.value, stage: d.stage,
+    stage_name: names[d.stage] || d.stage, probability: d.probability,
+    expected_close: d.expected_close, owner: d.owner, source: d.source,
+    company_id: d.company_id, contact_id: d.contact_id, campaign_id: d.campaign_id,
+    company_name: d.company_name, contact_name: d.contact_name,
+  };
+}
+function taskOut(t: any) {
+  return {
+    id: t.id, title: t.title, done: !!t.done, due_date: t.due_date, owner: t.owner,
+    deal_id: t.deal_id, deal_title: t.deal_title, is_blocked: !!t.is_blocked,
+    blocked_by: t.blocked_by || [],
+  };
+}
+
 // ---------------------------------------------------------------- workspaces
 function allWorkspaces() {
   return db.query("SELECT * FROM workspaces ORDER BY id").all() as any[];
@@ -1627,9 +1879,27 @@ const server = Bun.serve({
         for (const t of rows) if (inRange(t.due_date))
           items.push({ type: "task", date: t.due_date, ...t });
       };
+      // Campaigns surface as start/end markers so one global calendar shows
+      // everything: task due dates, deal close dates, campaign start/end.
+      const pushCampaigns = () => {
+        const rows = db
+          .query(
+            `SELECT c.id, c.name AS title, c.status, c.start_date, c.end_date, co.name AS company_name
+             FROM campaigns c LEFT JOIN companies co ON co.id = c.company_id
+             WHERE c.workspace_id = ? AND (c.start_date <> '' OR c.end_date <> '')`
+          )
+          .all(w) as any[];
+        for (const c of rows) {
+          if (c.start_date && inRange(c.start_date))
+            items.push({ type: "campaign", date: c.start_date, edge: "starts", ...c });
+          if (c.end_date && inRange(c.end_date) && c.end_date !== c.start_date)
+            items.push({ type: "campaign", date: c.end_date, edge: "ends", ...c });
+        }
+      };
       if (scope === "global") {
         pushDeals(dealRows("AND d.expected_close <> ''", []));
         pushTasks(taskRows("AND t.due_date <> ''", []));
+        pushCampaigns();
       } else if (scope === "campaign") {
         if (!id) return json({ error: "campaign id is required" }, 400);
         const camp = db.query("SELECT id, name FROM campaigns WHERE id = ? AND workspace_id = ?").get(id, w);
@@ -1981,6 +2251,29 @@ const server = Bun.serve({
         .run(Number(mwDel[1]), w);
       if (!hit.changes) return json({ error: "widget not found" }, 404);
       return json({ ok: true });
+    }
+
+    // ---- dashboard: default Milton-widget set + daily feed --------------------
+    // The default widget set (forecast, pipeline analysis, hygiene summary, top
+    // deals) is computed here from workspace data in the exact Widgetable shape
+    // Milton pins ({kind, title, payload}), so the frontend renders both with
+    // the same card builder. No Milton round-trip: the dashboard always renders.
+    if (path === "/api/dashboard/widgets" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      // Pinned widgets first (deletable in the UI), then the defaults.
+      const pinned = (db.query("SELECT * FROM milton_widgets WHERE workspace_id = ? ORDER BY created_at DESC, id DESC").all(w) as any[])
+        .map(miltonWidgetOut);
+      return json({ widgets: [...pinned, ...defaultDashboardWidgets(w)] });
+    }
+    // Daily feed: structured suggestion sections computed from workspace data,
+    // plus Milton's "morning brief" take when reachable (existing /api/chat
+    // endpoint — no new Milton endpoint needed). Never 500s on Milton being
+    // down: the feed renders with milton.available=false instead.
+    if (path === "/api/daily-feed" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      return json(await dailyFeed(w));
     }
     const hookIn = path.match(/^\/api\/hooks\/in\/([A-Za-z0-9]+)$/);
     if (hookIn && method === "POST") {

@@ -647,6 +647,19 @@ td { transition: background 0.12s ease; }
 .cal-dot { width: 10px; height: 10px; border-radius: 99px; flex: none; }
 .cal-dot.deal { background: var(--phase-early); }
 .cal-dot.task { background: var(--ctp-yellow); }
+.cal-dot.campaign { background: var(--ctp-mauve); }
+
+/* ---------- daily feed ---------- */
+.feed-take { border-left: 3px solid var(--ctp-mauve); }
+.feed-take-text { font-size: 13.5px; line-height: 1.6; color: var(--text-2); }
+.feed-item { display: flex; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border-soft); font-size: 13px; align-items: flex-start; }
+.feed-item:last-child { border-bottom: none; }
+.feed-item .dot { width: 8px; height: 8px; border-radius: 50%; margin-top: 5px; flex-shrink: 0; }
+.feed-item .text { flex: 1; line-height: 1.45; }
+
+/* ---------- dashboard widget groups ---------- */
+.mw-sub { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-3); margin: 14px 0 2px; }
+.mw-sub:first-child { margin-top: 0; }
 .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; }
 .cal-dow { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-3); padding: 4px 6px; }
 .cal-day {

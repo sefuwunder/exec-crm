@@ -26,6 +26,11 @@ Data lives in `./crm.db` (created + seeded on first run). Override with `CRM_DB`
   tasks; fields show up on every form automatically.
 - **Daily Feed** — overdue, today's, and upcoming todos plus deals closing
   this week, with quick-add.
+- **Calendar** — month grid of deal expected-close dates and task due dates;
+  global view in the sidebar, a Calendar panel on every campaign page, and a
+  mini calendar inside the deal editor. Read-only: dates change via the deal
+  and task forms. Overdue open items are muted terracotta; done tasks and
+  closed deals are dimmed.
 - **Captures** — snap or upload photos of business cards and client notes
   (`capture="environment"` opens the camera on mobile); add a note and link
   each photo to a contact.
@@ -91,7 +96,8 @@ outgoing webhooks, so chains compose.
 `GET|POST /api/captures` (multipart `photos[]`) · `PATCH|DELETE /api/captures/:id` ·
 `GET /uploads/:file` ·
 `GET /api/schema/:entity` · `POST /api/schema/:entity` · `PATCH|DELETE /api/schema/fields/:id` ·
-`GET|POST /api/campaigns` · `PATCH|DELETE /api/campaigns/:id`
+`GET|POST /api/campaigns` · `PATCH|DELETE /api/campaigns/:id` ·\
+`GET /api/calendar?scope=global|campaign|deal&id=<n>&from=YYYY-MM-DD&to=YYYY-MM-DD`
 
 Captured photos land in `./uploads/` (created on boot; override with
 `CRM_UPLOADS`). Images only, 12 MB max each.

@@ -1199,6 +1199,67 @@ const server = Bun.serve({
       ).all(w) as any[]);
       return json({ campaigns: rows });
     }
+    // ---- calendar: read-only dated items for the month-grid views ---------------
+    // GET /api/calendar?scope=global|campaign|deal&id=<n>&from=YYYY-MM-DD&to=YYYY-MM-DD
+    // Returns { items } where each item is { type: "deal"|"task", id, title, date,
+    // ...full row fields } so the frontend can open the entity modals directly.
+    // Dates are ISO YYYY-MM-DD strings; range compares are lexicographic.
+    if (path === "/api/calendar" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const scope = url.searchParams.get("scope") || "global";
+      const id = Number(url.searchParams.get("id") || 0);
+      const from = url.searchParams.get("from") || "0000-00-00";
+      const to = url.searchParams.get("to") || "9999-99-99";
+      const inRange = (d: string) => !!d && d >= from && d <= to;
+      const dealRows = (where: string, params: unknown[]) =>
+        db.query(
+          `SELECT d.*, c.name AS company_name FROM deals d
+           LEFT JOIN companies c ON c.id = d.company_id
+           WHERE d.workspace_id = ? ${where} ORDER BY d.expected_close`
+        ).all(w, ...params) as any[];
+      const taskRows = (where: string, params: unknown[]) =>
+        db.query(
+          `SELECT t.*, d.title AS deal_title FROM tasks t
+           LEFT JOIN deals d ON d.id = t.deal_id
+           WHERE t.workspace_id = ? ${where} ORDER BY t.due_date`
+        ).all(w, ...params) as any[];
+      const items: any[] = [];
+      const stageNames: Record<string, string> = {};
+      for (const s of db.query("SELECT slug, name FROM stages WHERE workspace_id = ?").all(w) as any[])
+        stageNames[s.slug] = s.name;
+      const pushDeals = (rows: any[]) => {
+        for (const d of rows) if (inRange(d.expected_close))
+          items.push({ type: "deal", date: d.expected_close, stage_name: stageNames[d.stage] || d.stage, ...d });
+      };
+      const pushTasks = (rows: any[]) => {
+        for (const t of rows) if (inRange(t.due_date))
+          items.push({ type: "task", date: t.due_date, ...t });
+      };
+      if (scope === "global") {
+        pushDeals(dealRows("AND d.expected_close <> ''", []));
+        pushTasks(taskRows("AND t.due_date <> ''", []));
+      } else if (scope === "campaign") {
+        if (!id) return json({ error: "campaign id is required" }, 400);
+        const camp = db.query("SELECT id, name FROM campaigns WHERE id = ? AND workspace_id = ?").get(id, w);
+        if (!camp) return json({ error: "unknown campaign" }, 400);
+        pushDeals(dealRows("AND d.campaign_id = ? AND d.expected_close <> ''", [id]));
+        // tasks linked to the campaign directly, or via one of its deals
+        pushTasks(taskRows(
+          `AND t.due_date <> '' AND (t.campaign_id = ? OR t.deal_id IN
+            (SELECT id FROM deals WHERE campaign_id = ? AND workspace_id = ?))`, [id, id, w]));
+      } else if (scope === "deal") {
+        if (!id) return json({ error: "deal id is required" }, 400);
+        const deal = dealRows("AND d.id = ?", [id])[0];
+        if (!deal) return json({ error: "unknown deal" }, 400);
+        pushDeals([deal]);
+        pushTasks(taskRows("AND t.deal_id = ? AND t.due_date <> ''", [id]));
+      } else {
+        return json({ error: `unknown scope "${scope}"` }, 400);
+      }
+      items.sort((a, b) => a.date.localeCompare(b.date) || a.type.localeCompare(b.type) || a.id - b.id);
+      return json({ items });
+    }
     if (path === "/api/campaigns" && method === "POST") {
       const w = needWs(req, url);
       if (w instanceof Response) return w;

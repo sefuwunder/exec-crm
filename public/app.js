@@ -18,7 +18,7 @@ const wsParam = (p) => {
   return p + (p.includes("?") ? "&" : "?") + "workspace=" + encodeURIComponent(wsId);
 };
 const TITLES = {
-  dashboard: "Dashboard", feed: "Daily Feed",
+  dashboard: "Dashboard", feed: "Daily Feed", calendar: "Calendar",
   companies: "Companies", campaigns: "Campaigns", captures: "Captures",
   automations: "Automations", schema: "Schema",
 };
@@ -798,7 +798,8 @@ async function editDealModal(d) {
       ${field("Probability %", input("probability", d.probability, "number"))}
       ${field("Expected close", input("expected_close", d.expected_close || "", "date"))}
       ${field("Owner", input("owner", d.owner || ""))}
-    </div>`,
+    </div>
+    <div class="field"><label>Calendar</label><div id="deal-cal"><div class="empty">Loading…</div></div></div>`,
     async (data) => {
       if (data.company_id === "") data.company_id = null;
       if (data.contact_id === "") data.contact_id = null;
@@ -806,6 +807,23 @@ async function editDealModal(d) {
       await PATCH(`/api/deals/${d.id}`, data);
       route();
     }, "Save changes");
+  // mini read-only calendar: this deal's expected close + its tasks' due dates
+  (async () => {
+    try {
+      const now = new Date();
+      const anchor = /^\d{4}-\d{2}-\d{2}$/.test(d.expected_close || "")
+        ? d.expected_close.split("-").map(Number)
+        : [now.getFullYear(), now.getMonth() + 1];
+      const { from, to } = calVisibleRange(anchor[0], anchor[1] - 1);
+      const { items } = await GET(`/api/calendar?scope=deal&id=${d.id}&from=${from}&to=${to}`);
+      const byDate = {};
+      for (const it of items) (byDate[it.date] = byDate[it.date] || []).push(it);
+      const host = document.querySelector("#deal-cal");
+      if (host) host.innerHTML =
+        monthGridHtml(anchor[0], anchor[1] - 1, byDate, { mini: true, today: toISODate(new Date()) }) +
+        (items.length ? "" : `<div class="empty" style="margin-top:6px">No dates set — add an expected close date or task due dates.</div>`);
+    } catch { /* calendar is decorative; never block the editor */ }
+  })();
   const actions = document.querySelector("#modal-root .modal .actions");
   if (actions) {
     const del = document.createElement("button");
@@ -1257,6 +1275,10 @@ function renderCampaignDetail(c, tasks, deals, camp) {
         </tbody>
       </table>
       ${tasks.length ? "" : `<div class="empty">No tasks yet — add the first step.</div>`}
+    </div>
+    <div class="panel">
+      <h2 style="margin-top:0">Calendar</h2>
+      <div id="camp-cal"></div>
     </div>`;
   $("#edit-campaign").onclick = () => editCampaignModal(c);
   $("#add-campaign-contact").onclick = () => newContactModal(c.id);
@@ -1304,6 +1326,9 @@ function renderCampaignDetail(c, tasks, deals, camp) {
     const td = document.querySelector(`#view td[data-tid="${task.id}"][data-f="title"]`);
     if (td) td.click();
   };
+  // per-campaign calendar: deal close dates + campaign/deal task due dates
+  const campCal = $("#camp-cal");
+  if (campCal) mountCalendar(campCal, "campaign", c.id, { onItem: openCalItem });
 }
 
 /* shared task row + wiring (used by Daily Feed and campaign detail) */
@@ -1330,6 +1355,162 @@ function wireTaskRows(tasks, deals) {
 
 const toISODate = (d) =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+/* ---------- calendar views (global, per-campaign, per-deal) ----------
+   Read-only month grids over existing dated data: deal expected_close dates
+   and task due dates. All arithmetic is local calendar days (toISODate);
+   weeks start Monday. No event creation or drag-reschedule here. */
+const CAL_DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+/* 42 cells (6 full weeks) covering the month; each { date: "YYYY-MM-DD", inMonth }. */
+function calCells(year, month) {
+  const lead = (new Date(year, month, 1).getDay() + 6) % 7; // Monday-first offset
+  const start = new Date(year, month, 1 - lead);
+  const cells = [];
+  for (let i = 0; i < 42; i++) {
+    const d = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i);
+    cells.push({ date: toISODate(d), inMonth: d.getMonth() === month });
+  }
+  return cells;
+}
+function calVisibleRange(year, month) {
+  const cells = calCells(year, month);
+  return { from: cells[0].date, to: cells[cells.length - 1].date };
+}
+function calMonthLabel(year, month) {
+  return new Date(year, month, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+}
+function calDayLabel(iso) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
+}
+/* byDate: { "YYYY-MM-DD": [ { type:"deal"|"task", id, title, date, done?, stage? } ] }.
+   Pure HTML — no DOM access, so it is unit-testable. */
+function monthGridHtml(year, month, byDate, opts = {}) {
+  const today = opts.today || toISODate(new Date());
+  const maxChips = opts.mini ? 2 : 3;
+  const days = calCells(year, month).map((c) => {
+    const items = (byDate[c.date] || []).slice().sort((a, b) =>
+      a.type.localeCompare(b.type) || a.id - b.id);
+    const shown = items.slice(0, maxChips);
+    const extra = items.length - shown.length;
+    const chips = shown.map((it) => {
+      const doneish = it.type === "task" ? !!it.done : ["closed_won", "closed_lost"].includes(it.stage);
+      const cls = `cal-chip ${it.type}${doneish ? " is-dim" : ""}${!doneish && c.date < today ? " is-overdue" : ""}`;
+      const inner = esc(it.title);
+      return opts.mini
+        ? `<span class="${cls}" title="${inner}">${inner}</span>`
+        : `<button type="button" class="${cls}" data-cal-item="${it.type}:${it.id}" title="${inner}">${inner}</button>`;
+    }).join("");
+    const cls = ["cal-day"];
+    if (!c.inMonth) cls.push("is-out");
+    if (c.date === today) cls.push("is-today");
+    if (opts.selected === c.date) cls.push("is-selected");
+    return `<div class="${cls.join(" ")}" data-cal-day="${c.date}" role="button" tabindex="0" aria-label="${c.date}">` +
+      `<span class="cal-num">${Number(c.date.slice(8, 10))}</span>` +
+      `<div class="cal-chips">${chips}${extra > 0 ? `<span class="cal-more">+${extra}</span>` : ""}</div></div>`;
+  }).join("");
+  return `<div class="cal-grid${opts.mini ? " cal-mini" : ""}" role="grid" aria-label="${esc(calMonthLabel(year, month))}">` +
+    CAL_DOW.map((d) => `<div class="cal-dow">${d}</div>`).join("") + days + `</div>`;
+}
+/* One row in a calendar day-detail list. Carries data-cal-item for the shared binder. */
+function calDayRowHtml(it, today) {
+  const doneish = it.type === "task" ? !!it.done : ["closed_won", "closed_lost"].includes(it.stage);
+  const od = !doneish && it.date < today;
+  const meta = it.type === "deal"
+    ? `${money(it.value)} · ${esc(it.stage_name || it.stage || "")}${it.company_name ? ` · ${esc(it.company_name)}` : ""}`
+    : `${it.done ? "done" : `due ${esc(it.date)}`}${it.deal_title ? ` · ${esc(it.deal_title)}` : ""}`;
+  return `<div class="cal-row${od ? " is-overdue" : ""}" data-cal-item="${it.type}:${it.id}" role="button" tabindex="0">` +
+    `<span class="cal-dot ${it.type}"></span>` +
+    `<div class="cal-row-text"><b>${esc(it.title)}</b><span>${meta}</span></div></div>`;
+}
+/* Click + keyboard delegation for grids and day lists. onDay(iso), onItem(type, id). */
+function bindCalendarGrid(root, onDay, onItem) {
+  root.addEventListener("click", (e) => {
+    const item = e.target.closest("[data-cal-item]");
+    if (item && onItem) {
+      e.stopPropagation();
+      const [type, id] = item.dataset.calItem.split(":");
+      onItem(type, Number(id));
+      return;
+    }
+    const day = e.target.closest("[data-cal-day]");
+    if (day && onDay) onDay(day.dataset.calDay);
+  });
+  root.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    const t = e.target.closest("[data-cal-day],[data-cal-item]");
+    if (!t) return;
+    e.preventDefault();
+    if (t.hasAttribute("data-cal-item") && onItem) {
+      const [type, id] = t.dataset.calItem.split(":");
+      onItem(type, Number(id));
+    } else if (onDay) onDay(t.dataset.calDay);
+  });
+}
+/* Self-contained month calendar. scope: global|campaign|deal. opts: { mini }.
+   Fetches its own data, renders nav + grid + day list, opens entities via onItem.
+   Returns a redraw function. */
+async function mountCalendar(el, scope, id, opts = {}) {
+  const now = new Date();
+  let y = now.getFullYear(), m = now.getMonth();
+  let selected = toISODate(now);
+  const q = scope === "global" ? "" : `&id=${id}`;
+  async function draw() {
+    const { from, to } = calVisibleRange(y, m);
+    const { items } = await GET(`/api/calendar?scope=${scope}${q}&from=${from}&to=${to}`);
+    const byDate = {};
+    for (const it of items) (byDate[it.date] = byDate[it.date] || []).push(it);
+    const today = toISODate(new Date());
+    const selItems = (byDate[selected] || []).slice().sort((a, b) =>
+      a.type.localeCompare(b.type) || a.id - b.id);
+    const deals = items.filter((i) => i.type === "deal");
+    el.innerHTML = `
+      ${opts.mini ? "" : `<div class="cal-head">
+        <div class="cal-nav">
+          <button class="btn ghost small" data-cal-nav="-1" aria-label="Previous month">←</button>
+          <button class="btn ghost small" data-cal-nav="0">Today</button>
+          <button class="btn ghost small" data-cal-nav="1" aria-label="Next month">→</button>
+        </div>
+        <h2 style="margin:0">${esc(calMonthLabel(y, m))}</h2>
+        <div class="cal-legend">
+          <span class="cal-legend-item"><span class="cal-dot deal"></span>Deal closes</span>
+          <span class="cal-legend-item"><span class="cal-dot task"></span>Task due</span>
+        </div>
+      </div>`}
+      ${monthGridHtml(y, m, byDate, { mini: opts.mini, selected: opts.mini ? undefined : selected, today })}
+      ${opts.mini ? "" : `<div class="cal-daypanel">
+        <h3>${esc(calDayLabel(selected))} <span class="count">${selItems.length}</span></h3>
+        ${selItems.length ? selItems.map((it) => calDayRowHtml(it, today)).join("")
+          : `<div class="empty">${items.length ? "Nothing scheduled this day." : "No dated items this month — set expected close dates on deals or due dates on tasks."}</div>`}
+      </div>`}`;
+    el.querySelectorAll("[data-cal-nav]").forEach((b) => {
+      b.onclick = () => {
+        const step = Number(b.dataset.calNav);
+        if (step === 0) { const n = new Date(); y = n.getFullYear(); m = n.getMonth(); selected = toISODate(n); }
+        else { const d = new Date(y, m + step, 1); y = d.getFullYear(); m = d.getMonth(); }
+        draw();
+      };
+    });
+    bindCalendarGrid(el,
+      (d) => { selected = d; draw(); },
+      opts.onItem ? (type, itemId) => opts.onItem(type, itemId, items, deals) : undefined);
+  }
+  await draw();
+  return draw;
+}
+/* Open a calendar item in its editor modal. items/deals come from the calendar payload. */
+function openCalItem(type, id, items, deals) {
+  const it = items.find((x) => x.type === type && x.id === id);
+  if (!it) return;
+  if (type === "deal") editDealModal(it);
+  else editTaskModal(it, deals);
+}
+/* Global calendar view: nav-level month grid over the whole workspace. */
+async function vCalendar() {
+  view.innerHTML = `<div id="cal-root"></div>`;
+  await mountCalendar($("#cal-root"), "global", null, { onItem: openCalItem });
+}
 
 /* ---------- daily feed: what needs you today ---------- */
 async function vFeed() {
@@ -1736,8 +1917,9 @@ function initPalette() {
     if (cache && cacheWs === wsId) return cache;
     const NAV = [
       ["Dashboard", "#/dashboard"], ["Daily Feed", "#/feed"],
-      ["Campaigns", "#/campaigns"], ["Captures", "#/captures"],
-      ["Automations", "#/automations"], ["Schema", "#/schema"],
+      ["Calendar", "#/calendar"], ["Campaigns", "#/campaigns"],
+      ["Captures", "#/captures"], ["Automations", "#/automations"],
+      ["Schema", "#/schema"],
     ];
     const out = NAV.map(([label, hash]) => ({
       group: "Go to", kind: "view", label,
@@ -1842,7 +2024,7 @@ async function route() {
       await vCampaignDetail(Number(parts[1]));
     } else {
       $("#page-title").textContent = TITLES[name];
-      await { dashboard: vDashboard, feed: vFeed, contacts: vContacts,
+      await { dashboard: vDashboard, feed: vFeed, calendar: vCalendar, contacts: vContacts,
         companies: vCompanies, campaigns: vCampaigns, captures: vCaptures,
         automations: vAutomations, schema: vSchema }[name]();
     }

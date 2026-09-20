@@ -459,8 +459,27 @@ async function loadMeta() {
   const res = await fetch("/api/meta-colors").then((r) => r.ok ? r.json() : null).catch(() => null);
   state.colors = res?.colors || {};
 }
-const stageColor = (s) =>
-  state.colors[s] || { prospecting: "#4c8dff", qualification: "#8b9cf0", proposal: "#8b7cf6", negotiation: "#f5b83d", closed_won: "#22c07a", closed_lost: "#f06a7a" }[s] || "#999";
+function stageColor(s) {
+  return state.colors[s] || { prospecting: "#4c8dff", qualification: "#8b9cf0", proposal: "#8b7cf6", negotiation: "#f5b83d", closed_won: "#22c07a", closed_lost: "#f06a7a" }[s] || "#999";
+}
+/* Funnel-phase color coding: the workspace's ordered stages are split into
+   thirds by position (early / middle / end), so the coding survives stage
+   renames, reorders and additions. closed_won/closed_lost sit at the end of
+   the order and land in the "end" third naturally. Unknown stages (not in
+   the workspace order) get no phase. --urgent is never used here: it is
+   reserved for overdue / upcoming-soon emphasis. */
+function stagePhase(s) {
+  const order = state.stages;
+  const i = order.indexOf(s);
+  if (i < 0 || order.length === 0) return null;
+  const third = order.length / 3;
+  return i < third ? "early" : i < 2 * third ? "middle" : "end";
+}
+const PHASE_VARS = { early: "var(--phase-early)", middle: "var(--phase-middle)", end: "var(--phase-end)" };
+function phaseColor(p) { return PHASE_VARS[p] || null; }
+/* Funnel-aware stage color for board/strip/chips: phase color when the stage
+   is in the workspace order, otherwise the legacy per-stage color. */
+function stageFunnelColor(s) { return phaseColor(stagePhase(s)) || stageColor(s); }
 
 async function vDashboard() {
   const k = await GET("/api/kpis");
@@ -532,12 +551,12 @@ function boardHtml(deals, campNameById) {
       const ds = deals.filter((d) => d.stage === s);
       const tot = ds.reduce((a, d) => a + (Number(d.value) || 0), 0);
       return `<div class="column" data-stage="${s}">
-        <div class="chead"><div class="dot" style="background:${stageColor(s)}"></div>
+        <div class="chead"><div class="dot" style="background:${stageFunnelColor(s)}"></div>
           <div class="cname">${esc(state.labels[s] || s)}</div>
           <div class="ctotal">${ds.length} · ${moneyShort(tot)}</div></div>
         ${ds.map((d) => `
           <div class="deal-card" data-id="${d.id}">
-            <div class="trow"><span class="sdot" style="background:${stageColor(s)}"></span><div class="t">${esc(d.title)}</div></div>
+            <div class="trow"><span class="sdot" style="background:${stageFunnelColor(s)}"></span><div class="t">${esc(d.title)}</div></div>
             <div class="co">${esc(d.company_name || "—")}${d.contact_name ? " · " + esc(d.contact_name) : ""}</div>
             ${campNameById ? `<div style="margin-top:6px"><span class="pill" style="background:var(--border-soft);color:var(--text-2)">${esc(campNameById.get(d.campaign_id) || "No campaign")}</span></div>` : ""}
             <div class="row"><div class="val">${money(d.value)}</div><div class="prob">${d.probability}%</div></div>
@@ -1019,7 +1038,7 @@ function campaignPipelineStrip(deals) {
   const total = [...totals.values()].reduce((a, v) => a + v, 0);
   const segs = ordered.map((s) => {
     const v = totals.get(s) || 0;
-    return `<span title="${esc(state.labels[s] || s)}: ${money(v)}" style="display:block;height:100%;width:${total ? ((v / total) * 100).toFixed(1) : 0}%;background:${stageColor(s)}"></span>`;
+    return `<span title="${esc(state.labels[s] || s)}: ${money(v)}" style="display:block;height:100%;width:${total ? ((v / total) * 100).toFixed(1) : 0}%;background:${stageFunnelColor(s)}"></span>`;
   }).join("");
   return `<div style="display:flex;align-items:center;gap:8px;min-width:170px;max-width:260px">
     <div style="display:flex;height:8px;flex:1;border-radius:99px;overflow:hidden;background:var(--border-soft)">${segs}</div>
@@ -1254,11 +1273,20 @@ function renderCampaignDetail(c, tasks, deals, camp) {
       ${campaignContactsHtml(camp.contacts)}
       ${campaignCompaniesHtml(camp.companies)}
     </div>
+    <div class="panel">
+      <h2 style="margin-top:0">Calendar</h2>
+      <div id="camp-cal"></div>
+    </div>
     <div class="panel sheet-wrap">
       <div class="sheet-head">
-        <h3 style="margin:0">Workflow tasks</h3>
+        <button type="button" class="collapse-toggle" id="tasks-toggle" aria-expanded="false" aria-controls="tasks-body">
+          <span class="chev" aria-hidden="true">▸</span>
+          <span>Workflow tasks</span>
+          <span class="count">${tasks.length}</span>
+        </button>
         <button class="btn small" id="add-task">+ Add task</button>
       </div>
+      <div id="tasks-body" hidden>
       <table class="sheet">
         <thead><tr>
           <th class="c-done"></th><th>Task</th><th>Owner</th><th>Due</th><th></th><th></th>
@@ -1275,10 +1303,7 @@ function renderCampaignDetail(c, tasks, deals, camp) {
         </tbody>
       </table>
       ${tasks.length ? "" : `<div class="empty">No tasks yet — add the first step.</div>`}
-    </div>
-    <div class="panel">
-      <h2 style="margin-top:0">Calendar</h2>
-      <div id="camp-cal"></div>
+      </div>
     </div>`;
   $("#edit-campaign").onclick = () => editCampaignModal(c);
   $("#add-campaign-contact").onclick = () => newContactModal(c.id);
@@ -1325,6 +1350,16 @@ function renderCampaignDetail(c, tasks, deals, camp) {
     await refreshCampaignDetail(c, deals);
     const td = document.querySelector(`#view td[data-tid="${task.id}"][data-f="title"]`);
     if (td) td.click();
+  };
+  // workflow tasks collapsed by default; header toggles the table
+  const tasksToggle = $("#tasks-toggle");
+  if (tasksToggle) tasksToggle.onclick = () => {
+    const body = $("#tasks-body");
+    const opening = body.hidden;
+    body.hidden = !opening;
+    tasksToggle.setAttribute("aria-expanded", String(opening));
+    const chev = tasksToggle.querySelector(".chev");
+    if (chev) chev.textContent = opening ? "▾" : "▸";
   };
   // per-campaign calendar: deal close dates + campaign/deal task due dates
   const campCal = $("#camp-cal");
@@ -1384,34 +1419,81 @@ function calDayLabel(iso) {
   const [y, m, d] = iso.split("-").map(Number);
   return new Date(y, m - 1, d).toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
 }
+/* One calendar chip. Deal chips carry a funnel-phase left border so the stage
+   position reads at a glance. Pure HTML — no DOM access, unit-testable. */
+function calChipHtml(it, date, today, opts = {}) {
+  const doneish = it.type === "task" ? !!it.done : ["closed_won", "closed_lost"].includes(it.stage);
+  const cls = `cal-chip ${it.type}${doneish ? " is-dim" : ""}${!doneish && date < today ? " is-overdue" : ""}`;
+  const inner = esc(it.title);
+  const phase = it.type === "deal" ? ` style="border-left:3px solid ${stageFunnelColor(it.stage)}"` : "";
+  return opts.mini
+    ? `<span class="${cls}"${phase} title="${inner}">${inner}</span>`
+    : `<button type="button" class="${cls}"${phase} data-cal-item="${it.type}:${it.id}" title="${inner}">${inner}</button>`;
+}
+function calChipsHtml(items, date, today, opts = {}) {
+  const maxChips = opts.mini ? 2 : 3;
+  const sorted = items.slice().sort((a, b) => a.type.localeCompare(b.type) || a.id - b.id);
+  const shown = sorted.slice(0, maxChips);
+  const extra = sorted.length - shown.length;
+  return shown.map((it) => calChipHtml(it, date, today, opts)).join("") +
+    (extra > 0 ? `<span class="cal-more">+${extra}</span>` : "");
+}
 /* byDate: { "YYYY-MM-DD": [ { type:"deal"|"task", id, title, date, done?, stage? } ] }.
    Pure HTML — no DOM access, so it is unit-testable. */
 function monthGridHtml(year, month, byDate, opts = {}) {
   const today = opts.today || toISODate(new Date());
-  const maxChips = opts.mini ? 2 : 3;
   const days = calCells(year, month).map((c) => {
-    const items = (byDate[c.date] || []).slice().sort((a, b) =>
-      a.type.localeCompare(b.type) || a.id - b.id);
-    const shown = items.slice(0, maxChips);
-    const extra = items.length - shown.length;
-    const chips = shown.map((it) => {
-      const doneish = it.type === "task" ? !!it.done : ["closed_won", "closed_lost"].includes(it.stage);
-      const cls = `cal-chip ${it.type}${doneish ? " is-dim" : ""}${!doneish && c.date < today ? " is-overdue" : ""}`;
-      const inner = esc(it.title);
-      return opts.mini
-        ? `<span class="${cls}" title="${inner}">${inner}</span>`
-        : `<button type="button" class="${cls}" data-cal-item="${it.type}:${it.id}" title="${inner}">${inner}</button>`;
-    }).join("");
+    const chips = calChipsHtml(byDate[c.date] || [], c.date, today, opts);
     const cls = ["cal-day"];
     if (!c.inMonth) cls.push("is-out");
     if (c.date === today) cls.push("is-today");
     if (opts.selected === c.date) cls.push("is-selected");
     return `<div class="${cls.join(" ")}" data-cal-day="${c.date}" role="button" tabindex="0" aria-label="${c.date}">` +
       `<span class="cal-num">${Number(c.date.slice(8, 10))}</span>` +
-      `<div class="cal-chips">${chips}${extra > 0 ? `<span class="cal-more">+${extra}</span>` : ""}</div></div>`;
+      `<div class="cal-chips">${chips}</div></div>`;
   }).join("");
   return `<div class="cal-grid${opts.mini ? " cal-mini" : ""}" role="grid" aria-label="${esc(calMonthLabel(year, month))}">` +
     CAL_DOW.map((d) => `<div class="cal-dow">${d}</div>`).join("") + days + `</div>`;
+}
+/* 7 cells (Monday-first week) containing the anchor date (ISO "YYYY-MM-DD"). */
+function weekCells(anchorIso) {
+  const [y, m, d] = anchorIso.split("-").map(Number);
+  const dt = new Date(y, m - 1, d);
+  const off = (dt.getDay() + 6) % 7; // Monday-first offset
+  const start = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate() - off);
+  const cells = [];
+  for (let i = 0; i < 7; i++) {
+    const dd = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i);
+    cells.push({ date: toISODate(dd) });
+  }
+  return cells;
+}
+function calWeekLabel(anchorIso) {
+  const cells = weekCells(anchorIso);
+  const fmt = (iso) => {
+    const [y, m, d] = iso.split("-").map(Number);
+    return new Date(y, m - 1, d).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  };
+  return `${fmt(cells[0].date)} – ${fmt(cells[6].date)}, ${cells[6].date.slice(0, 4)}`;
+}
+/* Week grid: 7 taller day columns headed by weekday + date number.
+   Pure HTML — unit-testable. */
+function weekGridHtml(anchorIso, byDate, opts = {}) {
+  const today = opts.today || toISODate(new Date());
+  const cells = weekCells(anchorIso);
+  const head = cells.map((c) => {
+    const [y, m, d] = c.date.split("-").map(Number);
+    const dow = CAL_DOW[(new Date(y, m - 1, d).getDay() + 6) % 7];
+    return `<div class="cal-dow${c.date === today ? " is-today" : ""}">${dow} <span class="cal-dow-num">${d}</span></div>`;
+  }).join("");
+  const days = cells.map((c) => {
+    const cls = ["cal-day"];
+    if (c.date === today) cls.push("is-today");
+    if (opts.selected === c.date) cls.push("is-selected");
+    return `<div class="${cls.join(" ")}" data-cal-day="${c.date}" role="button" tabindex="0" aria-label="${c.date}">` +
+      `<div class="cal-chips">${calChipsHtml(byDate[c.date] || [], c.date, today, opts)}</div></div>`;
+  }).join("");
+  return `<div class="cal-grid cal-week" role="grid" aria-label="${esc(calWeekLabel(anchorIso))}">${head}${days}</div>`;
 }
 /* One row in a calendar day-detail list. Carries data-cal-item for the shared binder. */
 function calDayRowHtml(it, today) {
@@ -1421,7 +1503,7 @@ function calDayRowHtml(it, today) {
     ? `${money(it.value)} · ${esc(it.stage_name || it.stage || "")}${it.company_name ? ` · ${esc(it.company_name)}` : ""}`
     : `${it.done ? "done" : `due ${esc(it.date)}`}${it.deal_title ? ` · ${esc(it.deal_title)}` : ""}`;
   return `<div class="cal-row${od ? " is-overdue" : ""}" data-cal-item="${it.type}:${it.id}" role="button" tabindex="0">` +
-    `<span class="cal-dot ${it.type}"></span>` +
+    `<span class="cal-dot ${it.type}"${it.type === "deal" ? ` style="background:${stageFunnelColor(it.stage)}"` : ""}></span>` +
     `<div class="cal-row-text"><b>${esc(it.title)}</b><span>${meta}</span></div></div>`;
 }
 /* Click + keyboard delegation for grids and day lists. onDay(iso), onItem(type, id). */
@@ -1448,56 +1530,105 @@ function bindCalendarGrid(root, onDay, onItem) {
     } else if (onDay) onDay(t.dataset.calDay);
   });
 }
-/* Self-contained month calendar. scope: global|campaign|deal. opts: { mini }.
-   Fetches its own data, renders nav + grid + day list, opens entities via onItem.
+/* Self-contained calendar. scope: global|campaign|deal. opts: { mini, view }.
+   Week view is the default (mini stays month-only). Fetches its own data,
+   renders nav + view toggle + grid + day list, opens entities via onItem.
    Returns a redraw function. */
 async function mountCalendar(el, scope, id, opts = {}) {
   const now = new Date();
-  let y = now.getFullYear(), m = now.getMonth();
+  let view = opts.mini ? "month" : (opts.view || "week");
+  let anchor = toISODate(now); // week anchor (any date in the shown week)
+  let y = now.getFullYear(), m = now.getMonth(); // month cursor
   let selected = toISODate(now);
   const q = scope === "global" ? "" : `&id=${id}`;
+  const stepNav = (step) => {
+    if (view === "week") {
+      const [ay, am, ad] = anchor.split("-").map(Number);
+      anchor = toISODate(new Date(ay, am - 1, ad + step * 7));
+    } else {
+      const d = new Date(y, m + step, 1);
+      y = d.getFullYear(); m = d.getMonth();
+    }
+  };
+  const goToday = () => {
+    const n = new Date();
+    anchor = toISODate(n); y = n.getFullYear(); m = n.getMonth(); selected = toISODate(n);
+  };
   async function draw() {
-    const { from, to } = calVisibleRange(y, m);
-    const { items } = await GET(`/api/calendar?scope=${scope}${q}&from=${from}&to=${to}`);
-    const byDate = {};
-    for (const it of items) (byDate[it.date] = byDate[it.date] || []).push(it);
     const today = toISODate(new Date());
-    const selItems = (byDate[selected] || []).slice().sort((a, b) =>
-      a.type.localeCompare(b.type) || a.id - b.id);
-    const deals = items.filter((i) => i.type === "deal");
+    let from, to, label, grid, panel = "";
+    if (view === "week") {
+      const cells = weekCells(anchor);
+      from = cells[0].date; to = cells[6].date;
+      label = calWeekLabel(anchor);
+      const { items } = await GET(`/api/calendar?scope=${scope}${q}&from=${from}&to=${to}`);
+      lastItems = items; lastDeals = items.filter((i) => i.type === "deal");
+      const byDate = {};
+      for (const it of items) (byDate[it.date] = byDate[it.date] || []).push(it);
+      grid = weekGridHtml(anchor, byDate, { selected, today });
+      panel = calDayPanelHtml(byDate, selected, today, items, "week");
+    } else {
+      ({ from, to } = calVisibleRange(y, m));
+      label = calMonthLabel(y, m);
+      const { items } = await GET(`/api/calendar?scope=${scope}${q}&from=${from}&to=${to}`);
+      const byDate = {};
+      for (const it of items) (byDate[it.date] = byDate[it.date] || []).push(it);
+      grid = monthGridHtml(y, m, byDate, { mini: opts.mini, selected: opts.mini ? undefined : selected, today });
+      if (!opts.mini) {
+        lastItems = items; lastDeals = items.filter((i) => i.type === "deal");
+        panel = calDayPanelHtml(byDate, selected, today, items, "month");
+      }
+    }
     el.innerHTML = `
       ${opts.mini ? "" : `<div class="cal-head">
         <div class="cal-nav">
-          <button class="btn ghost small" data-cal-nav="-1" aria-label="Previous month">←</button>
+          <button class="btn ghost small" data-cal-nav="-1" aria-label="Previous ${view}">←</button>
           <button class="btn ghost small" data-cal-nav="0">Today</button>
-          <button class="btn ghost small" data-cal-nav="1" aria-label="Next month">→</button>
+          <button class="btn ghost small" data-cal-nav="1" aria-label="Next ${view}">→</button>
         </div>
-        <h2 style="margin:0">${esc(calMonthLabel(y, m))}</h2>
+        <div class="cal-view" role="group" aria-label="Calendar view">
+          <button class="btn ghost small" data-cal-view="week" aria-pressed="${view === "week"}">Week</button>
+          <button class="btn ghost small" data-cal-view="month" aria-pressed="${view === "month"}">Month</button>
+        </div>
+        <h2 style="margin:0">${esc(label)}</h2>
         <div class="cal-legend">
           <span class="cal-legend-item"><span class="cal-dot deal"></span>Deal closes</span>
           <span class="cal-legend-item"><span class="cal-dot task"></span>Task due</span>
         </div>
       </div>`}
-      ${monthGridHtml(y, m, byDate, { mini: opts.mini, selected: opts.mini ? undefined : selected, today })}
-      ${opts.mini ? "" : `<div class="cal-daypanel">
-        <h3>${esc(calDayLabel(selected))} <span class="count">${selItems.length}</span></h3>
-        ${selItems.length ? selItems.map((it) => calDayRowHtml(it, today)).join("")
-          : `<div class="empty">${items.length ? "Nothing scheduled this day." : "No dated items this month — set expected close dates on deals or due dates on tasks."}</div>`}
-      </div>`}`;
+      ${grid}
+      ${opts.mini ? "" : `<div class="cal-daypanel">${panel}</div>`}`;
     el.querySelectorAll("[data-cal-nav]").forEach((b) => {
       b.onclick = () => {
         const step = Number(b.dataset.calNav);
-        if (step === 0) { const n = new Date(); y = n.getFullYear(); m = n.getMonth(); selected = toISODate(n); }
-        else { const d = new Date(y, m + step, 1); y = d.getFullYear(); m = d.getMonth(); }
+        if (step === 0) goToday(); else stepNav(step);
         draw();
       };
     });
-    bindCalendarGrid(el,
-      (d) => { selected = d; draw(); },
-      opts.onItem ? (type, itemId) => opts.onItem(type, itemId, items, deals) : undefined);
+    el.querySelectorAll("[data-cal-view]").forEach((b) => {
+      b.onclick = () => { view = b.dataset.calView; draw(); };
+    });
+    // bindCalendarGrid is bound once per mount (not per draw): draw() replaces
+    // innerHTML but the root element persists, so per-draw binding would pile
+    // up duplicate click/keydown handlers on every navigation.
   }
-  await draw();
-  return draw;
+  let lastItems = [], lastDeals = [];
+  bindCalendarGrid(el,
+    (d) => { selected = d; draw(); },
+    opts.onItem ? (type, itemId) => opts.onItem(type, itemId, lastItems, lastDeals) : undefined);
+  const _draw = draw;
+  await _draw();
+  return _draw;
+}
+/* Day-detail panel under the grid. Separated so week/month share it.
+   Pure HTML given its inputs — unit-testable. */
+function calDayPanelHtml(byDate, selected, today, items, view) {
+  const selItems = (byDate[selected] || []).slice().sort((a, b) =>
+    a.type.localeCompare(b.type) || a.id - b.id);
+  return `
+    <h3>${esc(calDayLabel(selected))} <span class="count">${selItems.length}</span></h3>
+    ${selItems.length ? selItems.map((it) => calDayRowHtml(it, today)).join("")
+      : `<div class="empty">${items.length ? "Nothing scheduled this day." : `No dated items this ${view} — set expected close dates on deals or due dates on tasks.`}</div>`}`;
 }
 /* Open a calendar item in its editor modal. items/deals come from the calendar payload. */
 function openCalItem(type, id, items, deals) {

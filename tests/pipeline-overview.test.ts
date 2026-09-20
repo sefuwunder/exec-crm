@@ -49,12 +49,20 @@ const moneyShortT = (n: any) => {
 const stageColorT = (s: string) =>
   ({ prospecting: "#4c8dff", negotiation: "#f5b83d" } as Record<string, string>)[s] || "#999";
 const stateT = { stages: ["prospecting", "qualification", "proposal", "negotiation", "closed_won", "closed_lost"], labels: { prospecting: "Prospecting", negotiation: "Negotiation" } as Record<string, string> };
+// Mirror of the app's funnel-phase logic over the same workspace order.
+const stageFunnelColorT = (s: string) => {
+  const i = stateT.stages.indexOf(s);
+  if (i < 0 || !stateT.stages.length) return stageColorT(s);
+  const third = stateT.stages.length / 3;
+  const p = i < third ? "early" : i < 2 * third ? "middle" : "end";
+  return ({ early: "var(--phase-early)", middle: "var(--phase-middle)", end: "var(--phase-end)" } as Record<string, string>)[p];
+};
 
 const strip = (deals: any[]) =>
   new Function(
-    "esc", "money", "moneyShort", "stageColor", "state", "deals",
+    "esc", "money", "moneyShort", "stageColor", "stageFunnelColor", "state", "deals",
     extractFn(appSrc, "campaignPipelineStrip") + "\nreturn campaignPipelineStrip(deals);"
-  )(escT, moneyT, moneyShortT, stageColorT, stateT, deals) as string;
+  )(escT, moneyT, moneyShortT, stageColorT, stageFunnelColorT, stateT, deals) as string;
 
 describe("campaignPipelineStrip", () => {
   test("empty campaign shows a clean empty state, not zeros", () => {
@@ -72,8 +80,8 @@ describe("campaignPipelineStrip", () => {
     ]);
     // one segment per stage, widths proportional to stage value (150k/150k)
     expect(html).toContain('width:50.0%');
-    expect(html).toContain('background:#4c8dff'); // prospecting
-    expect(html).toContain('background:#f5b83d'); // negotiation
+    expect(html).toContain('background:var(--phase-early)'); // prospecting
+    expect(html).toContain('background:var(--phase-middle)'); // negotiation
     expect(html).toContain('title="Prospecting: $150,000"');
     expect(html).toContain('title="Negotiation: $150,000"');
     expect(html).toContain("3 · <b>$300k</b>");

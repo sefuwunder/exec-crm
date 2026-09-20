@@ -58,12 +58,20 @@ const stateT = {
     negotiation: "Negotiation", closed_won: "Closed won", closed_lost: "Closed lost",
   } as Record<string, string>,
 };
+// Mirror of the app's funnel-phase logic over the same workspace order.
+const stageFunnelColorT = (s: string) => {
+  const i = stateT.stages.indexOf(s);
+  if (i < 0 || !stateT.stages.length) return stageColorT(s);
+  const third = stateT.stages.length / 3;
+  const p = i < third ? "early" : i < 2 * third ? "middle" : "end";
+  return ({ early: "var(--phase-early)", middle: "var(--phase-middle)", end: "var(--phase-end)" } as Record<string, string>)[p];
+};
 
 const board = (deals: any[], campNameById?: Map<number, string>) =>
   new Function(
-    "esc", "money", "moneyShort", "stageColor", "state", "deals", "campNameById",
+    "esc", "money", "moneyShort", "stageColor", "stageFunnelColor", "state", "deals", "campNameById",
     extractFn(appSrc, "boardHtml") + "\nreturn boardHtml(deals, campNameById);"
-  )(escT, moneyT, moneyShortT, stageColorT, stateT, deals, campNameById) as string;
+  )(escT, moneyT, moneyShortT, stageColorT, stageFunnelColorT, stateT, deals, campNameById) as string;
 
 const campMap = new Map<number, string>([[7, "Q4 Launch"], [9, "Beta Test"]]);
 const D = (id: number, stage: string, value: number, campaign_id: number | null, title = "Deal " + id) =>
@@ -247,9 +255,9 @@ describe("filterBoardDeals", () => {
 describe("vCampaigns DOM-stubbed render", () => {
   const statusPillT = (s: string) => `<span class="pill">${escT(s)}</span>`;
   const stripT = (deals: any[]) =>
-    new Function("esc", "money", "moneyShort", "stageColor", "state", "deals",
+    new Function("esc", "money", "moneyShort", "stageColor", "stageFunnelColor", "state", "deals",
       extractFn(appSrc, "campaignPipelineStrip") + "\nreturn campaignPipelineStrip(deals);")
-      (escT, moneyT, moneyShortT, stageColorT, stateT, deals) as string;
+      (escT, moneyT, moneyShortT, stageColorT, stageFunnelColorT, stateT, deals) as string;
 
   const campaigns = [
     { id: 7, name: "Q4 Launch", company_name: "Acme", status: "active", start_date: "", end_date: "", budget: 5000 },

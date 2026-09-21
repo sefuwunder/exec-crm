@@ -113,9 +113,9 @@ describe("campaign detail no longer shows the pipeline panel", () => {
 });
 
 describe("campaigns overview wires the strip in", () => {
-  test("vCampaigns fetches all deals and renders a Pipeline column per row", () => {
-    const fn = extractFn(appSrc, "vCampaigns");
-    expect(fn).toContain('GET("/api/deals")');
+  test("vCampaignOverview fetches all deals and renders a Pipeline column per row", () => {
+    expect(extractFn(appSrc, "campaignTabData")).toContain('GET("/api/deals")');
+    const fn = extractFn(appSrc, "vCampaignOverview");
     expect(fn).toContain("<th>Pipeline</th>");
     expect(fn).toContain("campaignPipelineStrip(dealsByCamp.get(c.id) || [])");
   });

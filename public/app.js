@@ -33,6 +33,7 @@ const wsParam = (p) => {
 const TITLES = {
   dashboard: "Dashboard", feed: "Daily Feed", calendar: "Calendar",
   companies: "Companies", contacts: "Contacts", campaigns: "Campaigns",
+  calls: "Calls",
   workshop: "Data Workshop", milton: "Milton",
 };
 // Old top-level sections now live inside the Data Workshop tabs.
@@ -1049,7 +1050,8 @@ async function editDealModal(d) {
       ${field("Source", `<input name="source" list="deal-sources" value="${esc(d.source || "")}"><datalist id="deal-sources">${sources.map((s) => `<option value="${esc(s)}">`).join("")}</datalist>`)}
     </div>
     <div class="journey"><h3>Journey</h3><div id="deal-journey"><div class="empty">Loading…</div></div></div>
-    <div class="field"><label>Calendar</label><div id="deal-cal"><div class="empty">Loading…</div></div></div>`,
+    <div class="field"><label>Calendar</label><div id="deal-cal"><div class="empty">Loading…</div></div></div>
+    ${callSectionHtml("deal", d.id)}`,
     async (data) => {
       if (data.company_id === "") data.company_id = null;
       if (data.contact_id === "") data.contact_id = null;
@@ -1057,6 +1059,7 @@ async function editDealModal(d) {
       await PATCH(`/api/deals/${d.id}`, data);
       route();
     }, "Save changes");
+  wireCallSection("deal", d.id, { deal_id: d.id, company_id: d.company_id || undefined, contact_id: d.contact_id || undefined });
   // mini read-only calendar: this deal's expected close + its tasks' due dates
   (async () => {
     try {
@@ -1265,15 +1268,25 @@ async function editContactModal(c) {
       ${field("Title", input("title", c.title))}
       ${field("Company", select("company_id", [["", "—"]].concat(companies.map((x) => [x.id, x.name])), c.company_id || ""))}
       ${field("Email", input("email", c.email, "email"))}
-      ${field("Phone", input("phone", c.phone))}
+      ${field("Phone", `<div style="display:flex;gap:8px;align-items:center">${input("phone", c.phone, "tel")}${c.phone ? `<a class="btn ghost small" href="tel:${esc(c.phone.replace(/[^+\d]/g, ""))}" title="Call ${esc(c.phone)}">Call</a>` : ""}</div>`)}
       ${field("Campaign", select("campaign_id", [["", "—"]].concat(campaigns.map((x) => [x.id, x.name])), c.campaign_id || ""))}
     </div>
-    ${cfFieldsHtml(fields, c.custom)}`,
+    <div class="formgrid">
+      ${field("Email opt-out", `<label class="check"><input type="checkbox" id="f-email-optout" ${c.email_opt_out ? "checked" : ""}> Skip in email campaigns</label>`)}
+      ${field("SMS opt-out", `<label class="check"><input type="checkbox" id="f-sms-optout" ${c.sms_opt_out ? "checked" : ""}> Skip in SMS campaigns</label>`)}
+    </div>
+    ${field("SMS gateway", input("sms_gateway", c.sms_gateway || "", "text", 'placeholder="15551234567@vtext.com"'))}
+    <p class="hint" style="margin-top:-6px">Used for Email-to-SMS gateway delivery. Find yours from your mobile carrier (e.g. <span class="tag">number@vtext.com</span>).</p>
+    ${cfFieldsHtml(fields, c.custom)}
+    ${callSectionHtml("contact", c.id)}`,
     async (d) => {
       if (d.company_id === "") d.company_id = null;
       if (d.campaign_id === "") d.campaign_id = null;
+      d.email_opt_out = $("#f-email-optout").checked;
+      d.sms_opt_out = $("#f-sms-optout").checked;
       await PATCH(`/api/contacts/${c.id}`, d); route();
     }, "Save changes");
+  wireCallSection("contact", c.id, { contact_id: c.id, company_id: c.company_id || undefined });
 }
 
 async function newCompanyModal(presetCampaignId) {
@@ -1313,11 +1326,13 @@ async function editCompanyModal(c) {
     ${field("Name", input("name", c.name))}
     <div class="formgrid">${field("Industry", input("industry", c.industry))}${field("Website", input("website", c.website))}${field("Campaign", select("campaign_id", [["", "—"]].concat(campaigns.map((x) => [x.id, x.name])), c.campaign_id || ""))}</div>
     ${cfFieldsHtml(fields, c.custom)}
+    ${callSectionHtml("company", c.id)}
     <div style="margin-top:14px"><button class="btn danger small" id="m-del-company">Delete company</button></div>`,
     async (d) => {
       if (d.campaign_id === "") d.campaign_id = null;
       await PATCH(`/api/companies/${c.id}`, d); route();
     }, "Save changes");
+  wireCallSection("company", c.id, { company_id: c.id });
   $("#m-del-company").onclick = () => deleteCompany(c);
 }
 
@@ -1419,7 +1434,28 @@ function filterBoardDeals(deals, filter) {
   return deals.filter((d) => String(d.campaign_id) === String(filter));
 }
 
-async function vCampaigns() {
+/* ---------- campaigns: Overview | Pipeline | Email | SMS tabs ---------- */
+const CAMPAIGN_TABS = [["overview", "Overview"], ["pipeline", "Pipeline"], ["email", "Email"], ["sms", "SMS"]];
+function campaignTabsHtml(active) {
+  return `<div class="seg" role="tablist" aria-label="Campaign sections" style="margin-bottom:16px">${CAMPAIGN_TABS.map(([id, label]) =>
+    `<button type="button" role="tab" aria-selected="${id === active}" class="${id === active ? "on" : ""}" data-ctab="${id}">${label}</button>`).join("")}</div>`;
+}
+function wireCampaignTabs() {
+  document.querySelectorAll("[data-ctab]").forEach((b) => {
+    b.onclick = () => { location.hash = `#/campaigns/${b.dataset.ctab}`; };
+  });
+}
+
+async function vCampaigns(tab = "overview") {
+  view.innerHTML = campaignTabsHtml(tab) + `<div id="ctab-body"></div>`;
+  wireCampaignTabs();
+  if (tab === "email" || tab === "sms") return vMsgTab(tab);
+  if (tab === "pipeline") return vCampaignPipeline();
+  return vCampaignOverview();
+}
+
+/* Overview + pipeline tabs share one data fetch. */
+async function campaignTabData() {
   const [{ campaigns }, { companies }, { deals }, { sources }, { views }] = await Promise.all([
     GET("/api/campaigns"), GET("/api/companies"), GET("/api/deals"),
     GET("/api/deal-sources").catch(() => ({ sources: [] })),
@@ -1434,16 +1470,12 @@ async function vCampaigns() {
     if (!dealsByCamp.has(d.campaign_id)) dealsByCamp.set(d.campaign_id, []);
     dealsByCamp.get(d.campaign_id).push(d);
   }
-  /* Pipeline board below the list: all workspace deals as a cross-campaign
-     kanban, filtered client-side by campaign, then by the board filters. */
-  const campNameById = new Map(campaigns.map((c) => [c.id, c.name]));
-  const allDeals = deals || [];
-  const boardDeals = applyPipeFilters(filterBoardDeals(allDeals, campBoardFilter));
-  // selection only survives for deals still visible
-  bulkSel = new Set([...bulkSel].filter((id) => boardDeals.some((d) => d.id === id)));
-  const boardOpen = boardDeals.filter((d) => !["closed_won", "closed_lost"].includes(d.stage));
-  const boardValue = boardOpen.reduce((a, d) => a + (Number(d.value) || 0), 0);
-  view.innerHTML = `
+  return { campaigns, companies, deals: deals || [], dealsByCamp };
+}
+
+async function vCampaignOverview() {
+  const { campaigns, companies, dealsByCamp } = await campaignTabData();
+  $("#ctab-body").innerHTML = `
     <div class="toolbar"><div class="spacer"></div>
       <button class="btn" id="new-campaign">+ New campaign</button></div>
     <div class="panel"><table>
@@ -1454,34 +1486,10 @@ async function vCampaigns() {
         <td><b>${money(c.budget)}</b></td>
         <td>${campaignPipelineStrip(dealsByCamp.get(c.id) || [])}</td></tr>`).join("")}
     </table>${campaigns.length ? "" : `<div class="empty">No campaigns yet — launch your first one.</div>`}</div>
-    <div class="panel">
-      <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap">
-        <h2 style="margin:0">Pipeline</h2>
-        <select id="board-camp-filter" style="max-width:230px;width:auto">
-          <option value="all" ${campBoardFilter === "all" ? "selected" : ""}>All campaigns</option>
-          ${campaigns.map((c) => `<option value="${c.id}" ${String(campBoardFilter) === String(c.id) ? "selected" : ""}>${esc(c.name)}</option>`).join("")}
-          <option value="none" ${campBoardFilter === "none" ? "selected" : ""}>No campaign</option>
-        </select>
-        ${savedViewsHtml()}
-        <span style="color:var(--text-2);font-size:12.5px">${boardOpen.length} open deals · ${money(boardValue)} pipeline</span>
-        <div class="spacer"></div>
-        <button class="btn" id="new-deal">+ New deal</button>
-      </div>
-      ${dealFiltersHtml()}
-      ${boardHtml(boardDeals, campNameById, bulkSel, true)}
-      <div id="bulkbar-host"></div>
-    </div>`;
+`;
   document.querySelectorAll("#view tr.clickable").forEach((tr) => {
     tr.onclick = () => { location.hash = `#/campaigns/${tr.dataset.id}`; };
   });
-  $("#board-camp-filter").onchange = (e) => { campBoardFilter = e.target.value; route(); };
-  $("#new-deal").onclick = () => newDealModal();
-  wirePipeControls();
-  if ($("#board")) {
-    initDealDrag(allDeals);
-    wireBulkBar();
-    renderBulkBar();
-  }
   $("#new-campaign").onclick = async () => {
     const fields = await getSchemaFields("campaign");
     openModal("New campaign", `
@@ -1546,9 +1554,46 @@ async function editCampaignModal(c) {
     if (confirm(`Delete campaign "${c.name}"?`)) {
       await DEL(`/api/campaigns/${c.id}`);
       $("#modal-root").innerHTML = "";
-      location.hash = "#/campaigns";
+      location.hash = "#/campaigns/overview";
     }
   };
+}
+
+async function vCampaignPipeline() {
+  const { campaigns, deals } = await campaignTabData();
+  const campNameById = new Map(campaigns.map((c) => [c.id, c.name]));
+  const allDeals = deals;
+  const boardDeals = applyPipeFilters(filterBoardDeals(allDeals, campBoardFilter));
+  // selection only survives for deals still visible
+  bulkSel = new Set([...bulkSel].filter((id) => boardDeals.some((d) => d.id === id)));
+  const boardOpen = boardDeals.filter((d) => !["closed_won", "closed_lost"].includes(d.stage));
+  const boardValue = boardOpen.reduce((a, d) => a + (Number(d.value) || 0), 0);
+  $("#ctab-body").innerHTML = `
+    <div class="panel">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap">
+        <h2 style="margin:0">Pipeline</h2>
+        <select id="board-camp-filter" style="max-width:230px;width:auto">
+          <option value="all" ${campBoardFilter === "all" ? "selected" : ""}>All campaigns</option>
+          ${campaigns.map((c) => `<option value="${c.id}" ${String(campBoardFilter) === String(c.id) ? "selected" : ""}>${esc(c.name)}</option>`).join("")}
+          <option value="none" ${campBoardFilter === "none" ? "selected" : ""}>No campaign</option>
+        </select>
+        ${savedViewsHtml()}
+        <span style="color:var(--text-2);font-size:12.5px">${boardOpen.length} open deals · ${money(boardValue)} pipeline</span>
+        <div class="spacer"></div>
+        <button class="btn" id="new-deal">+ New deal</button>
+      </div>
+      ${dealFiltersHtml()}
+      ${boardHtml(boardDeals, campNameById, bulkSel, true)}
+      <div id="bulkbar-host"></div>
+    </div>`;
+  $("#board-camp-filter").onchange = (e) => { campBoardFilter = e.target.value; route(); };
+  $("#new-deal").onclick = () => newDealModal();
+  wirePipeControls();
+  if ($("#board")) {
+    initDealDrag(allDeals);
+    wireBulkBar();
+    renderBulkBar();
+  }
 }
 
 /* ---------- campaign detail: workflow task spreadsheet + widgets ---------- */
@@ -2897,6 +2942,7 @@ function initPalette() {
     const NAV = [
       ["Dashboard", "#/dashboard"], ["Daily Feed", "#/feed"],
       ["Calendar", "#/calendar"], ["Campaigns", "#/campaigns"],
+      ["Calls", "#/calls"],
       ["Data Workshop", "#/workshop"], ["Milton", "#/milton"],
     ];
     const out = NAV.map(([label, hash]) => ({
@@ -2985,6 +3031,437 @@ function initPalette() {
   });
 }
 
+/* ================= message campaigns (email / SMS) + call logging ================= */
+const CALL_OUTCOMES = ["connected", "voicemail", "no answer", "busy", "wrong number", "follow-up"];
+const OUTCOME_COLORS = {
+  connected: "var(--ctp-green)", voicemail: "var(--ctp-blue)",
+  "no answer": "var(--ctp-yellow)", busy: "var(--ctp-peach)",
+  "wrong number": "var(--ctp-overlay2)", "follow-up": "var(--ctp-mauve)",
+};
+const outcomePill = (o) => {
+  const c = OUTCOME_COLORS[o] || "var(--ctp-overlay0)";
+  return `<span class="pill" style="background:color-mix(in srgb, ${c} 14%, transparent);color:${c}">${esc(o || "—")}</span>`;
+};
+const MERGE_TAGS = ["first_name", "last_name", "name", "company", "title", "email"];
+const mergeHintHtml = () =>
+  `<p class="hint">Merge tags: ${MERGE_TAGS.map((t) => `<span class="tag">{{${t}}}</span>`).join(" ")} — empty when the contact has no value.</p>`;
+const cap = (s) => (s ? s[0].toUpperCase() + s.slice(1) : s);
+
+/* client-side SMS segment estimate (mirrors the server counter) */
+const GSM7_BASIC = "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà";
+const GSM7_EXT = "^{}\\[~]|€";
+function smsSegCount(text) {
+  let septets = 0;
+  for (const ch of text) {
+    if (GSM7_BASIC.includes(ch)) septets += 1;
+    else if (GSM7_EXT.includes(ch)) septets += 2;
+    else {
+      const chars = [...text].length;
+      return { chars, encoding: "Unicode", segments: chars <= 70 ? 1 : Math.ceil(chars / 67) };
+    }
+  }
+  return { chars: septets, encoding: "GSM-7", segments: septets <= 160 ? 1 : Math.ceil(septets / 153) };
+}
+function renderMergeJs(tpl, c) {
+  const parts = String(c.name || "").split(/\s+/).filter(Boolean);
+  const vals = {
+    name: c.name || "", first_name: parts[0] || "", last_name: parts.slice(1).join(" "),
+    company: c.company_name || "", title: c.title || "", email: c.email || "",
+  };
+  return String(tpl ?? "").replace(/{{\s*([a-z_]+)\s*}}/g, (m, k) => (k in vals ? vals[k] : m));
+}
+
+/* ---------- email / SMS campaign tabs ---------- */
+async function vMsgTab(kind) {
+  const host = $("#ctab-body");
+  const label = kind === "email" ? "Email" : "SMS";
+  const lower = label.toLowerCase();
+  host.innerHTML = `<div class="skel" style="height:120px;margin-bottom:16px"></div><div class="skel" style="height:220px"></div>`;
+  const [{ templates }, { campaigns }, settings] = await Promise.all([
+    GET(`/api/${kind}-templates`), GET(`/api/${kind}-campaigns`), GET("/api/msg-settings"),
+  ]);
+  host.innerHTML = `
+    <div class="toolbar"><div class="spacer"></div>
+      <button class="btn" id="msg-new-tpl">+ New template</button>
+      <button class="btn" id="msg-new-camp">+ New ${lower} campaign</button></div>
+    <div class="panel"><h3 style="margin-top:0">Templates</h3>
+      ${templates.length ? `<div style="overflow-x:auto"><table>
+        <tr><th>Name</th>${kind === "email" ? "<th>Subject</th>" : ""}<th>Message</th><th></th></tr>
+        ${templates.map((t) => `<tr>
+          <td><b>${esc(t.name)}</b></td>
+          ${kind === "email" ? `<td>${esc(t.subject) || "—"}</td>` : ""}
+          <td style="max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(t.body)}">${esc(t.body)}</td>
+          <td class="rowact" style="white-space:nowrap"><button class="btn ghost small" data-tedit="${t.id}">Edit</button>
+            <button class="btn ghost small" data-tdel="${t.id}">Delete</button></td>
+        </tr>`).join("")}
+      </table></div>` : `<div class="empty">No ${lower} templates yet — create one to start a campaign.</div>`}
+    </div>
+    <div class="panel"><h3 style="margin-top:0">Campaigns</h3>
+      ${campaigns.length ? `<div style="overflow-x:auto"><table>
+        <tr><th>Name</th><th>Template</th><th>Status</th><th>Sent</th><th>Failed</th><th>Created</th><th></th></tr>
+        ${campaigns.map((c) => `<tr class="clickable" data-camp="${c.id}">
+          <td><b>${esc(c.name)}</b></td><td>${esc(c.template_name || "—")}</td>
+          <td>${statusPill(c.status)}</td><td>${c.sent_count || 0}</td><td>${c.failed_count || 0}</td>
+          <td style="white-space:nowrap">${esc((c.created_at || "").slice(0, 10))}</td>
+          <td class="rowact">${c.status === "draft" ? `<button class="btn ghost small" data-cdel="${c.id}">Delete</button>` : ""}</td>
+        </tr>`).join("")}
+      </table></div>` : `<div class="empty">No ${lower} campaigns yet.</div>`}
+    </div>
+    ${msgSettingsHtml(settings)}`;
+  $("#msg-new-tpl").onclick = () => msgTemplateModal(kind);
+  $("#msg-new-camp").onclick = () => msgCampaignModal(kind);
+  host.querySelectorAll("[data-tedit]").forEach((b) => b.onclick = (e) => {
+    e.stopPropagation();
+    msgTemplateModal(kind, templates.find((t) => t.id === Number(b.dataset.tedit)));
+  });
+  host.querySelectorAll("[data-tdel]").forEach((b) => b.onclick = async (e) => {
+    e.stopPropagation();
+    const t = templates.find((x) => x.id === Number(b.dataset.tdel));
+    if (confirm(`Delete ${lower} template "${t.name}"?`)) { await DEL(`/api/${kind}-templates/${t.id}`); route(); }
+  });
+  host.querySelectorAll("[data-camp]").forEach((tr) => tr.onclick = (e) => {
+    if (e.target.closest("[data-cdel]")) return;
+    location.hash = `#/campaigns/${kind}/${tr.dataset.camp}`;
+  });
+  host.querySelectorAll("[data-cdel]").forEach((b) => b.onclick = async (e) => {
+    e.stopPropagation();
+    const c = campaigns.find((x) => x.id === Number(b.dataset.cdel));
+    if (confirm(`Delete draft ${lower} campaign "${c.name}"?`)) { await DEL(`/api/${kind}-campaigns/${c.id}`); route(); }
+  });
+  wireMsgSettings();
+}
+
+async function msgTemplateModal(kind, tpl) {
+  const isEmail = kind === "email";
+  const label = isEmail ? "Email" : "SMS";
+  openModal(`${tpl ? "Edit" : "New"} ${label.toLowerCase()} template`, `
+    ${field("Name", input("name", tpl ? tpl.name : ""))}
+    ${isEmail ? field("Subject", input("subject", tpl ? tpl.subject || "" : "")) : ""}
+    ${field("Message", `<textarea name="body" id="msg-tpl-body" rows="6">${esc(tpl ? tpl.body || "" : "")}</textarea>`)}
+    ${isEmail ? "" : `<div id="msg-seg-hint"></div>`}
+    ${mergeHintHtml()}`,
+    async (d) => {
+      if (!d.name.trim()) { alert("Name is required."); return; }
+      if (tpl) await PATCH(`/api/${kind}-templates/${tpl.id}`, d);
+      else await POST(`/api/${kind}-templates`, d);
+      route();
+    }, tpl ? "Save changes" : "Create template");
+  if (!isEmail) {
+    const ta = $("#msg-tpl-body"), hint = $("#msg-seg-hint");
+    const upd = () => {
+      const s = smsSegCount(ta.value);
+      hint.innerHTML = `<p class="hint">${s.chars} characters · ${s.segments} segment${s.segments === 1 ? "" : "s"} (${s.encoding})</p>`;
+    };
+    ta.addEventListener("input", upd); upd();
+  }
+}
+
+async function msgCampaignModal(kind) {
+  const label = kind === "email" ? "Email" : "SMS";
+  const [{ templates }, { contacts }] = await Promise.all([GET(`/api/${kind}-templates`), GET("/api/contacts")]);
+  if (!templates.length) { alert(`Create an ${label.toLowerCase()} template first.`); return; }
+  openModal(`New ${label.toLowerCase()} campaign`, `
+    ${field("Name", input("name"))}
+    ${field("Template", select("template_id", templates.map((t) => [t.id, t.name])))}
+    <div class="field"><label>Audience</label>
+      <label class="check"><input type="radio" name="audmode" value="all" checked> All contacts (${contacts.length})</label>
+      <label class="check"><input type="radio" name="audmode" value="sel"> Selected contacts</label>
+      <select id="msg-aud-contacts" multiple size="8" style="display:none;margin-top:8px;width:100%">
+        ${contacts.map((c) => `<option value="${c.id}">${esc(c.name)}${c.email ? ` &lt;${esc(c.email)}&gt;` : ""}</option>`).join("")}
+      </select></div>
+    ${mergeHintHtml()}`,
+    async (d) => {
+      if (!d.name.trim()) { alert("Name is required."); return; }
+      const sel = document.querySelector("#msg-aud-contacts");
+      const ids = [...sel.selectedOptions].map((o) => Number(o.value));
+      const all = document.querySelector('input[name="audmode"]:checked').value === "all";
+      if (!all && !ids.length) { alert("Select at least one contact."); return; }
+      const { campaign } = await POST(`/api/${kind}-campaigns`, {
+        name: d.name.trim(), template_id: Number(d.template_id),
+        audience: all ? { mode: "all" } : { contact_ids: ids },
+      });
+      location.hash = `#/campaigns/${kind}/${campaign.id}`;
+    }, "Create campaign");
+  document.querySelectorAll('input[name="audmode"]').forEach((r) => r.addEventListener("change", () => {
+    document.querySelector("#msg-aud-contacts").style.display =
+      document.querySelector('input[name="audmode"]:checked').value === "sel" ? "" : "none";
+  }));
+}
+
+/* messaging settings (SMTP + SMS provider). Secrets are write-only. */
+function msgSettingsHtml(s) {
+  const v = s.values || {}, set = s.secrets_set || {};
+  return `<details class="panel"><summary style="cursor:pointer"><b>Messaging settings</b>
+    <span class="hint">SMTP &amp; SMS provider</span>
+    ${set.smtp_pass ? `<span class="tag">SMTP password set</span>` : ""}
+    ${set.twilio_token ? `<span class="tag">Twilio token set</span>` : ""}</summary>
+    <div style="margin-top:14px">
+      <h4 style="margin:0 0 8px">Email (SMTP)</h4>
+      <div class="formgrid">
+        ${field("SMTP host", input("smtp_host", v.smtp_host || ""))}
+        ${field("Port", input("smtp_port", v.smtp_port || "", "number"))}
+        ${field("Security", select("smtp_secure", [["", "—"], ["none", "None"], ["starttls", "STARTTLS"], ["tls", "Implicit TLS"]], v.smtp_secure || ""))}
+        ${field("Username", input("smtp_user", v.smtp_user || ""))}
+        ${field("Password",
+          `<input name="smtp_pass" type="password" autocomplete="new-password" placeholder="${set.smtp_pass ? "•••••• (unchanged — type to replace)" : ""}">${set.smtp_pass ? ' <span class="tag">set</span>' : ""}`)}
+        ${field("From name", input("smtp_from_name", v.smtp_from_name || ""))}
+        ${field("From email", input("smtp_from_email", v.smtp_from_email || "", "email"))}
+      </div>
+      <h4 style="margin:16px 0 8px">SMS</h4>
+      <div class="formgrid">
+        ${field("Provider", select("sms_provider", [["", "—"], ["twilio", "Twilio"], ["gateway", "Email-to-SMS gateway"]], v.sms_provider || ""))}
+        ${field("Twilio account SID", input("twilio_sid", v.twilio_sid || ""))}
+        ${field("Auth token",
+          `<input name="twilio_token" type="password" autocomplete="new-password" placeholder="${set.twilio_token ? "•••••• (unchanged — type to replace)" : ""}">${set.twilio_token ? ' <span class="tag">set</span>' : ""}`)}
+        ${field("Twilio from number", input("twilio_from", v.twilio_from || "", "tel"))}
+      </div>
+      <p class="hint">Gateway mode sends each SMS through your SMTP server to the contact's <b>SMS gateway</b> address (set on the contact). Secrets are write-only — they are never shown back.</p>
+      <button class="btn" id="msg-settings-save">Save settings</button>
+      <span id="msg-settings-msg" class="hint" style="margin-left:8px"></span>
+    </div></details>`;
+}
+function wireMsgSettings() {
+  const btn = $("#msg-settings-save");
+  if (!btn) return;
+  btn.onclick = async () => {
+    const host = btn.closest("details");
+    const d = {};
+    host.querySelectorAll("[name]").forEach((el) => { d[el.name] = el.value; });
+    const msg = $("#msg-settings-msg");
+    try {
+      await PATCH("/api/msg-settings", d);
+      msg.textContent = "Saved.";
+      setTimeout(route, 600);
+    } catch (e) { msg.textContent = e.message; }
+  };
+}
+
+/* how many recipients would a draft campaign reach right now? */
+async function msgAudienceInfo(kind, camp) {
+  const aud = JSON.parse(camp.audience_json || "{}");
+  const [{ contacts }, settings] = await Promise.all([GET("/api/contacts"), GET("/api/msg-settings")]);
+  let list = aud.mode === "all" || !aud.contact_ids ? contacts : contacts.filter((x) => aud.contact_ids.includes(x.id));
+  if (kind === "email") list = list.filter((x) => x.email && !x.email_opt_out);
+  else {
+    const viaTwilio = settings.values.sms_provider === "twilio";
+    list = list.filter((x) => !x.sms_opt_out && (viaTwilio ? x.phone : x.sms_gateway));
+  }
+  return { count: list.length, sample: list[0] || null, provider: settings.values.sms_provider || "" };
+}
+
+async function vMsgCampaignDetail(kind, id) {
+  const label = kind === "email" ? "Email" : "SMS";
+  const lower = label.toLowerCase();
+  let data;
+  try { data = await GET(`/api/${kind}-campaigns/${id}`); }
+  catch {
+    view.innerHTML = `<div class="empty">Campaign not found. <a href="#/campaigns/${kind}">Back to ${lower} campaigns</a>.</div>`;
+    return;
+  }
+  const c = data.campaign, sends = data.sends || [];
+  const isDraft = c.status === "draft";
+  view.innerHTML = `
+    <div class="toolbar"><a href="#/campaigns/${kind}" class="btn ghost small">← ${label} campaigns</a><div class="spacer"></div>
+      ${isDraft ? `<button class="btn ghost" id="msg-camp-del">Delete</button>
+      <button class="btn" id="msg-camp-send">Send now</button>` : ""}</div>
+    <div class="panel">
+      <h2 style="margin:0 0 6px">${esc(c.name)}</h2>
+      <p class="hint" style="margin:0">Template <b>${esc(c.template_name || "—")}</b> · ${statusPill(c.status)} · created ${esc((c.created_at || "").slice(0, 16))}</p>
+      ${isDraft ? `<div id="msg-aud" style="margin-top:12px"><div class="empty">Loading audience…</div></div>
+      <div id="msg-preview"></div>` : ""}
+    </div>
+    <div class="panel"><h3 style="margin-top:0">Delivery log${sends.length ? ` (${sends.length})` : ""}</h3>
+      ${sends.length ? `<div style="overflow-x:auto"><table>
+        <tr><th>To</th><th>Contact</th><th>Status</th><th>Detail</th><th>Sent at</th></tr>
+        ${sends.map((s) => `<tr><td style="white-space:nowrap">${esc(s.dest)}</td><td>${esc(s.contact_name || "—")}</td>
+          <td>${s.status === "sent"
+            ? `<span class="pill" style="background:color-mix(in srgb, var(--ctp-green) 14%, transparent);color:var(--ctp-green)">sent</span>`
+            : `<span class="pill" style="background:color-mix(in srgb, var(--ctp-red) 14%, transparent);color:var(--ctp-red)">failed</span>`}</td>
+          <td style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(s.error || "")}">${esc(s.error || "—")}</td>
+          <td style="white-space:nowrap">${esc((s.sent_at || "").slice(0, 19))}</td></tr>`).join("")}
+      </table></div>` : `<div class="empty">${isDraft ? "Nothing sent yet." : "No delivery rows."}</div>`}
+    </div>`;
+  if (!isDraft) return;
+  $("#msg-camp-del").onclick = async () => {
+    if (confirm(`Delete draft ${lower} campaign "${c.name}"?`)) {
+      await DEL(`/api/${kind}-campaigns/${id}`);
+      location.hash = `#/campaigns/${kind}`;
+    }
+  };
+  $("#msg-camp-send").onclick = async () => {
+    let n = "?";
+    try { n = (await msgAudienceInfo(kind, c)).count; } catch {}
+    if (!confirm(`Send "${c.name}" to ${n} recipient${n === 1 ? "" : "s"} now?`)) return;
+    const btn = $("#msg-camp-send");
+    btn.disabled = true; btn.textContent = "Sending…";
+    try {
+      const r = await POST(`/api/${kind}-campaigns/${id}/send`);
+      alert(`Done: ${r.sent} sent, ${r.failed} failed, ${r.total} total.`);
+    } catch (e) { alert(`Send failed: ${e.message}`); }
+    route();
+  };
+  // audience summary + merge preview against the first recipient
+  (async () => {
+    try {
+      const [{ templates }, info] = await Promise.all([GET(`/api/${kind}-templates`), msgAudienceInfo(kind, c)]);
+      const tpl = templates.find((t) => t.id === c.template_id);
+      const audHost = $("#msg-aud"), prevHost = $("#msg-preview");
+      if (!audHost) return;
+      audHost.innerHTML = `<p class="hint" style="margin:8px 0 0">Audience: <b>${info.count} recipient${info.count === 1 ? "" : "s"}</b>${kind === "sms" && !info.provider ? ` — <b>no SMS provider configured</b> (see Messaging settings on the ${lower} tab)` : ""}.</p>`;
+      if (tpl && info.sample) {
+        const subj = kind === "email" ? `<div><b>Subject:</b> ${esc(renderMergeJs(tpl.subject, info.sample))}</div>` : "";
+        prevHost.innerHTML = `<div class="field"><label>Preview — ${esc(info.sample.name)}</label>
+          <div class="panel" style="background:var(--ctp-mantle);margin:0">${subj}<div>${esc(renderMergeJs(tpl.body, info.sample)).replace(/\n/g, "<br>")}</div></div></div>`;
+      } else if (tpl) {
+        prevHost.innerHTML = `<p class="hint">No recipients — adjust the audience or opt-outs.</p>`;
+      }
+    } catch { const h = $("#msg-aud"); if (h) h.innerHTML = `<div class="empty">Couldn't load audience.</div>`; }
+  })();
+}
+
+/* ---------- calls ---------- */
+let callDirFilter = "", callOutcomeFilter = "", callQ = "";
+function fmtDuration(sec) {
+  sec = Math.max(0, Math.round(Number(sec) || 0));
+  if (sec < 60) return `${sec}s`;
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return s ? `${m}m ${s}s` : `${m}m`;
+}
+const fmtWhen = (s) => (s || "").slice(0, 16);
+
+async function vCalls() {
+  const p = new URLSearchParams();
+  if (callDirFilter) p.set("direction", callDirFilter);
+  if (callOutcomeFilter) p.set("outcome", callOutcomeFilter);
+  if (callQ) p.set("q", callQ);
+  const qs = p.toString();
+  const { calls, outcomes } = await GET(`/api/calls${qs ? "?" + qs : ""}`);
+  view.innerHTML = `
+    <div class="toolbar">
+      <input class="search" id="call-q" placeholder="Search notes, names…" value="${esc(callQ)}">
+      <select id="call-dir" style="max-width:140px;width:auto">
+        <option value="">All directions</option>
+        <option value="out" ${callDirFilter === "out" ? "selected" : ""}>Outgoing</option>
+        <option value="in" ${callDirFilter === "in" ? "selected" : ""}>Incoming</option>
+      </select>
+      <select id="call-outcome" style="max-width:170px;width:auto">
+        <option value="">All outcomes</option>
+        ${(outcomes || []).map((o) => `<option value="${esc(o)}" ${callOutcomeFilter === o ? "selected" : ""}>${cap(esc(o))}</option>`).join("")}
+      </select>
+      <button class="btn ghost" id="call-go">Filter</button>
+      <div class="spacer"></div>
+      <button class="btn" id="log-call">+ Log a call</button>
+    </div>
+    <div class="panel"><div style="overflow-x:auto"><table>
+      <tr><th>When</th><th>Contact</th><th>Company</th><th>Deal</th><th>Dir.</th><th>Length</th><th>Outcome</th><th>Notes</th><th></th></tr>
+      ${calls.map((c) => `<tr>
+        <td style="white-space:nowrap">${esc(fmtWhen(c.called_at))}</td>
+        <td>${esc(c.contact_name || "—")}</td>
+        <td>${esc(c.company_name || "—")}</td>
+        <td>${esc(c.deal_title || "—")}</td>
+        <td>${c.direction === "in" ? "← In" : "Out →"}</td>
+        <td style="white-space:nowrap">${fmtDuration(c.duration_sec)}</td>
+        <td>${outcomePill(c.outcome)}</td>
+        <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(c.notes || "")}">${esc(c.notes || "—")}</td>
+        <td class="rowact" style="white-space:nowrap"><button class="btn ghost small" data-calledit="${c.id}">Edit</button>
+          <button class="btn ghost small" data-calldel="${c.id}">Delete</button></td>
+      </tr>`).join("")}
+    </table></div>${calls.length ? "" : `<div class="empty">No calls match. Log the first one above.</div>`}</div>`;
+  const apply = () => {
+    callQ = $("#call-q").value; callDirFilter = $("#call-dir").value; callOutcomeFilter = $("#call-outcome").value;
+    route();
+  };
+  $("#call-go").onclick = apply;
+  $("#call-q").addEventListener("keydown", (e) => { if (e.key === "Enter") apply(); });
+  $("#call-dir").onchange = apply;
+  $("#call-outcome").onchange = apply;
+  $("#log-call").onclick = () => logCallModal();
+  view.querySelectorAll("[data-calledit]").forEach((b) => b.onclick = () => editCallModal(Number(b.dataset.calledit)));
+  view.querySelectorAll("[data-calldel]").forEach((b) => b.onclick = async () => {
+    if (confirm("Delete this call log?")) { await DEL(`/api/calls/${b.dataset.calldel}`); route(); }
+  });
+}
+
+function callFormHtml(preset, contacts, companies, deals) {
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  const iso = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
+  const when = preset.called_at ? preset.called_at.slice(0, 16).replace(" ", "T") : iso;
+  const mins = preset.duration_sec != null && preset.duration_sec !== "" ? String(Math.round(Number(preset.duration_sec) / 6) / 10) : "";
+  return `
+    <div class="formgrid">
+      ${field("Contact", select("contact_id", [["", "—"]].concat(contacts.map((c) => [c.id, c.name])), preset.contact_id || ""))}
+      ${field("Company", select("company_id", [["", "—"]].concat(companies.map((c) => [c.id, c.name])), preset.company_id || ""))}
+      ${field("Deal", select("deal_id", [["", "—"]].concat(deals.map((d) => [d.id, d.title])), preset.deal_id || ""))}
+      ${field("Direction", select("direction", [["out", "Outgoing"], ["in", "Incoming"]], preset.direction || "out"))}
+      ${field("Outcome", select("outcome", CALL_OUTCOMES.map((o) => [o, cap(o)]), preset.outcome || "connected"))}
+      ${field("Duration (minutes)", input("duration_min", mins, "number", 'min="0" step="0.5"'))}
+    </div>
+    ${field("When", `<input name="called_at" type="datetime-local" value="${esc(when)}">`)}
+    ${field("Notes", `<textarea name="notes" rows="3">${esc(preset.notes || "")}</textarea>`)}`;
+}
+function collectCallBody(d) {
+  const num = (v) => (v === "" || v == null ? null : Number(v));
+  return {
+    contact_id: num(d.contact_id), company_id: num(d.company_id), deal_id: num(d.deal_id),
+    direction: d.direction === "in" ? "in" : "out",
+    outcome: d.outcome,
+    duration_sec: Math.max(0, Math.round(Number(d.duration_min || 0) * 60)),
+    called_at: d.called_at ? d.called_at.replace("T", " ") + ":00" : undefined,
+    notes: d.notes || "",
+  };
+}
+async function logCallModal(preset = {}) {
+  const [{ contacts }, { companies }, { deals }] = await Promise.all([GET("/api/contacts"), GET("/api/companies"), GET("/api/deals")]);
+  openModal("Log a call", callFormHtml(preset, contacts, companies, deals), async (d) => {
+    await POST("/api/calls", collectCallBody(d));
+    route();
+  }, "Log call");
+}
+async function editCallModal(id) {
+  const [{ call }, { contacts }, { companies }, { deals }] = await Promise.all([
+    GET(`/api/calls/${id}`), GET("/api/contacts"), GET("/api/companies"), GET("/api/deals"),
+  ]);
+  openModal("Edit call", callFormHtml(call, contacts, companies, deals) +
+    `<div style="margin-top:14px"><button type="button" class="btn danger small" id="call-del">Delete call</button></div>`,
+    async (d) => { await PATCH(`/api/calls/${id}`, collectCallBody(d)); route(); }, "Save changes");
+  $("#call-del").onclick = async () => {
+    if (confirm("Delete this call log?")) { await DEL(`/api/calls/${id}`); $("#modal-root").innerHTML = ""; route(); }
+  };
+}
+
+/* compact call history for entity modals */
+async function fillCallHistory(hostId, query) {
+  const host = document.getElementById(hostId);
+  if (!host) return;
+  try {
+    const { calls } = await GET(`/api/calls?${query}`);
+    host.innerHTML = calls.length ? `<table class="calls-mini">
+      ${calls.slice(0, 8).map((c) => `<tr>
+        <td style="white-space:nowrap">${esc(fmtWhen(c.called_at))}</td>
+        <td>${c.direction === "in" ? "←" : "→"}</td>
+        <td>${outcomePill(c.outcome)}</td>
+        <td style="white-space:nowrap">${fmtDuration(c.duration_sec)}</td>
+        <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(c.notes || "")}">${esc(c.notes || "—")}</td>
+        <td class="rowact"><button class="btn ghost small" data-hcalldel="${c.id}" title="Delete call">×</button></td>
+      </tr>`).join("")}
+    </table>${calls.length > 8 ? `<p class="hint" style="margin:6px 0 0">+ ${calls.length - 8} more in <a href="#/calls">Calls</a></p>` : ""}`
+      : `<div class="empty">No calls logged yet.</div>`;
+    host.querySelectorAll("[data-hcalldel]").forEach((b) => b.onclick = async () => {
+      if (confirm("Delete this call log?")) { await DEL(`/api/calls/${b.dataset.hcalldel}`); fillCallHistory(hostId, query); }
+    });
+  } catch { host.innerHTML = `<div class="empty">Couldn't load call history.</div>`; }
+}
+const callSectionHtml = (kind, id) =>
+  `<div class="field"><label>Call history</label>
+    <div id="calls-${kind}-${id}"><div class="empty">Loading…</div></div>
+    <button type="button" class="btn ghost small" id="logcall-${kind}-${id}" style="margin-top:8px">+ Log a call</button></div>`;
+function wireCallSection(kind, id, preset) {
+  fillCallHistory(`calls-${kind}-${id}`, `${kind}_id=${id}`);
+  const b = document.getElementById(`logcall-${kind}-${id}`);
+  if (b) b.onclick = () => logCallModal(preset);
+}
+
 /* ---------- router ---------- */
 async function route() {
   const [hash] = location.hash.split("?");
@@ -3000,14 +3477,26 @@ async function route() {
     <div class="skel" style="height:120px;margin-bottom:16px"></div>
     <div class="skel" style="height:220px"></div>`;
   try {
-    if (name === "campaigns" && parts[1]) {
-      $("#page-title").textContent = "Campaign";
-      await vCampaignDetail(Number(parts[1]));
+    if (name === "campaigns") {
+      const sub = parts[1] || "overview";
+      if (["overview", "pipeline", "email", "sms"].includes(sub)) {
+        // msg campaign detail: #/campaigns/email/3
+        if (!parts[1]) { location.hash = "#/campaigns/overview"; return; }
+        $("#page-title").textContent = "Campaigns";
+        if ((sub === "email" || sub === "sms") && /^\d+$/.test(parts[2] || "")) {
+          await vMsgCampaignDetail(sub, Number(parts[2]));
+        } else {
+          await vCampaigns(sub);
+        }
+      } else {
+        $("#page-title").textContent = "Campaign";
+        await vCampaignDetail(Number(sub));
+      }
     } else {
       $("#page-title").textContent = TITLES[name];
       await { dashboard: vDashboard, feed: vFeed, calendar: vCalendar,
         contacts: () => (dupMode ? vDuplicates() : vContacts()),
-        companies: vCompanies, campaigns: vCampaigns,
+        companies: vCompanies, campaigns: () => vCampaigns("overview"), calls: vCalls,
         workshop: () => vWorkshop(parts[1]), milton: vMilton }[name]();
     }
   } catch (e) {

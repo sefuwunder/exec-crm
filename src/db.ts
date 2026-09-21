@@ -221,6 +221,77 @@ CREATE TABLE IF NOT EXISTS task_dependencies (
   workspace_id INTEGER REFERENCES workspaces(id),
   PRIMARY KEY (task_id, depends_on_task_id)
 );
+CREATE TABLE IF NOT EXISTS workspace_settings (
+  workspace_id INTEGER NOT NULL REFERENCES workspaces(id),
+  key TEXT NOT NULL,
+  value TEXT DEFAULT '',
+  PRIMARY KEY (workspace_id, key)
+);
+CREATE TABLE IF NOT EXISTS email_templates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER REFERENCES workspaces(id),
+  name TEXT NOT NULL,
+  subject TEXT DEFAULT '',
+  body TEXT DEFAULT '',
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS email_campaigns (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER REFERENCES workspaces(id),
+  template_id INTEGER REFERENCES email_templates(id),
+  name TEXT NOT NULL,
+  status TEXT DEFAULT 'draft',
+  audience_json TEXT DEFAULT '{}',
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS email_sends (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER REFERENCES workspaces(id),
+  campaign_id INTEGER REFERENCES email_campaigns(id),
+  contact_id INTEGER REFERENCES contacts(id),
+  to_email TEXT DEFAULT '',
+  status TEXT DEFAULT 'sent',
+  error TEXT DEFAULT '',
+  sent_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS sms_templates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER REFERENCES workspaces(id),
+  name TEXT NOT NULL,
+  body TEXT DEFAULT '',
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS sms_campaigns (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER REFERENCES workspaces(id),
+  template_id INTEGER REFERENCES sms_templates(id),
+  name TEXT NOT NULL,
+  status TEXT DEFAULT 'draft',
+  audience_json TEXT DEFAULT '{}',
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS sms_sends (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER REFERENCES workspaces(id),
+  campaign_id INTEGER REFERENCES sms_campaigns(id),
+  contact_id INTEGER REFERENCES contacts(id),
+  to_phone TEXT DEFAULT '',
+  status TEXT DEFAULT 'sent',
+  error TEXT DEFAULT '',
+  sent_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS calls (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER REFERENCES workspaces(id),
+  contact_id INTEGER REFERENCES contacts(id),
+  company_id INTEGER REFERENCES companies(id),
+  deal_id INTEGER REFERENCES deals(id),
+  direction TEXT DEFAULT 'out',
+  duration_sec INTEGER DEFAULT 0,
+  outcome TEXT DEFAULT '',
+  notes TEXT DEFAULT '',
+  called_at TEXT DEFAULT (datetime('now'))
+);
 `;
 
 export function openDb(path: string): Database {
@@ -345,6 +416,27 @@ export function openDb(path: string): Database {
   db.exec("CREATE INDEX IF NOT EXISTS idx_stage_history_ws ON deal_stage_history(workspace_id)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_task_deps_ws ON task_dependencies(workspace_id)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_saved_views_ws ON saved_views(workspace_id)");
+  // migration: contacts gained messaging opt-outs and an SMS gateway address.
+  // email_opt_out / sms_opt_out default 0 (opted in); sms_gateway is the
+  // carrier email-to-SMS address (e.g. 5551234567@vtext.com), blank = none.
+  const contactCols = db.query("PRAGMA table_info(contacts)").all() as any[];
+  for (const [col, ddl] of [
+    ["email_opt_out", "INTEGER DEFAULT 0"],
+    ["sms_opt_out", "INTEGER DEFAULT 0"],
+    ["sms_gateway", "TEXT DEFAULT ''"],
+  ] as [string, string][]) {
+    if (!contactCols.some((c) => c.name === col)) {
+      db.exec(`ALTER TABLE contacts ADD COLUMN ${col} ${ddl}`);
+    }
+  }
+  for (const t of ["email_templates", "email_campaigns", "email_sends", "sms_templates", "sms_campaigns", "sms_sends", "calls", "workspace_settings"]) {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_${t}_ws ON ${t}(workspace_id)`);
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_email_sends_camp ON email_sends(campaign_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_sms_sends_camp ON sms_sends(campaign_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_calls_contact ON calls(contact_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_calls_company ON calls(company_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_calls_deal ON calls(deal_id)");
   // migration: pipeline stages are editable per workspace (Milton schema editing).
   // deals.stage stays a TEXT slug; the stages table owns the per-workspace
   // ordered schema. Legacy DBs get the table created and seeded below.

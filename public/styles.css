@@ -846,3 +846,19 @@ button.cal-chip:hover { filter: brightness(0.94); }
 @media (prefers-reduced-motion: reduce) {
   .sb-drop { transition: none; }
 }
+
+/* ---------- message campaigns + call logging ---------- */
+.check { display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer; }
+.check input { width: auto; margin: 0; }
+.calls-mini { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.calls-mini td { padding: 5px 8px 5px 0; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.calls-mini tr:last-child td { border-bottom: none; }
+details.panel summary { list-style: none; }
+details.panel summary::-webkit-details-marker { display: none; }
+details.panel summary::before { content: "▸"; margin-right: 6px; color: var(--text-3); }
+details.panel[open] summary::before { content: "▾"; }
+@media (max-width: 640px) {
+  .toolbar { flex-wrap: wrap; }
+  .toolbar .search { flex: 1 1 100%; }
+  .formgrid { grid-template-columns: 1fr; }
+}

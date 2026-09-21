@@ -1,5 +1,5 @@
-// tests/pipeline-board.test.ts — drag-and-drop pipeline kanban board living
-// inside the campaigns overview (vCampaigns): shared boardHtml markup with
+// tests/pipeline-board.test.ts — drag-and-drop pipeline kanban board living in
+// the campaigns Pipeline tab (vCampaignPipeline): shared boardHtml markup with
 // campaign badges, a client-side campaign filter, and drag persistence via
 // PATCH /api/deals/:id { stage }.
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
@@ -117,15 +117,16 @@ describe("boardHtml", () => {
   });
 });
 
-describe("vCampaigns wires the board", () => {
-  const fn = () => extractFn(appSrc, "vCampaigns");
+describe("campaign pipeline tab wires the board", () => {
+  const fn = () => extractFn(appSrc, "vCampaignPipeline");
 
-  test("overview renders the board below the campaign list with badges", () => {
+  test("pipeline tab renders the board with badges, strips stay on overview", () => {
     const src = fn();
     expect(src).toContain("boardHtml(boardDeals, campNameById, bulkSel, true)");
     expect(src).toContain('id="board-camp-filter"');
-    // per-campaign summary strips stay as the glanceable layer
-    expect(src).toContain("campaignPipelineStrip(dealsByCamp.get(c.id) || [])");
+    // per-campaign summary strips live in the overview tab, not here
+    expect(src).not.toContain("campaignPipelineStrip");
+    expect(extractFn(appSrc, "vCampaignOverview")).toContain("campaignPipelineStrip(dealsByCamp.get(c.id) || [])");
   });
 
   test("campaign filter offers All / per-campaign / No campaign and re-routes", () => {
@@ -252,13 +253,7 @@ describe("filterBoardDeals", () => {
   });
 });
 
-describe("vCampaigns DOM-stubbed render", () => {
-  const statusPillT = (s: string) => `<span class="pill">${escT(s)}</span>`;
-  const stripT = (deals: any[]) =>
-    new Function("esc", "money", "moneyShort", "stageColor", "stageFunnelColor", "state", "deals",
-      extractFn(appSrc, "campaignPipelineStrip") + "\nreturn campaignPipelineStrip(deals);")
-      (escT, moneyT, moneyShortT, stageColorT, stageFunnelColorT, stateT, deals) as string;
-
+describe("campaign pipeline tab DOM-stubbed render", () => {
   const campaigns = [
     { id: 7, name: "Q4 Launch", company_name: "Acme", status: "active", start_date: "", end_date: "", budget: 5000 },
     { id: 9, name: "Beta Test", company_name: "Acme", status: "draft", start_date: "", end_date: "", budget: 1000 },
@@ -269,9 +264,17 @@ describe("vCampaigns DOM-stubbed render", () => {
   )() as (deals: any[], filter: any) => any[];
 
   const render = async (filter: any) => {
-    let html = "";
-    const view = { set innerHTML(v: string) { html = v; } };
-    const $stub = () => ({}) as any;
+    const els = new Map<string, any>();
+    const elStub = () => ({
+      innerHTML: "", textContent: "", value: "", style: {}, dataset: {},
+      addEventListener() {}, append() {},
+      querySelectorAll: () => [] as any[],
+      querySelector: () => null,
+    });
+    const $stub = (sel: string) => {
+      if (!els.has(sel)) els.set(sel, elStub());
+      return els.get(sel);
+    };
     const docStub = { querySelectorAll: () => [] } as any;
     const dragCalls: any[][] = [];
     const bulkCalls: any[][] = [];
@@ -297,19 +300,22 @@ describe("vCampaigns DOM-stubbed render", () => {
     const dealFiltersHtmlT = () => "";
     const wirePipeControlsT = () => {};
     const bulkSelT = new Set<number>();
+    const view = { innerHTML: "" };
+    const campaignTabDataT = async () => ({ campaigns, deals, companies: [], dealsByCamp: new Map() });
     await new Function(
       "GET", "view", "esc", "money", "moneyShort", "statusPill", "campaignPipelineStrip",
-      "boardHtml", "filterBoardDeals", "campBoardFilter", "route", "newDealModal",
+      "boardHtml", "filterBoardDeals", "campBoardFilter", "campaignTabData", "route", "newDealModal",
       "initDealDrag", "getSchemaFields", "openModal", "field", "input", "select",
       "CAMPAIGN_STATUSES", "cfFieldsHtml", "wireDraftRows", "draftContactRowHtml",
       "draftCompanyRowHtml", "state", "$", "document", "POST",
       "applyPipeFilters", "savedViewsHtml", "dealFiltersHtml", "wirePipeControls",
       "wireBulkBar", "renderBulkBar", "bulkSel", "pipeFilters",
       "savedViewsCache", "dealSourcesCache", "dealOwnersCache",
-      extractFn(appSrc, "vCampaigns") + "\nreturn vCampaigns();"
+      extractFn(appSrc, "vCampaignPipeline") + "\nreturn vCampaignPipeline();"
     )(
-      stubs.GET, view, escT, moneyT, moneyShortT, statusPillT, stripT,
-      (ds: any[], m: any) => board(ds, m), filterDealsT, filter, stubs.route, stubs.newDealModal,
+      stubs.GET, view, escT, moneyT, moneyShortT, (s: string) => `<span class="pill">${escT(s)}</span>`,
+      (ds: any[]) => "", // strips live in the overview tab, unused here
+      (ds: any[], m: any) => board(ds, m), filterDealsT, filter, campaignTabDataT, stubs.route, stubs.newDealModal,
       stubs.initDealDrag, stubs.getSchemaFields, stubs.openModal, stubs.field, stubs.input,
       stubs.select, stubs.CAMPAIGN_STATUSES, stubs.cfFieldsHtml, stubs.wireDraftRows,
       stubs.draftContactRowHtml, stubs.draftCompanyRowHtml,
@@ -318,10 +324,10 @@ describe("vCampaigns DOM-stubbed render", () => {
       stubs.wireBulkBar, stubs.renderBulkBar, bulkSelT, pipeFiltersT,
       [], [], []
     );
-    return { html, dragCalls };
+    return { html: els.get("#ctab-body")?.innerHTML ?? "", dragCalls };
   };
 
-  test("overview renders strips plus the drag board with badges and filter", async () => {
+  test("pipeline tab renders the drag board with badges and filter", async () => {
     const { html, dragCalls } = await render("all");
     expect(html).toContain('id="board"');
     expect(html).toContain('data-stage="prospecting"');

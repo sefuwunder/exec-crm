@@ -1,6 +1,7 @@
 // tests/restructure-ui.test.ts — DOM-stubbed render of the restructured surface:
-// Dashboard renders Milton insights only (Review → Action → Outcome),
-// Outreach renders the action log, Milton page embeds the agent.
+// Dashboard shows the Milton-built daily feed (take + stream) with Milton's
+// insights below, Outreach renders the action log, and Milton lives in a
+// floating, collapsible dock.
 import { describe, test, expect } from "bun:test";
 import { readFileSync } from "fs";
 import { join } from "path";
@@ -8,7 +9,7 @@ import { join } from "path";
 const appSrc = readFileSync(join(new URL(".", import.meta.url).pathname, "..", "public", "app.js"), "utf8");
 
 function makeEl(): any {
-  return {
+  const el: any = {
     innerHTML: "", textContent: "", value: "", hidden: false,
     dataset: {}, style: {},
     classList: { toggle() {}, add() {}, remove() {}, contains: () => false },
@@ -16,7 +17,10 @@ function makeEl(): any {
     querySelectorAll() { return []; },
     addEventListener() {}, removeEventListener() {},
     appendChild() {}, focus() {}, click() {},
+    setAttribute(k: string, v: string) { el["attr:" + k] = v; },
+    getAttribute(k: string) { return el["attr:" + k]; },
   };
+  return el;
 }
 
 const HYGIENE = {
@@ -73,7 +77,7 @@ function bootApp(canned: Record<string, any>) {
     removeItem: (k: string) => { store.delete(k); },
   };
   const factory = new Function("document", "fetch", "location", "localStorage", "confirm", "window",
-    appSrc + "\nreturn { route, vDashboard, vOutreach, vMilton, sugAction, sugLiveDeals, outreachSuggestions, outreachModal };");
+    appSrc + "\nreturn { route, vDashboard, vOutreach, miltonDockOpen, miltonDockToggle, miltonDockApi, sugAction, sugLiveDeals, outreachSuggestions, outreachModal };");
   const app = factory(documentStub, fetchStub, locationStub, localStorageStub, () => true, { addEventListener() {} });
   const view = () => documentStub.querySelector("#view").innerHTML as string;
   const waitFor = async (pred: (h: string) => boolean, label: string) => {
@@ -83,50 +87,84 @@ function bootApp(canned: Record<string, any>) {
     }
     throw new Error("timed out waiting for " + label + ":\n" + view().slice(0, 600));
   };
-  return { app, view, waitFor, doc: documentStub };
+  const insights = () => documentStub.querySelector("#dash-insights").innerHTML;
+  const booted = (h: string) => h.includes("Today's stream") || h.includes("Milton's take") || insights().includes("cycle-strip") || insights().includes("Milton insights");
+  return { app, view, waitFor, doc: documentStub, location: locationStub, insights, booted };
 }
+
+const FEED = {
+  generated_at: "2026-09-23T12:00:00Z",
+  milton: { available: true, take: "Today: follow up on **Beta LLC**.\nCall Bea back." },
+  due_count: 1,
+  items: [
+    { type: "task", label: "Plan", date: "2026-09-23",
+      task: { id: 1, title: "Call Bea", done: false, due_date: "2026-09-23",
+        owner: "You", deal_id: 7, deal_title: "Beta LLC rollout" } },
+    { type: "prep", label: "Prep", date: "2026-09-25",
+      prep: { kind: "contact", id: 3, name: "Bea", sub: "CEO · bea@beta.com",
+        reason: "Beta LLC rollout — closes 2026-09-25" } },
+    { type: "deal", label: "Hygiene", date: null, note: "untouched 31 days",
+      deal: { id: 7, title: "Beta LLC rollout", value: 5000, stage: "proposal",
+        stage_name: "Proposal", probability: 50, expected_close: "", owner: "You",
+        company_id: null, contact_id: 3, campaign_id: null,
+        company_name: "Beta LLC", contact_name: "Bea" } },
+  ],
+};
 
 const BOOT_CANNED = {
   "/api/deals": { deals: [], stages: [], labels: [] },
   "/api/meta-colors": { colors: {} },
   "/api/workspaces": { workspaces: [{ id: 1, name: "Main", color: "#579bfc" }] },
+  "/api/daily-feed": FEED,
   "/api/milton/hygiene": HYGIENE,
   "/api/milton/status": { ok: true, reachable: true },
+  "/api/milton/chat": { text: "stub heard: hello", chips: ["thanks"] },
   "/api/outreach": OUTREACH,
   "/api/contacts": { contacts: [] },
 };
 
 describe("restructured views (DOM-stubbed render)", () => {
-  test("dashboard renders milton insights grouped Review → Action → Outcome", async () => {
-    const { view, waitFor } = bootApp(BOOT_CANNED);
+  test("dashboard shows the daily feed: take + stream, then insights", async () => {
+    const { view, waitFor, booted, insights } = bootApp(BOOT_CANNED);
     // the boot IIFE routes to the dashboard by itself
-    await waitFor((h) => h.includes("cycle-strip"), "dashboard cycle strip");
+    await waitFor((h) => h.includes("Today's stream"), "dashboard feed");
     const h = view();
-    for (const label of ["Review", "Action", "Outcome"]) expect(h).toContain(label);
-    expect(h).toContain("Acme Corp has no research notes");
-    expect(h).toContain("Beta LLC went quiet 9 days ago");
-    expect(h).toContain("log the outcome of the Acme demo");
-    // phase order in the document: review group before action before outcome
-    const ri = h.indexOf("Review <span"), ai = h.indexOf("Action <span"), oi = h.indexOf("Outcome <span");
-    expect(ri).toBeGreaterThan(-1); expect(ai).toBeGreaterThan(-1); expect(oi).toBeGreaterThan(-1);
-    expect(ri).toBeLessThan(ai); expect(ai).toBeLessThan(oi);
+    // the Milton-built feed: take with **bold** rendered, chronological stream
+    expect(h).toContain("✦ Milton's take");
+    expect(h).toContain("follow up on <b>Beta LLC</b>");
+    expect(h).toContain("Call Bea");
+    expect(h).toContain("Beta LLC rollout");
+    expect(h).toContain("feed-pill");
+    expect(h).toContain("untouched 31 days");
+    expect(h).toContain("1</b> things need you today");
+    // the playbook insights still render below the feed
+    await waitFor(() => insights().includes("cycle-strip"), "insights strip");
+    const h2 = view() + insights();
+    for (const label of ["Review", "Action", "Outcome"]) expect(h2).toContain(label);
+    expect(h2).toContain("Acme Corp has no research notes");
+    // feed comes before insights in the document
+    expect(view().indexOf("Today's stream")).toBeLessThan(view().indexOf("dash-insights"));
     // the old dashboard content is gone
-    expect(h).not.toContain("Open pipeline");
-    expect(h).not.toContain("Weighted pipeline");
-    expect(h).not.toContain("Closing soon");
+    expect(h2).not.toContain("Open pipeline");
+    expect(h2).not.toContain("Weighted pipeline");
+    expect(h2).not.toContain("Closing soon");
   });
 
-  test("dashboard shows a helpful empty state when milton is down", async () => {
-    const { view, waitFor } = bootApp({ ...BOOT_CANNED, "/api/milton/hygiene": "THROW" });
-    await waitFor((h) => h.includes("Milton insights"), "dashboard down state");
-    const h = view();
-    expect(h).toContain("Milton");
+  test("dashboard still renders when milton is down: stream empty, take + insights show the offline state", async () => {
+    const { view, waitFor, booted, insights } = bootApp({ ...BOOT_CANNED, "/api/daily-feed": "THROW", "/api/milton/hygiene": "THROW" });
+    await waitFor((h) => h.includes("Milton's take"), "dashboard down state");
+    const h = view() + insights();
+    expect(h).toContain("Milton's take");
+    expect(h).toContain("Milton is unreachable");
+    expect(h).toContain("Milton insights");
     expect(h).not.toContain("cycle-strip");
+    // quick-add still renders so the day can be seeded by hand
+    expect(h).toContain('id="qa-title"');
   });
 
   test("outreach renders every channel and the outcome affordance", async () => {
-    const { app, view, waitFor } = bootApp(BOOT_CANNED);
-    await waitFor((h) => h.includes("cycle-strip") || h.includes("Milton insights"), "boot");
+    const { app, view, waitFor, booted } = bootApp(BOOT_CANNED);
+    await waitFor(booted, "boot");
     await app.vOutreach();
     const h = view();
     for (const label of ["Call", "Email", "Social message", "Video call", "In person"]) {
@@ -141,28 +179,62 @@ describe("restructured views (DOM-stubbed render)", () => {
     expect(h).toContain("Meeting booked");
   });
 
-  test("milton page is a same-origin chat shell, never an iframe", async () => {
-    const up = bootApp(BOOT_CANNED);
-    await up.waitFor((h) => h.includes("cycle-strip") || h.includes("Milton insights"), "boot");
-    await up.app.vMilton();
-    // wait for the history fetch to settle into the greeting
-    await up.waitFor((h) => h.includes("milton-text"), "chat shell");
-    const h = up.view();
-    expect(h).not.toContain("<iframe");
-    expect(h).toContain('id="milton-text"');
-    expect(h).toContain("New conversation");
-    expect(h).not.toContain("127.0.0.1:3009");
-    // the greeting paints into the messages element (stub keeps it separate
-    // from #view's html string, as a real DOM would nest it)
-    const msgs = up.doc.querySelector("#milton-msgs").innerHTML;
+  test("milton dock: collapsible, same-origin chat shell, no iframe, no MILTON_URL leak", async () => {
+    const { app, doc, waitFor, booted } = bootApp(BOOT_CANNED);
+    await waitFor(booted, "boot");
+    const head = doc.querySelector("#milton-dock-head");
+    const body = doc.querySelector("#milton-dock-body");
+    // starts collapsed
+    expect(body.hidden).toBe(true);
+    expect(head.getAttribute("aria-expanded")).toBe("false");
+    app.miltonDockOpen();
+    // wait for init to finish (status check + history/greeting)
+    for (let i = 0; i < 200; i++) {
+      if (body.hidden === false && head.getAttribute("aria-expanded") === "true" &&
+        doc.querySelector("#milton-msgs").innerHTML.includes("pipeline agent")) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(body.hidden).toBe(false);
+    expect(head.getAttribute("aria-expanded")).toBe("true");
+    const msgs = doc.querySelector("#milton-msgs").innerHTML;
     expect(msgs).toContain("your pipeline agent");
+    expect(msgs).not.toContain("127.0.0.1:3009");
+    expect(msgs).not.toContain("<iframe");
+    // send a message through the same-origin proxy
+    await app.miltonDockApi.send("hello");
+    const after = doc.querySelector("#milton-msgs").innerHTML;
+    expect(after).toContain("hello");
+    expect(after).toContain("stub heard: hello");
+    // open state persists; collapse again
+    app.miltonDockToggle();
+    expect(body.hidden).toBe(true);
+    expect(head.getAttribute("aria-expanded")).toBe("false");
+  });
 
-    const down = bootApp({ ...BOOT_CANNED, "/api/milton/status": { ok: false, reachable: false } });
-    await down.waitFor((h) => h.includes("cycle-strip") || h.includes("Milton insights"), "boot");
-    await down.app.vMilton();
-    const hd = down.view();
-    expect(hd).not.toContain("milton-text");
-    expect(hd).toContain("isn't running");
+  test("milton dock shows the offline state when milton is down", async () => {
+    const { app, doc, waitFor, booted } = bootApp({
+      ...BOOT_CANNED,
+      "/api/milton/status": { ok: false, reachable: false },
+    });
+    await waitFor(booted, "boot");
+    app.miltonDockOpen();
+    for (let i = 0; i < 200; i++) {
+      if (doc.querySelector("#milton-msgs").innerHTML.includes("isn't running")) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const msgs = doc.querySelector("#milton-msgs").innerHTML;
+    expect(msgs).toContain("isn't running");
+    expect(msgs).not.toContain("127.0.0.1:3009");
+  });
+
+  test("old milton/feed routes redirect to the dashboard", async () => {
+    const { app, location, waitFor, booted } = bootApp(BOOT_CANNED);
+    await waitFor(booted, "boot");
+    for (const hash of ["#/milton", "#/feed"]) {
+      location.hash = hash;
+      await app.route();
+      expect(location.hash).toBe("#/dashboard");
+    }
   });
 });
 
@@ -225,8 +297,8 @@ describe("milton suggestions on the outreach screen", () => {
   });
 
   test("vOutreach renders clickable suggestion cards", async () => {
-    const { app, view, waitFor } = bootApp(SUG_CANNED);
-    await waitFor((h) => h.includes("cycle-strip") || h.includes("Milton insights"), "boot");
+    const { app, view, waitFor, booted } = bootApp(SUG_CANNED);
+    await waitFor(booted, "boot");
     await app.vOutreach();
     const h = view();
     expect(h).toContain("Milton suggests");
@@ -250,8 +322,8 @@ describe("milton suggestions on the outreach screen", () => {
   });
 
   test("vOutreach renders the log with no suggestion panel when milton is down", async () => {
-    const { app, view, waitFor } = bootApp({ ...SUG_CANNED, "/api/milton/hygiene": "THROW" });
-    await waitFor((h) => h.includes("cycle-strip") || h.includes("Milton insights"), "boot");
+    const { app, view, waitFor, booted } = bootApp({ ...SUG_CANNED, "/api/milton/hygiene": "THROW" });
+    await waitFor(booted, "boot");
     await app.vOutreach();
     const h = view();
     expect(h).not.toContain("Milton suggests");

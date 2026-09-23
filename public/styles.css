@@ -655,7 +655,7 @@ td { transition: background 0.12s ease; }
 }
 .linklike:hover { text-decoration: underline; }
 
-/* ---------- milton page: embedded agent (same-origin chat shell) ---------- */
+/* ---------- milton chat shell (floating dock; message styles shared) ---------- */
 .milton-wrap {
   height: calc(100vh - 170px); min-height: 420px; background: var(--surface);
   border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
@@ -778,4 +778,56 @@ td { transition: background 0.12s ease; }
 .link:hover { text-decoration: underline; }
 @media (max-width: 640px) {
   .sb-card .info { flex: 1 1 100%; }
+}
+
+/* ---------- daily feed (Milton's take + chronological stream) ---------- */
+.feed-take { border-left: 3px solid var(--brand); }
+.feed-take-text { font-size: 13.5px; line-height: 1.6; color: var(--text-2); }
+.feed-item { display: flex; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border-soft); font-size: 13px; align-items: flex-start; }
+.feed-item:last-child { border-bottom: none; }
+.feed-item .text { flex: 1; line-height: 1.45; min-width: 0; }
+.feed-item-main { display: flex; gap: 10px; align-items: flex-start; flex: 1; min-width: 0; }
+.feed-item-main .text { flex: 1; min-width: 0; }
+.feed-item-main .task { margin: 0; }
+.feed-pill {
+  display: inline-block; flex-shrink: 0; margin-top: 1px;
+  font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px;
+  border: 1px solid; border-radius: 20px; padding: 1px 8px; white-space: nowrap;
+}
+@media (max-width: 640px) {
+  .feed-item { flex-wrap: wrap; }
+  .feed-item-main { flex: 1 1 100%; }
+}
+
+/* ---------- milton dock: floating, collapsible chat ---------- */
+.milton-dock {
+  position: fixed; right: 18px; bottom: 18px; z-index: 400;
+  width: 380px; max-width: calc(100vw - 36px);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 14px; box-shadow: var(--shadow-lg);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.milton-dock-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 14px; cursor: pointer; user-select: none;
+  font-size: 13.5px; font-weight: 600; color: var(--text);
+}
+.milton-dock-head:hover { background: var(--bg); }
+.milton-dock-head:focus-visible { outline: 2px solid var(--brand); outline-offset: -2px; }
+.mdot { width: 9px; height: 9px; border-radius: 50%; background: var(--text-3); flex-shrink: 0; }
+.mdot.on { background: #22c07a; }
+.mdot.off { background: var(--danger); }
+.md-status { font-weight: 400; font-size: 12px; color: var(--text-3); }
+.md-chev { color: var(--text-3); font-size: 12px; }
+.milton-dock-body { border-top: 1px solid var(--border); display: flex; flex-direction: column; }
+.milton-dock-tools {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px; border-bottom: 1px solid var(--border-soft);
+}
+.md-note { font-size: 11.5px; color: var(--text-3); }
+.milton-dock .milton-msgs { height: 320px; max-height: 50vh; }
+.milton-dock .bubble { max-width: 92%; }
+@media (max-width: 760px) {
+  .milton-dock { right: 10px; bottom: 10px; }
+  .milton-dock .milton-msgs { height: 300px; }
 }

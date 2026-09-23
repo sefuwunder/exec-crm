@@ -344,31 +344,42 @@ describe("restructured frontend", () => {
   const indexSrc = readFileSync(
     join(new URL(".", import.meta.url).pathname, "..", "public", "index.html"), "utf8");
 
-  test("nav has Milton + Outreach, no global calendar, no calls tab", () => {
-    expect(indexSrc).toContain('href="#/milton"');
+  test("nav drops Milton and Daily Feed; Milton lives in a floating dock", () => {
+    expect(indexSrc).toContain('href="#/dashboard"');
     expect(indexSrc).toContain('href="#/outreach"');
+    expect(indexSrc).not.toContain('href="#/milton"');
+    expect(indexSrc).not.toContain('href="#/feed"');
     expect(indexSrc).not.toMatch(/calendar/i);
     expect(indexSrc).not.toMatch(/#\/calls/);
+    // the floating chat dock markup ships in the static page
+    expect(indexSrc).toContain('id="milton-dock"');
+    expect(indexSrc).toContain('id="milton-dock-head"');
+    expect(indexSrc).toContain('id="milton-dock-body"');
+    expect(indexSrc).toContain('id="milton-form"');
   });
 
-  test("dashboard is milton-insights-only: no KPI/pipeline/closing-soon markup", () => {
+  test("dashboard is the daily feed again, with milton insights below", () => {
     const dashFn = appSrc.slice(appSrc.indexOf("async function vDashboard()"));
     const body = dashFn.slice(0, dashFn.indexOf("/* ---------- outreach"));
+    expect(body).toContain("/api/daily-feed");
+    expect(body).toContain("Milton's take");
     expect(body).toContain("/api/milton/hygiene");
     expect(body).not.toContain("/api/kpis");
     expect(body).not.toContain("/api/activities");
     expect(body).not.toContain("closing-soon");
-    expect(body).toContain("review");
-    expect(body).toContain("action");
-    expect(body).toContain("outcome");
+    expect(body).toContain("Today's stream");
   });
 
-  test("router + palette expose milton and outreach views", () => {
-    expect(appSrc).toContain("milton: vMilton");
+  test("router redirects old milton/feed routes; palette opens the dock", () => {
+    expect(appSrc).not.toContain("milton: vMilton");
+    expect(appSrc).not.toContain('["Milton", "#/milton"]');
+    expect(appSrc).not.toContain('milton: "Milton"');
+    expect(appSrc).toContain('r === "milton" || r === "feed"');
     expect(appSrc).toContain("outreach: vOutreach");
-    expect(appSrc).toContain('["Milton", "#/milton"]');
     expect(appSrc).toContain('["Outreach", "#/outreach"]');
-    expect(appSrc).toContain("milton: \"Milton\"");
-    expect(appSrc).toContain("outreach: \"Outreach\"");
+    // palette offers the dock, and outreach's askMilton opens it
+    expect(appSrc).toContain('"Milton chat"');
+    expect(appSrc).toContain("miltonDockOpen()");
+    expect(appSrc).toContain("function initMiltonDock()");
   });
 });

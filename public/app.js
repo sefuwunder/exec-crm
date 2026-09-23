@@ -18,8 +18,8 @@ const wsParam = (p) => {
   return p + (p.includes("?") ? "&" : "?") + "workspace=" + encodeURIComponent(wsId);
 };
 const TITLES = {
-  dashboard: "Dashboard", milton: "Milton", outreach: "Outreach",
-  feed: "Daily Feed", contacts: "Contacts",
+  dashboard: "Dashboard", outreach: "Outreach",
+  contacts: "Contacts",
   companies: "Companies", campaigns: "Campaigns", workshop: "Data Workshop",
 };
 // Old top-level sections now live inside the Data Workshop tabs.
@@ -464,11 +464,52 @@ async function loadMeta() {
 const stageColor = (s) =>
   state.colors[s] || { prospecting: "#4c8dff", qualification: "#8b9cf0", proposal: "#8b7cf6", negotiation: "#f5b83d", closed_won: "#22c07a", closed_lost: "#f06a7a" }[s] || "#999";
 
-async function vDashboard() {
-  // Dashboard is Milton insights only: the Review → Action → Outcome cycle
-  // compass. KPIs, stage bars and activity lists used to live here; they are
-  // gone — Milton's playbook already watches the pipeline and says what
-  // needs attention, grouped by phase.
+/* ---------- dashboard: the Milton-built daily feed is back ----------
+   Greeting + quick-add, then Milton's morning brief and one chronological
+   stream (due → prep → hygiene) of CRM-derived suggestions, with Milton's
+   playbook insights (Review → Action → Outcome) below. The feed comes from
+   /api/daily-feed and never depends on Milton being up: when Milton is
+   unreachable the stream still renders, minus the take. */
+const FEED_LABEL_STYLE = {
+  Plan: "var(--brand)",
+  Prep: "#0e9f6e",
+  Hygiene: "#c77800",
+};
+function feedItemHtml(it) {
+  const pillColor = FEED_LABEL_STYLE[it.label] || "var(--text-3)";
+  const pill = `<span class="feed-pill" style="border-color:${pillColor};color:${pillColor}">${esc(it.label)}</span>`;
+  if (it.type === "task" && it.task) {
+    return `<div class="feed-item"><div class="feed-item-main">${pill}<div class="text">${taskRow(it.task)}</div></div></div>`;
+  }
+  let main = "";
+  if (it.type === "prep") {
+    const p = it.prep || {};
+    const href = p.kind === "company" ? `#/companies?q=${encodeURIComponent(p.name || "")}` : `#/contacts?q=${encodeURIComponent(p.name || "")}`;
+    // the reason already carries its relevant date ("task due 2026-09-11: …" / "closes 2026-09-25")
+    main = `<b>${esc(p.name)}</b><br>
+      <span style="color:var(--text-3);font-size:12.5px">${esc(p.sub || "")} · ${esc(p.reason || "")}</span>`;
+  } else if (it.type === "deal") {
+    const d = it.deal || {};
+    main = `<b>${esc(d.title)}</b>${d.company_name ? ` · ${esc(d.company_name)}` : ""}<br>
+      <span style="color:var(--text-3);font-size:12.5px">${money(d.value)} · ${esc(d.stage_name || d.stage || "")} · ${esc(it.note || "")}</span>`;
+  } else return "";
+  const actions = it.type === "deal" && it.deal
+    ? `<button class="btn ghost small" data-deal-open="${it.deal.id}">Open</button>`
+    : it.type === "prep"
+      ? `<a class="btn ghost small" style="text-decoration:none" href="${it.prep && it.prep.kind === "company" ? `#/companies?q=${encodeURIComponent(it.prep.name || "")}` : `#/contacts?q=${encodeURIComponent(it.prep.name || "")}`}">Open</a>`
+      : "";
+  return `<div class="feed-item">
+    <div class="feed-item-main">${pill}<div class="text">${main}</div></div>
+    <div class="spacer"></div>
+    ${actions}
+  </div>`;
+}
+
+/* Milton's playbook insights (Review → Action → Outcome), rendered into a
+   container with the phase filter strip. The Dashboard shows these under
+   the daily feed. */
+function renderMiltonInsights(el, data, err) {
+  if (!el) return;
   const PHASES = ["review", "action", "outcome"];
   const PHASE_LABEL = { review: "Review", action: "Action", outcome: "Outcome" };
   const PHASE_HINT = {
@@ -478,18 +519,11 @@ async function vDashboard() {
   };
   const PHASE_COLOR = { review: "#4c8dff", action: "#f5b83d", outcome: "#22c07a" };
   let filter = "all";
-  let data = null;
-  let err = "";
-  try {
-    data = await GET("/api/milton/hygiene");
-    if (data && data.error) { err = data.error; data = null; }
-  } catch (e) { err = e.message || "milton unreachable"; }
-
   const render = () => {
     if (!data) {
-      view.innerHTML = `<div class="panel"><h2>Milton insights</h2>
+      el.innerHTML = `<div class="panel"><h2>Milton insights</h2>
         <div class="empty">${esc(err || "Milton didn't return insights.")}<br><br>
-        The Dashboard shows only Milton's playbook insights now. Start Milton
+        Milton's playbook insights appear here. Start Milton
         (default <code>http://127.0.0.1:3009</code>) and reload — or set
         <code>MILTON_URL</code> on exec-crm if Milton runs on another host.</div></div>`;
       return;
@@ -498,7 +532,7 @@ async function vDashboard() {
     const groups = PHASES
       .map((ph) => ({ ph, items: items.filter((i) => i.phase === ph) }))
       .filter((g) => g.items.length);
-    view.innerHTML = `
+    el.innerHTML = `
       <div class="cycle-strip" role="group" aria-label="Review, Action, Outcome">
         ${PHASES.map((ph, idx) => `
           <button class="cycle-step ${filter === ph ? "sel" : ""}" data-phase="${ph}">
@@ -518,12 +552,72 @@ async function vDashboard() {
             </div>`).join("")}
         </div>`).join("") : `<div class="panel"><div class="empty">${esc(data.lead)}</div></div>`}
       <p class="dash-foot">Insights by Milton's playbook ·
-        <a href="#/milton">ask Milton</a> · <a href="#/outreach">log outreach</a></p>`;
-    view.querySelectorAll(".cycle-step").forEach((b) => {
+        <button class="link" id="dash-ask">ask Milton</button> · <a href="#/outreach">log outreach</a></p>`;
+    el.querySelectorAll(".cycle-step").forEach((b) => {
       b.onclick = () => { filter = filter === b.dataset.phase ? "all" : b.dataset.phase; render(); };
     });
+    const ask = el.querySelector("#dash-ask");
+    if (ask) ask.onclick = () => miltonDockOpen();
   };
   render();
+}
+
+async function vDashboard() {
+  const now = new Date();
+  const dow = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][now.getDay()];
+  const hr = now.getHours();
+  const greet = hr < 12 ? "Good morning" : hr < 18 ? "Good afternoon" : "Good evening";
+  let feed = null;
+  try {
+    const f = await GET("/api/daily-feed");
+    if (f && !f.error) feed = f;
+  } catch { /* down → empty stream */ }
+  let hyg = null, hygErr = "";
+  try {
+    const h = await GET("/api/milton/hygiene");
+    if (h && h.error) { hygErr = h.error; } else hyg = h;
+  } catch (e) { hygErr = e.message || "milton unreachable"; }
+  const items = feed && Array.isArray(feed.items) ? feed.items : [];
+  const take = feed && feed.milton && feed.milton.available && feed.milton.take
+    ? esc(feed.milton.take).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/\n/g, "<br>")
+    : null;
+  view.innerHTML = `
+    <div class="feed-head">
+      <div>
+        <div class="feed-greet">${greet}</div>
+        <div class="feed-sub">${dow}, ${now.toLocaleDateString(undefined, { month: "long", day: "numeric" })} ·
+          <b>${(feed && feed.due_count) || 0}</b> things need you today</div>
+      </div>
+      <div class="feed-add">
+        <input id="qa-title" placeholder="Quick add a task for today…" autocomplete="off">
+        <button class="btn" id="qa-add">Add</button>
+      </div>
+    </div>
+    <div class="panel feed-take"><h2>✦ Milton's take</h2>${take
+      ? `<div class="feed-take-text">${take}</div>`
+      : `<div class="empty">Milton is unreachable — showing the CRM-derived stream only.
+          <button class="link" id="feed-ask">Ask Milton</button> when he's back.</div>`}</div>
+    <div class="panel">
+      <h2>Today's stream <span class="count">${items.length}</span></h2>
+      ${items.length ? items.map(feedItemHtml).join("") : `<div class="empty">Nothing due — a clear runway. Add a task above to seed it.</div>`}
+    </div>
+    <div id="dash-insights"></div>`;
+  // task items: shared checkbox/edit wiring (same flow as the old feed)
+  wireTaskRows(items.filter((i) => i.type === "task" && i.task).map((i) => i.task), []);
+  view.querySelectorAll("[data-deal-open]").forEach((b) => {
+    b.onclick = () => editDealModal({ id: Number(b.dataset.dealOpen) });
+  });
+  const askBtn = $("#feed-ask");
+  if (askBtn) askBtn.onclick = () => miltonDockOpen();
+  const add = async () => {
+    const title = $("#qa-title").value.trim();
+    if (!title) return;
+    await POST("/api/tasks", { title, due_date: toISODate(new Date()), owner: "You" });
+    route();
+  };
+  $("#qa-add").onclick = add;
+  $("#qa-title").addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
+  renderMiltonInsights($("#dash-insights"), hyg, hygErr);
 }
 
 /* ---------- outreach: every channel, one log (the Action phase) ---------- */
@@ -592,8 +686,8 @@ async function vOutreach() {
     try {
       if (typeof sessionStorage !== "undefined")
         sessionStorage.setItem(miltonPrefillKey(), prompt);
-    } catch { /* private mode etc: the chat page still opens */ }
-    location.hash = "#/milton";
+    } catch { /* private mode etc: the chat dock still opens */ }
+    miltonDockOpen();
   };
   const sugCardHtml = (it, idx) => {
     const act = sugAction(it, deals);
@@ -752,35 +846,40 @@ function miltonCardHtml(c) {
   return h + `</div>`;
 }
 
-async function vMilton() {
-  let st = { reachable: false };
-  try { st = await GET("/api/milton/status"); } catch { /* unreachable */ }
-  if (!st.reachable) {
-    view.innerHTML = `<div class="panel"><h2>Milton</h2>
-      <div class="empty">Milton isn't running.<br><br>
-      Start it with <code>bun src/server.ts</code> in the milton project (default port 3009),
-      then reload this page. If Milton lives on another host, set
-      <code>MILTON_URL</code> on exec-crm.</div></div>`;
-    return;
-  }
-  view.innerHTML = `
-    <div class="milton-wrap">
-      <div class="milton-head">
-        <h2>Milton</h2>
-        <span class="milton-status"><span class="dot-ok"></span>listening</span>
-        <span class="flex-sp"></span>
-        <button class="btn ghost sm" id="milton-new">New conversation</button>
-      </div>
-      <div class="milton-msgs" id="milton-msgs" aria-live="polite"></div>
-      <div class="milton-chips" id="milton-chips"></div>
-      <form class="milton-input" id="milton-form">
-        <input id="milton-text" placeholder="Ask Milton — try “morning brief” or “pipeline hygiene”" autocomplete="off">
-        <button class="btn" type="submit">Send</button>
-      </form>
-    </div>`;
+/* ---------- milton dock: floating, collapsible chat ------------------------
+   Same-origin chat shell: the browser only talks to /api/milton/* on this
+   origin; exec-crm proxies to Milton server-side, so MILTON_URL never leaks.
+   One Milton session per workspace, remembered in localStorage; the server
+   re-validates the session against the active workspace on every call.
+   The dock markup lives in index.html; it floats above the UI bottom-right,
+   collapsed to a compact header bar until opened. Open state persists in
+   localStorage. */
+const miltonDockStateKey = () => "exec-crm-milton-dock-open";
+const miltonDockApi = {};
+function miltonDockOpen() { if (miltonDockApi.open) miltonDockApi.open(); }
+function miltonDockClose() { if (miltonDockApi.close) miltonDockApi.close(); }
+function miltonDockToggle() { if (miltonDockApi.toggle) miltonDockApi.toggle(); }
+
+function initMiltonDock() {
+  const root = $("#milton-dock");
+  if (!root) return;
+  const head = $("#milton-dock-head"), body = $("#milton-dock-body");
+  const dot = $("#milton-dock-dot"), statusEl = $("#milton-dock-status");
+  const chev = head.querySelector(".md-chev");
   const msgs = $("#milton-msgs"), chipsEl = $("#milton-chips"),
     form = $("#milton-form"), input = $("#milton-text");
   let thread = []; // {role: "user"|"milton", html}
+  let inited = false, wsBooted = null;
+  const setStatus = (ok) => {
+    dot.className = "mdot " + (ok ? "on" : "off");
+    statusEl.textContent = ok ? "listening" : "offline";
+  };
+  const setOpen = (open) => {
+    body.hidden = !open;
+    head.setAttribute("aria-expanded", String(open));
+    if (chev) chev.textContent = open ? "▾" : "▴";
+    try { localStorage.setItem(miltonDockStateKey(), open ? "1" : ""); } catch { /* storage unavailable */ }
+  };
   const paint = () => {
     msgs.innerHTML = thread.map((m) =>
       `<div class="msg ${m.role}"><div class="bubble">${m.html}</div></div>`).join("");
@@ -809,14 +908,74 @@ async function vMilton() {
       thread[thread.length - 1] = { role: "milton", html };
       paint();
       paintChips(rep.chips);
+      setStatus(true);
     } catch (e) {
       thread[thread.length - 1] =
         { role: "milton", html: `<span class="merror">${esc(e.message || "send failed")}</span>` };
       paint();
+      setStatus(false);
     }
     delete form.dataset.busy;
     input.focus();
   };
+  const greeting = () => ({
+    role: "milton",
+    html: miltonTextHtml(
+      "Hi — I'm Milton, your pipeline agent for this workspace.\nAsk for the morning brief or pipeline hygiene, or tell me what happened: “log outcome” after a call keeps the Review → Action → Outcome cycle honest."),
+  });
+  // Initialize the thread for the current workspace (history or greeting),
+  // and consume any prompt parked by an Outreach suggestion.
+  const init = async () => {
+    if (inited && wsBooted === wsId) return;
+    inited = true; wsBooted = wsId;
+    let st = { reachable: false };
+    try { st = await GET("/api/milton/status"); } catch { /* unreachable */ }
+    setStatus(!!st.reachable);
+    if (!st.reachable) {
+      thread = [{
+        role: "milton",
+        html: `<span class="merror">Milton isn't running.<br><br>Start it with <code>bun src/server.ts</code> in the milton project (default port 3009), then send again. If Milton lives on another host, set <code>MILTON_URL</code> on exec-crm.</span>`,
+      }];
+      paint(); paintChips([]);
+      return;
+    }
+    thread = [];
+    const sid = miltonGetSession();
+    if (sid) {
+      try {
+        const h = await GET(`/api/milton/history?session=${encodeURIComponent(sid)}`);
+        if (h.session) miltonSetSession(h.session);
+        thread = (h.messages || []).map((m) => ({
+          role: m.role === "user" ? "user" : "milton", html: miltonTextHtml(m.text || ""),
+        }));
+      } catch { miltonSetSession(""); }
+    }
+    if (!thread.length) thread = [greeting()];
+    paint(); paintChips([]);
+    // A suggestion click on the Outreach screen parks its prompt here so the
+    // dock opens with the question ready — consumed once, then cleared.
+    try {
+      if (typeof sessionStorage !== "undefined") {
+        const pending = sessionStorage.getItem(miltonPrefillKey());
+        if (pending) {
+          sessionStorage.removeItem(miltonPrefillKey());
+          input.value = pending;
+          input.focus();
+        }
+      }
+    } catch { /* storage unavailable */ }
+  };
+  const open = () => { setOpen(true); init(); };
+  const close = () => setOpen(false);
+  miltonDockApi.open = open;
+  miltonDockApi.close = close;
+  miltonDockApi.toggle = () => (body.hidden ? open() : close());
+  miltonDockApi.send = send;
+  miltonDockApi.init = init;
+  head.onclick = () => miltonDockApi.toggle();
+  head.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); miltonDockApi.toggle(); }
+  });
   chipsEl.onclick = (e) => {
     const b = e.target.closest("[data-send]");
     if (b) send(b.dataset.send);
@@ -826,45 +985,21 @@ async function vMilton() {
     if (b) send(b.dataset.send);
   };
   form.onsubmit = (e) => { e.preventDefault(); send(input.value); };
-  $("#milton-new").onclick = () => {
+  const fresh = $("#milton-dock-new");
+  if (fresh) fresh.onclick = (e) => {
+    e.stopPropagation();
     miltonSetSession("");
-    thread = [{
-      role: "milton",
-      html: miltonTextHtml("Fresh thread. I'm scoped to this workspace — ask me anything."),
-    }];
-    paint(); paintChips([]); input.focus();
+    thread = [greeting()];
+    paint(); paintChips([]);
+    input.focus();
   };
-  // load history for the remembered session, else greet
-  const sid = miltonGetSession();
-  if (sid) {
-    try {
-      const h = await GET(`/api/milton/history?session=${encodeURIComponent(sid)}`);
-      if (h.session) miltonSetSession(h.session);
-      thread = (h.messages || []).map((m) => ({
-        role: m.role === "user" ? "user" : "milton", html: miltonTextHtml(m.text || ""),
-      }));
-    } catch { miltonSetSession(""); }
-  }
-  if (!thread.length) {
-    thread = [{
-      role: "milton",
-      html: miltonTextHtml(
-        "Hi — I'm Milton, your pipeline agent for this workspace.\nAsk for the morning brief or pipeline hygiene, or tell me what happened: “log outcome” after a call keeps the Review → Action → Outcome cycle honest."),
-    }];
-  }
-  paint();
-  // A suggestion click on the Outreach screen parks its prompt here so the
-  // chat opens with the question ready — consumed once, then cleared.
-  try {
-    if (typeof sessionStorage !== "undefined") {
-      const pending = sessionStorage.getItem(miltonPrefillKey());
-      if (pending) {
-        sessionStorage.removeItem(miltonPrefillKey());
-        input.value = pending;
-      }
-    }
-  } catch { /* storage unavailable */ }
-  input.focus();
+  // The collapsed bar still shows whether Milton is reachable.
+  GET("/api/milton/status").then((st) => setStatus(!!(st && st.reachable))).catch(() => setStatus(false));
+  // Restore the persisted open state.
+  let persisted = "";
+  try { persisted = localStorage.getItem(miltonDockStateKey()) || ""; } catch { /* storage unavailable */ }
+  setOpen(!!persisted);
+  if (persisted) init();
 }
 
 /* Pipeline board markup — extracted verbatim from the old standalone vPipeline
@@ -1646,68 +1781,6 @@ function wireTaskRows(tasks, deals) {
 const toISODate = (d) =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 
-/* ---------- daily feed: what needs you today ---------- */
-async function vFeed() {
-  const [{ tasks }, { deals }] = await Promise.all([GET("/api/tasks"), GET("/api/deals")]);
-  const now = new Date();
-  const today = toISODate(now);
-  const plus7 = toISODate(new Date(now.getTime() + 7 * 86400000));
-  const h = now.getHours();
-  const greet = h < 5 ? "Still up" : h < 12 ? "Good morning" : h < 17 ? "Good afternoon" : "Good evening";
-  const byDue = (a, b) => (a.due_date || "9999").localeCompare(b.due_date || "9999");
-
-  const open = tasks.filter((t) => !t.done);
-  const overdue = open.filter((t) => t.due_date && t.due_date < today).sort(byDue);
-  const todayTasks = open.filter((t) => !t.due_date || t.due_date === today).sort(byDue);
-  const upcoming = open.filter((t) => t.due_date > today && t.due_date <= plus7).sort(byDue);
-  const closing = deals
-    .filter((d) => !["closed_won", "closed_lost"].includes(d.stage) && d.expected_close >= today && d.expected_close <= plus7)
-    .sort((a, b) => a.expected_close.localeCompare(b.expected_close));
-  const needYou = overdue.length + todayTasks.length;
-
-  const section = (title, rows, emptyMsg) => `
-    <div class="panel"><h2>${title} <span class="count">${rows.length}</span></h2>
-      ${rows.length ? rows.map(taskRow).join("") : `<div class="empty">${emptyMsg}</div>`}
-    </div>`;
-
-  view.innerHTML = `
-    <div class="feed-head">
-      <div>
-        <div class="feed-greet">${greet}</div>
-        <div class="feed-sub">${now.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })} ·
-          ${needYou ? `<b>${needYou}</b> thing${needYou === 1 ? "" : "s"} need${needYou === 1 ? "s" : ""} you today` : "nothing due — clear runway"}</div>
-      </div>
-      <div class="feed-add">
-        <input id="qa-title" placeholder="Quick add a task for today…" autocomplete="off">
-        <button class="btn" id="qa-add">Add</button>
-      </div>
-    </div>
-    <div class="cols2">
-      <div>
-        ${section("Overdue", overdue, "Nothing overdue. Nice.")}
-        ${section("Today", todayTasks, "Nothing due today.")}
-        ${section("Coming up", upcoming, "Nothing on the horizon.")}
-      </div>
-      <div class="panel"><h2>Closing this week <span class="count">${closing.length}</span></h2>
-        ${closing.length ? closing.map((d) => `
-          <div class="activity"><div class="dot" style="background:${stageColor(d.stage)}"></div>
-            <div class="text"><b>${esc(d.title)}</b> · ${esc(d.company_name || "")}<br>
-            <span style="color:var(--text-3);font-size:12.5px">${money(d.value)} · ${d.probability}% · closes ${esc(d.expected_close)}</span></div>
-          </div>`).join("") : `<div class="empty">No deals closing in the next 7 days.</div>`}
-      </div>
-    </div>`;
-  wireTaskRows(tasks, deals);
-
-  const add = async () => {
-    const title = $("#qa-title").value.trim();
-    if (!title) return;
-    await POST("/api/tasks", { title, due_date: today, owner: "You" });
-    route();
-  };
-  $("#qa-add").onclick = add;
-  $("#qa-title").addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
-}
-
 /* ---------- captures: business cards & client notes ---------- */
 /* ---------- data workshop: captures · schema · automation · sandbox in one place ---------- */
 const WORKSHOP_TABS = [
@@ -2264,13 +2337,17 @@ function initPalette() {
   async function buildItems() {
     if (cache && cacheWs === wsId) return cache;
     const NAV = [
-      ["Dashboard", "#/dashboard"], ["Milton", "#/milton"], ["Outreach", "#/outreach"],
-      ["Campaigns", "#/campaigns"], ["Daily Feed", "#/feed"], ["Data Workshop", "#/workshop"],
+      ["Dashboard", "#/dashboard"], ["Outreach", "#/outreach"],
+      ["Campaigns", "#/campaigns"], ["Data Workshop", "#/workshop"],
     ];
     const out = NAV.map(([label, hash]) => ({
       group: "Go to", kind: "view", label,
       run: () => { location.hash = hash; },
     }));
+    out.push({
+      group: "Go to", kind: "view", label: "Milton chat",
+      run: () => miltonDockOpen(),
+    });
     try {
       const [{ deals }, { contacts }, { companies }] = await Promise.all([
         GET("/api/deals"), GET("/api/contacts"), GET("/api/companies"),
@@ -2361,6 +2438,9 @@ async function route() {
   const [hash] = location.hash.split("?");
   const parts = (hash.replace("#/", "") || "dashboard").split("/");
   const r = parts[0];
+  // Milton lives in the floating dock now, and the daily feed lives on the
+  // Dashboard — old top-level routes redirect there.
+  if (r === "milton" || r === "feed") { location.hash = "#/dashboard"; return; }
   if (LEGACY_ROUTES[r]) { location.hash = `#/workshop/${LEGACY_ROUTES[r]}`; return; }
   const name = TITLES[r] ? r : "dashboard";
   document.querySelectorAll("#nav a").forEach((a) =>
@@ -2377,7 +2457,7 @@ async function route() {
       await vWorkshop(parts[1]);
     } else {
       $("#page-title").textContent = TITLES[name];
-      await { dashboard: vDashboard, milton: vMilton, outreach: vOutreach, feed: vFeed, contacts: vContacts,
+      await { dashboard: vDashboard, outreach: vOutreach, contacts: vContacts,
         companies: vCompanies, campaigns: vCampaigns }[name]();
     }
   } catch (e) {
@@ -2388,6 +2468,7 @@ async function route() {
 (async () => {
   await loadMeta();
   await initWorkspaces();
+  initMiltonDock();
   initPalette();
   window.addEventListener("hashchange", route);
   if (!location.hash) location.hash = "#/dashboard";

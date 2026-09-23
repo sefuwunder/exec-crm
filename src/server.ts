@@ -260,6 +260,172 @@ function needWs(req: Request, url: URL): number | Response {
   return list[0].id;
 }
 
+// ---------------------------------------------------------------- daily feed
+// The Milton-built daily feed, back on the Dashboard: one chronological
+// stream (due → prep → hygiene) of CRM-derived suggestions, plus Milton's
+// "morning brief" take when reachable. Dated items sort first, ascending;
+// undated nudges follow.
+// (The pre-restructure feed also ranked a Blocked section above Plan, fed
+// by the task_dependencies table; that table was removed from the schema,
+// so the restored feed uses the current data model.)
+const mwToday = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+function mwStageNames(w: number): Record<string, string> {
+  const names: Record<string, string> = {};
+  for (const s of db.query("SELECT slug, name FROM stages WHERE workspace_id = ?").all(w) as any[])
+    names[s.slug] = s.name;
+  return names;
+}
+function mwOpenDeals(w: number) {
+  return db
+    .query(
+      `SELECT d.*, c.name AS company_name, ct.name AS contact_name FROM deals d
+       LEFT JOIN companies c ON c.id = d.company_id
+       LEFT JOIN contacts ct ON ct.id = d.contact_id
+       WHERE d.workspace_id = ? AND d.stage NOT IN ('closed_won', 'closed_lost')
+       ORDER BY d.value DESC`
+    )
+    .all(w) as any[];
+}
+// Ask Milton directly (server-side, so MILTON_URL never leaves the server).
+// Returns the reply JSON, or null when Milton is down or slow. Never throws,
+// so the feed always renders with milton.available=false instead of 500ing.
+async function miltonChat(session: string, message: string, w: number, timeoutMs = 7000): Promise<any | null> {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    await fetch(`${MILTON_URL}/api/session/workspace`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session, workspace_id: w }), signal: ctl.signal,
+    }).catch(() => null);
+    const r = await fetch(`${MILTON_URL}/api/chat`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session, message }), signal: ctl.signal,
+    });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+}
+// Deal/task shapes the feed frontend can hand straight to the edit modals.
+function feedDealOut(d: any, names: Record<string, string>) {
+  return {
+    id: d.id, title: d.title, value: d.value, stage: d.stage,
+    stage_name: names[d.stage] || d.stage, probability: d.probability,
+    expected_close: d.expected_close, owner: d.owner,
+    company_id: d.company_id, contact_id: d.contact_id, campaign_id: d.campaign_id,
+    company_name: d.company_name, contact_name: d.contact_name,
+  };
+}
+function feedTaskOut(t: any) {
+  return {
+    id: t.id, title: t.title, done: !!t.done, due_date: t.due_date, owner: t.owner,
+    deal_id: t.deal_id, deal_title: t.deal_title,
+  };
+}
+async function dailyFeed(w: number) {
+  const today = mwToday();
+  const plus7 = (() => {
+    const d = new Date(); d.setDate(d.getDate() + 7);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  })();
+  const names = mwStageNames(w);
+  const taskRows = attachCustom(
+    "task",
+    db.query(
+      `SELECT t.*, d.title AS deal_title FROM tasks t
+       LEFT JOIN deals d ON d.id = t.deal_id
+       WHERE t.workspace_id = ? ORDER BY t.done, t.due_date`
+    ).all(w) as any[]
+  );
+  const deals = mwOpenDeals(w);
+  const open = taskRows.filter((t: any) => !t.done);
+  const plan = open.filter((t: any) => t.due_date && t.due_date <= today);
+  const closingSoon = deals.filter(
+    (d) => d.expected_close && d.expected_close >= today && d.expected_close <= plus7
+  );
+  const staleDays = (iso: string) => {
+    const m = (iso || "").slice(0, 10).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!m) return null;
+    return Math.round(
+      (Date.now() - new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime()) / 86400000
+    );
+  };
+  const hygieneDeals = [
+    ...deals
+      .map((d) => ({ d, days: staleDays(d.updated_at) }))
+      .filter((x) => x.days !== null && (x.days as number) >= 30)
+      .sort((a, b) => (b.days as number) - (a.days as number))
+      .slice(0, 5)
+      .map((x) => ({ ...feedDealOut(x.d, names), note: `untouched ${Math.round(x.days as number)} days` })),
+    ...deals.filter((d) => !d.expected_close).slice(0, 5)
+      .map((d) => ({ ...feedDealOut(d, names), note: "no expected close date" })),
+  ];
+  // Meeting prep: distinct contacts/companies behind today's tasks and this
+  // week's closing deals.
+  const prepDeals = new Map<number, any>();
+  for (const t of plan) {
+    const d = deals.find((x) => x.id === t.deal_id);
+    if (d) prepDeals.set(d.id, { deal: d, reason: `task due ${t.due_date}: ${t.title}`, date: t.due_date });
+  }
+  for (const d of closingSoon)
+    if (!prepDeals.has(d.id)) prepDeals.set(d.id, { deal: d, reason: `closes ${d.expected_close}`, date: d.expected_close });
+  const seen = new Set<string>();
+  const prep: any[] = [];
+  for (const { deal: d, reason, date } of prepDeals.values()) {
+    const contact = d.contact_id
+      ? (db.query("SELECT id, name, title, email, phone FROM contacts WHERE id = ? AND workspace_id = ?").get(d.contact_id, w) as any)
+      : null;
+    const company = d.company_id
+      ? (db.query("SELECT id, name, industry, website FROM companies WHERE id = ? AND workspace_id = ?").get(d.company_id, w) as any)
+      : null;
+    if (contact && !seen.has(`c${contact.id}`)) {
+      seen.add(`c${contact.id}`);
+      prep.push({
+        kind: "contact", id: contact.id, name: contact.name, date,
+        sub: [contact.title, contact.email].filter(Boolean).join(" · ") || "—",
+        reason: `${d.title} — ${reason}`,
+      });
+    }
+    if (company && !seen.has(`o${company.id}`)) {
+      seen.add(`o${company.id}`);
+      prep.push({
+        kind: "company", id: company.id, name: company.name, date,
+        sub: company.industry || company.website || "—",
+        reason: `${d.title} — ${reason}`,
+      });
+    }
+  }
+  const brief = await miltonChat(`exec-crm-feed-w${w}`, "morning brief", w);
+  // One chronological stream: Plan > Prep > Hygiene rank breaks date ties.
+  const rank: Record<string, number> = { Plan: 0, Prep: 1, Hygiene: 2 };
+  const items: any[] = [];
+  for (const t of plan) items.push({
+    type: "task", label: "Plan", date: t.due_date || null, task: feedTaskOut(t),
+  });
+  for (const p of prep) items.push({ type: "prep", label: "Prep", date: p.date || null, prep: p });
+  for (const d of hygieneDeals) items.push({
+    type: "deal", label: "Hygiene", date: d.expected_close || null, note: d.note, deal: d,
+  });
+  items.sort((a, b) => {
+    const da = a.date || "", dbb = b.date || "";
+    if (da && dbb && da !== dbb) return da < dbb ? -1 : 1;
+    if (!!da !== !!dbb) return da ? -1 : 1;
+    return (rank[a.label] ?? 9) - (rank[b.label] ?? 9);
+  });
+  return {
+    generated_at: new Date().toISOString(),
+    milton: { available: !!brief, take: brief?.text || null },
+    due_count: plan.length,
+    items,
+  };
+}
+
 // minimal CSV parser: handles quoted fields, embedded commas/quotes, CRLF
 function parseCsv(text: string): string[][] {
   const rows: string[][] = [];
@@ -1874,7 +2040,7 @@ const server = Bun.serve({
       return json({ ok: true, outreach: outreachRow(id, w) });
     }
 
-    // ---- milton bridge: insights for the Dashboard, agent for the Milton page ---
+    // ---- milton bridge: insights + daily feed for the Dashboard, agent for the floating chat dock ---
     // exec-crm never talks to Milton's DB — it proxies over HTTP so the
     // browser stays same-origin and needs no CORS. MILTON_URL never leaves the
     // server: the browser only ever sees /api/milton/* on this origin.
@@ -1969,6 +2135,15 @@ const server = Bun.serve({
       } catch {
         return miltonDown();
       }
+    }
+
+    // The Milton-built daily feed: a workspace-scoped stream plus Milton's
+    // "morning brief". Never 500s when Milton is down — the feed renders
+    // with milton.available=false instead.
+    if (path === "/api/daily-feed" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      return json(await dailyFeed(w));
     }
 
     // ---- outgoing webhooks (automation platforms)

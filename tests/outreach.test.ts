@@ -96,9 +96,15 @@ describe("outreach API", () => {
           stubHygieneWs = url.searchParams.get("workspace");
           return Response.json({
             ok: true, workspace_id: Number(stubHygieneWs),
-            lead: "1 in review, 0 in action, 0 in outcome",
-            counts: { review: 1, action: 0, outcome: 0 },
-            items: [{ phase: "review", icon: "🔍", text: "stub finding", fix: "stub fix" }],
+            lead: "1 in review, 2 in action, 0 in outcome",
+            counts: { review: 1, action: 2, outcome: 0 },
+            items: [
+              { phase: "review", icon: "🔍", text: "stub finding", fix: "stub fix", kind: "no_contact" },
+              { phase: "action", icon: "📞", text: "stub: Beta LLC went quiet", kind: "quiet_early",
+                ref: { deal_id: 7, contact_id: 3 } },
+              { phase: "action", icon: "🕸️", text: "stub: 2 stale deals", kind: "stale",
+                ref: { deal_ids: [7, 8] } },
+            ],
             chips: ["refresh"],
           });
         }
@@ -277,7 +283,18 @@ describe("outreach API", () => {
     expect(h.status).toBe(200);
     expect(stubHygieneWs).toBe(String(mainId));
     expect(h.data.items[0]).toMatchObject({ phase: "review", text: "stub finding" });
-    expect(h.data.counts).toEqual({ review: 1, action: 0, outcome: 0 });
+    expect(h.data.counts).toEqual({ review: 1, action: 2, outcome: 0 });
+  });
+
+  test("milton proxy passes hygiene refs and kinds through untouched", async () => {
+    const h = await api(BASE_M, "GET", "/api/milton/hygiene", undefined, mainId);
+    expect(h.status).toBe(200);
+    const byKind = Object.fromEntries(h.data.items.map((i: any) => [i.kind, i]));
+    // the Outreach screen's clickable suggestions depend on these refs
+    expect(byKind["quiet_early"].ref).toEqual({ deal_id: 7, contact_id: 3 });
+    expect(byKind["stale"].ref).toEqual({ deal_ids: [7, 8] });
+    // no ref key at all when milton sent none (not an empty object)
+    expect("ref" in byKind["no_contact"]).toBe(false);
   });
 
   test("milton proxy: unknown workspace is rejected before any milton call", async () => {

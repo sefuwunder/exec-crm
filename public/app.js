@@ -530,6 +530,37 @@ async function vDashboard() {
 let outreachFilter = "all";
 const OUTREACH_ICONS = { call: "📞", email: "✉️", social: "💬", video: "🎥", in_person: "🤝" };
 
+/* Milton suggestions on the Outreach screen.
+   Hygiene items arrive with an optional ref {deal_id | deal_ids, contact_id}
+   (see milton's playbook-refs). Clicking a suggestion resolves to one of
+   three actions — kept pure so it's unit-testable:
+     log  — exactly one live deal: open the Log outreach modal prefilled
+     pick — several live deals (an aggregate finding): per-deal chips
+     ask  — no live deal behind the words: hand the text to Milton chat   */
+const miltonPrefillKey = () => `exec-crm-milton-prefill-${wsId}`;
+
+function sugLiveDeals(item, deals) {
+  const ref = item.ref || {};
+  const ids = ref.deal_ids || (ref.deal_id != null ? [ref.deal_id] : []);
+  return ids.map((id) => deals.find((d) => String(d.id) === String(id))).filter(Boolean);
+}
+
+function sugAction(item, deals) {
+  const live = sugLiveDeals(item, deals);
+  if (live.length === 1) return { kind: "log", deal: live[0] };
+  if (live.length > 1) return { kind: "pick", deals: live };
+  return { kind: "ask", prompt: `Help me act on this: ${item.text}` };
+}
+
+/* Which hygiene items belong on the Outreach screen: the Action phase
+   (the next touch) plus Outcome-phase items that name a deal, e.g. a
+   voicemail that wants a callback. Review-phase prep stays on the Dashboard. */
+function outreachSuggestions(items, deals) {
+  return (items || [])
+    .filter((i) => i.phase === "action" || (i.phase === "outcome" && sugLiveDeals(i, deals).length > 0))
+    .slice(0, 8);
+}
+
 async function vOutreach() {
   const [{ outreach, channels }, { deals }, { contacts }] = await Promise.all([
     GET("/api/outreach"), GET("/api/deals"), GET("/api/contacts"),
@@ -538,6 +569,48 @@ async function vOutreach() {
   const openDeals = deals.filter((d) => !["closed_won", "closed_lost"].includes(d.stage));
   const rows = outreach.filter((o) => outreachFilter === "all" || o.channel === outreachFilter);
   const today = new Date().toISOString().slice(0, 10);
+  // Milton's suggestions are advisory — when Milton is down the log still
+  // renders; the suggestions panel just stays empty.
+  let hyg = [];
+  try {
+    const h = await GET("/api/milton/hygiene");
+    if (h && !h.error && Array.isArray(h.items)) hyg = h.items;
+  } catch { /* milton unreachable */ }
+  const sugItems = outreachSuggestions(hyg, deals);
+
+  // Open the Log outreach modal prefilled from a suggestion's deal ref.
+  // contact_id comes from the suggestion's ref, falling back to the deal's
+  // own linked contact; anything not in the dropdowns is dropped.
+  const logFromSuggestion = (deal, ref) => {
+    const contactId = [ref && ref.contact_id, deal.contact_id]
+      .map((c) => (c == null ? "" : String(c)))
+      .find((c) => c && contacts.some((x) => String(x.id) === c)) || "";
+    outreachModal(null, channels, openDeals, contacts, today,
+      { deal_id: deal.id, contact_id: contactId });
+  };
+  const askMilton = (prompt) => {
+    try {
+      if (typeof sessionStorage !== "undefined")
+        sessionStorage.setItem(miltonPrefillKey(), prompt);
+    } catch { /* private mode etc: the chat page still opens */ }
+    location.hash = "#/milton";
+  };
+  const sugCardHtml = (it, idx) => {
+    const act = sugAction(it, deals);
+    const body = `<span class="f-icon">${esc(it.icon || "💡")}</span>
+      <div class="text">${esc(it.text)}${it.fix ? `<div class="fix">${esc(it.fix)}</div>` : ""}</div>`;
+    if (act.kind === "pick") {
+      return `<div class="sug-card">${body}
+        <div class="sug-picks" role="group" aria-label="Choose a deal">
+          ${act.deals.map((d) => `<button class="chip" data-sug-pick="${idx}:${d.id}">${esc(d.title)}</button>`).join("")}
+        </div></div>`;
+    }
+    const cta = act.kind === "log"
+      ? `Log outreach — ${esc(act.deal.title)}`
+      : `Ask Milton`;
+    return `<button class="sug-card as-btn" data-sug="${idx}">
+      ${body}<span class="sug-cta">${cta} →</span></button>`;
+  };
 
   view.innerHTML = `
     <div class="outreach-head">
@@ -546,6 +619,10 @@ async function vOutreach() {
       <div class="spacer"></div>
       <button class="btn" id="or-log">＋ Log outreach</button>
     </div>
+    ${sugItems.length ? `
+    <div class="panel sug-panel"><h2>🤖 Milton suggests <span class="count">${sugItems.length}</span></h2>
+      <div class="sug-list">${sugItems.map(sugCardHtml).join("")}</div>
+    </div>` : ""}
     <div class="chip-row" role="group" aria-label="Filter by channel">
       <button class="chip ${outreachFilter === "all" ? "sel" : ""}" data-ch="all">All</button>
       ${channels.map((c) => `<button class="chip ${outreachFilter === c.value ? "sel" : ""}" data-ch="${c.value}">${OUTREACH_ICONS[c.value] || ""} ${esc(c.label)}</button>`).join("")}
@@ -569,8 +646,25 @@ async function vOutreach() {
         : `<div class="empty">No outreach logged yet — calls, emails, social messages, video calls and in-person touches all live here.</div>`}
     </div>`;
 
-  view.querySelectorAll(".chip").forEach((b) => {
+  view.querySelectorAll(".chip-row .chip").forEach((b) => {
     b.onclick = () => { outreachFilter = b.dataset.ch; route(); };
+  });
+  view.querySelectorAll("[data-sug]").forEach((b) => {
+    b.onclick = () => {
+      const it = sugItems[Number(b.dataset.sug)];
+      if (!it) return;
+      const act = sugAction(it, deals);
+      if (act.kind === "log") logFromSuggestion(act.deal, it.ref || {});
+      else askMilton(act.prompt);
+    };
+  });
+  view.querySelectorAll("[data-sug-pick]").forEach((b) => {
+    b.onclick = () => {
+      const [idx, dealId] = String(b.dataset.sugPick).split(":");
+      const it = sugItems[Number(idx)];
+      const deal = deals.find((d) => String(d.id) === String(dealId));
+      if (it && deal) logFromSuggestion(deal, it.ref || {});
+    };
   });
   $("#or-log").onclick = () => outreachModal(null, channels, openDeals, contacts, today);
   view.querySelectorAll("[data-or-del]").forEach((b) => {
@@ -592,16 +686,22 @@ async function vOutreach() {
   });
 }
 
-function outreachModal(o, channels, deals, contacts, today) {
+function outreachModal(o, channels, deals, contacts, today, prefill) {
   const isNew = !o;
+  // prefill ({deal_id, contact_id}) comes from a Milton suggestion click —
+  // only for new entries, and only ids that exist in the dropdowns.
+  const pf = isNew ? (prefill || {}) : {};
+  const dealOk = pf.deal_id != null && deals.some((d) => String(d.id) === String(pf.deal_id));
+  const contactOk = pf.contact_id != null && String(pf.contact_id) !== "" &&
+    contacts.some((c) => String(c.id) === String(pf.contact_id));
   openModal(isNew ? "Log outreach" : "Edit outreach", `
     <div class="formgrid">
       ${field("Channel", select("channel", channels.map((c) => [c.value, c.label]), o ? o.channel : "call"))}
       ${field("Date", input("happened_at", o ? (o.happened_at || today) : today, "date"))}
     </div>
     <div class="formgrid">
-      ${field("Deal", select("deal_id", [["", "—"]].concat(deals.map((d) => [d.id, d.title])), o ? (o.deal_id || "") : ""))}
-      ${field("Contact", select("contact_id", [["", "—"]].concat(contacts.map((c) => [c.id, c.name])), o ? (o.contact_id || "") : ""))}
+      ${field("Deal", select("deal_id", [["", "—"]].concat(deals.map((d) => [d.id, d.title])), o ? (o.deal_id || "") : (dealOk ? pf.deal_id : "")))}
+      ${field("Contact", select("contact_id", [["", "—"]].concat(contacts.map((c) => [c.id, c.name])), o ? (o.contact_id || "") : (contactOk ? pf.contact_id : "")))}
     </div>
     ${field("Note", `<textarea name="note" rows="3" placeholder="What was said, sent, or shown…">${esc(o ? (o.note || "") : "")}</textarea>`)}
     ${field("Outcome (optional — the Outcome phase)", input("outcome", o ? (o.outcome || "") : "", "text"))}`,
@@ -753,6 +853,17 @@ async function vMilton() {
     }];
   }
   paint();
+  // A suggestion click on the Outreach screen parks its prompt here so the
+  // chat opens with the question ready — consumed once, then cleared.
+  try {
+    if (typeof sessionStorage !== "undefined") {
+      const pending = sessionStorage.getItem(miltonPrefillKey());
+      if (pending) {
+        sessionStorage.removeItem(miltonPrefillKey());
+        input.value = pending;
+      }
+    }
+  } catch { /* storage unavailable */ }
   input.focus();
 }
 

@@ -73,7 +73,7 @@ function bootApp(canned: Record<string, any>) {
     removeItem: (k: string) => { store.delete(k); },
   };
   const factory = new Function("document", "fetch", "location", "localStorage", "confirm", "window",
-    appSrc + "\nreturn { route, vDashboard, vOutreach, vMilton };");
+    appSrc + "\nreturn { route, vDashboard, vOutreach, vMilton, sugAction, sugLiveDeals, outreachSuggestions, outreachModal };");
   const app = factory(documentStub, fetchStub, locationStub, localStorageStub, () => true, { addEventListener() {} });
   const view = () => documentStub.querySelector("#view").innerHTML as string;
   const waitFor = async (pred: (h: string) => boolean, label: string) => {
@@ -163,5 +163,120 @@ describe("restructured views (DOM-stubbed render)", () => {
     const hd = down.view();
     expect(hd).not.toContain("milton-text");
     expect(hd).toContain("isn't running");
+  });
+});
+
+// ---------------------------------------------------------------- milton suggestions on the outreach screen
+const SUG_DEALS = [
+  { id: 7, title: "Beta LLC", stage: "prospecting", contact_id: 3, company_name: "Beta", contact_name: "Bea" },
+  { id: 9, title: "Gamma Inc", stage: "qualification", contact_id: null, company_name: "Gamma", contact_name: "" },
+  { id: 11, title: "Won Deal", stage: "closed_won", contact_id: null, company_name: "", contact_name: "" },
+];
+const SUG_CONTACTS = [{ id: 3, name: "Bea" }, { id: 5, name: "Cal" }];
+const SUG_HYGIENE = {
+  ok: true, workspace_id: 1, lead: "x", counts: { review: 1, action: 3, outcome: 2 },
+  items: [
+    { phase: "action", icon: "📞", kind: "quiet_early", text: "Beta LLC went quiet 9 days ago", fix: "log a call", ref: { deal_id: 7, contact_id: 3 } },
+    { phase: "action", icon: "🕸️", kind: "stale", text: "2 stale deals untouched for 30+ days", ref: { deal_ids: [7, 9] } },
+    { phase: "action", icon: "💡", kind: "R14", text: "rotate the channel, says Milton", ref: null },
+    { phase: "outcome", icon: "📞", kind: "R15", text: "Beta LLC: voicemail left 2d ago — call back", ref: { deal_id: 7 } },
+    { phase: "outcome", icon: "💡", kind: "R18", text: "no-interest fork advice", ref: null },
+    { phase: "review", icon: "🔍", kind: "no_research", text: "Beta LLC has no research notes", ref: { deal_id: 7 } },
+  ],
+  chips: [],
+};
+const SUG_CANNED = {
+  ...BOOT_CANNED,
+  "/api/deals": { deals: SUG_DEALS, stages: [], labels: [] },
+  "/api/contacts": { contacts: SUG_CONTACTS },
+  "/api/milton/hygiene": SUG_HYGIENE,
+};
+
+describe("milton suggestions on the outreach screen", () => {
+  test("sugAction resolves log / pick / ask", async () => {
+    const { app } = bootApp(SUG_CANNED);
+    const [quiet, stale, chan, vm] = SUG_HYGIENE.items;
+    const log = app.sugAction(quiet, SUG_DEALS);
+    expect(log.kind).toBe("log");
+    expect(log.deal.title).toBe("Beta LLC");
+    const pick = app.sugAction(stale, SUG_DEALS);
+    expect(pick.kind).toBe("pick");
+    expect(pick.deals.map((d) => d.title)).toEqual(["Beta LLC", "Gamma Inc"]);
+    // ref.deal_ids pointing at unknown deals → no live deals → ask milton
+    const gone = app.sugAction({ ...stale, ref: { deal_ids: [404, 405] } }, SUG_DEALS);
+    expect(gone.kind).toBe("ask");
+    expect(gone.prompt).toContain("2 stale deals");
+    const ask = app.sugAction(chan, SUG_DEALS);
+    expect(ask.kind).toBe("ask");
+    expect(ask.prompt).toContain("rotate the channel");
+    // outcome item with a live deal ref is a log action too
+    expect(app.sugAction(vm, SUG_DEALS).kind).toBe("log");
+  });
+
+  test("outreachSuggestions keeps action + outcome-with-deal, drops review", async () => {
+    const { app } = bootApp(SUG_CANNED);
+    const kept = app.outreachSuggestions(SUG_HYGIENE.items, SUG_DEALS);
+    expect(kept.map((i) => i.kind)).toEqual(["quiet_early", "stale", "R14", "R15"]);
+    // outcome item without a deal ref is dropped (no useful click target)
+    expect(kept.some((i) => i.kind === "R18")).toBe(false);
+    // capped at 8
+    const many = Array.from({ length: 20 }, (_, n) => ({ phase: "action", text: `s${n}` }));
+    expect(app.outreachSuggestions(many, SUG_DEALS)).toHaveLength(8);
+  });
+
+  test("vOutreach renders clickable suggestion cards", async () => {
+    const { app, view, waitFor } = bootApp(SUG_CANNED);
+    await waitFor((h) => h.includes("cycle-strip") || h.includes("Milton insights"), "boot");
+    await app.vOutreach();
+    const h = view();
+    expect(h).toContain("Milton suggests");
+    // single-deal suggestion → clickable card with a log CTA
+    expect(h).toContain("Beta LLC went quiet 9 days ago");
+    expect(h).toContain("Log outreach — Beta LLC");
+    expect(h).toContain('data-sug="0"');
+    // aggregate → per-deal chips, not a single button
+    expect(h).toContain("2 stale deals untouched for 30+ days");
+    expect(h).toContain('data-sug-pick="1:7"');
+    expect(h).toContain('data-sug-pick="1:9"');
+    expect(h).toContain(">Beta LLC</button>");
+    // ref-less action item → ask-Milton card
+    expect(h).toContain("rotate the channel, says Milton");
+    expect(h).toContain("Ask Milton");
+    // outcome item with a deal ref renders; outcome without one doesn't
+    expect(h).toContain("voicemail left 2d ago");
+    expect(h).not.toContain("no-interest fork advice");
+    // review-phase prep stays on the Dashboard, not here
+    expect(h).not.toContain("has no research notes");
+  });
+
+  test("vOutreach renders the log with no suggestion panel when milton is down", async () => {
+    const { app, view, waitFor } = bootApp({ ...SUG_CANNED, "/api/milton/hygiene": "THROW" });
+    await waitFor((h) => h.includes("cycle-strip") || h.includes("Milton insights"), "boot");
+    await app.vOutreach();
+    const h = view();
+    expect(h).not.toContain("Milton suggests");
+    expect(h).toContain("Log outreach");
+  });
+
+  test("outreachModal prefills deal + contact from a suggestion", async () => {
+    const { app, doc } = bootApp(SUG_CANNED);
+    const channels = OUTREACH.channels;
+    app.outreachModal(null, channels, SUG_DEALS, SUG_CONTACTS, "2026-09-23",
+      { deal_id: 7, contact_id: 3 });
+    const modal = doc.querySelector("#modal-root").innerHTML;
+    expect(modal).toContain('<option value="7" selected>Beta LLC</option>');
+    expect(modal).toContain('<option value="3" selected>Bea</option>');
+  });
+
+  test("outreachModal ignores prefill ids that are not in the dropdowns", async () => {
+    const { app, doc } = bootApp(SUG_CANNED);
+    const channels = OUTREACH.channels;
+    app.outreachModal(null, channels, SUG_DEALS, SUG_CONTACTS, "2026-09-23",
+      { deal_id: 404, contact_id: 405 });
+    const modal = doc.querySelector("#modal-root").innerHTML;
+    expect(modal).not.toContain('value="404" selected');
+    expect(modal).not.toContain('value="405" selected');
+    // falls back to the unselected placeholder
+    expect(modal).toContain('<option value="" selected>—</option>');
   });
 });

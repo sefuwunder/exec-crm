@@ -2,19 +2,6 @@
 const $ = (s, el = document) => el.querySelector(s);
 const view = $("#view");
 
-/* ---------- Catppuccin auto theme ---------- */
-// Latte applies under prefers-color-scheme: light, Mocha otherwise (pure CSS,
-// no toggle). JS-side colors always go through CSS custom properties so a live
-// OS switch repaints via the stylesheet; the listener below re-renders the
-// current view so any JS-computed markup picks up the new scheme too.
-const ctpScheme = () =>
-  typeof matchMedia === "function" && matchMedia("(prefers-color-scheme: light)").matches ? "latte" : "mocha";
-const ctp = (name) =>
-  getComputedStyle(document.documentElement).getPropertyValue("--ctp-" + name).trim();
-if (typeof matchMedia === "function") {
-  matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => route());
-}
-
 /* ---------- workspaces ---------- */
 const WS_KEY = "exec-crm-workspace";
 let workspaces = [];
@@ -31,13 +18,11 @@ const wsParam = (p) => {
   return p + (p.includes("?") ? "&" : "?") + "workspace=" + encodeURIComponent(wsId);
 };
 const TITLES = {
-  dashboard: "Dashboard", feed: "Daily Feed", calendar: "Calendar",
-  companies: "Companies", contacts: "Contacts", campaigns: "Campaigns",
-  calls: "Calls",
-  workshop: "Data Workshop", milton: "Milton",
+  dashboard: "Dashboard", milton: "Milton", outreach: "Outreach",
+  feed: "Daily Feed", contacts: "Contacts",
+  companies: "Companies", campaigns: "Campaigns", captures: "Captures",
+  automations: "Automations", schema: "Schema",
 };
-// Old top-level sections now live inside the Data Workshop tabs.
-const LEGACY_ROUTES = { captures: "captures", automations: "automation", schema: "schema" };
 $("#today").textContent = new Date(Date.now()).toLocaleDateString(undefined, {
   weekday: "long", year: "numeric", month: "long", day: "numeric",
 });
@@ -72,34 +57,6 @@ const GET = (p) => api("GET", p);
 const POST = (p, b) => api("POST", p, b);
 const PATCH = (p, b) => api("PATCH", p, b);
 const DEL = (p) => api("DELETE", p);
-
-// Toggle a task's done state. The server 409s when completing a blocked task;
-// prompt and retry with {confirm:true} on the explicit override.
-async function toggleTask(id, cb, task) {
-  const attempt = async (confirm) => {
-    const res = await fetch(wsParam(`/api/tasks/${id}/toggle`), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(confirm ? { confirm: true } : {}),
-    });
-    if (res.status === 409) {
-      const j = await res.json().catch(() => ({}));
-      const names = (j.blocked_by || []).map((p) => p.title).join(", ");
-      const label = task ? task.title : "this task";
-      if (!confirm(`"${label}" still has unfinished predecessors: ${names}. Complete it anyway?`)) {
-        if (cb) cb.checked = !cb.checked;
-        return null;
-      }
-      return attempt(true);
-    }
-    if (!res.ok) {
-      if (cb) cb.checked = !cb.checked;
-      throw new Error(`toggle task -> ${res.status}`);
-    }
-    return res.json();
-  };
-  return attempt(false);
-}
 
 /* ---------- modal ---------- */
 function openModal(title, bodyHtml, onSubmit, submitLabel = "Save") {
@@ -214,23 +171,13 @@ const cfFieldsHtml = (fields, values = {}) => {
     `</div></div>`;
 };
 const getSchemaFields = async (entity) => (await GET(`/api/schema/${entity}`)).fields;
-/* Read-only pills for an entity's custom_fields: [{id, name, field_type, value}]. */
-const cfReadonlyHtml = (customFields = []) => {
-  const set = (customFields || []).filter((f) => f.value !== "" && f.value != null);
-  if (!set.length) return "";
-  return `<div class="cf-readonly">${set.map((f) => {
-    const v = f.field_type === "checkbox" ? (f.value === "1" ? "✓" : "—") : esc(f.value);
-    return `<span class="cf-pill"><b>${esc(f.name)}</b><span>${v}</span></span>`;
-  }).join("")}</div>`;
-};
 const statusPill = (s) => {
-  const colors = { draft: "var(--ctp-overlay0)", active: "var(--ctp-green)", paused: "var(--ctp-yellow)", completed: "var(--ctp-blue)" };
-  const c = colors[s] || "var(--ctp-overlay0)";
-  return `<span class="pill" style="background:color-mix(in srgb, ${c} 14%, transparent);color:${c}">${esc(s)}</span>`;
+  const colors = { draft: "#9aa1b3", active: "#18a058", paused: "#e6a23c", completed: "#2f62f0" };
+  return `<span class="pill" style="background:${colors[s] || "#9aa1b3"}22;color:${colors[s] || "#9aa1b3"}">${esc(s)}</span>`;
 };
 
 /* ---------- workspace switcher ---------- */
-const WS_COLORS = ["#1e66f5", "#40a02b", "#df8e1d", "#ea76cb", "#8839ef", "#fe640b", "#179299", "#7287fd"];
+const WS_COLORS = ["#579bfc", "#00ca72", "#ffcb00", "#d974b9", "#784bd1", "#ff8a5c", "#20c5d2", "#8b9cf0"];
 
 async function initWorkspaces() {
   const { workspaces: list } = await GET("/api/workspaces");
@@ -259,7 +206,7 @@ function setWorkspace(id) {
 
 function renderWsSwitcher() {
   const w = workspaces.find((x) => x.id === wsId);
-  $("#ws-dot").style.background = (w && w.color) || "var(--ctp-overlay0)";
+  $("#ws-dot").style.background = (w && w.color) || "#999";
   $("#ws-name").textContent = (w && w.name) || "—";
   const menu = $("#ws-menu");
   menu.innerHTML =
@@ -504,7 +451,8 @@ function wireCompanyCells(companies) {
 const state = { stages: [], labels: {}, colors: {} };
 let pipeView = "board"; // pipeline tab: "board" | "timeline"
 let ganttZoom = "fit";  // timeline range: "fit" | "3m" | "6m" | "1y"
-let campBoardFilter = "all"; // campaigns-overview pipeline board: "all" | campaign id | "none"
+let campTab = "overview"; // campaigns window tab: "overview" | "board"
+let campBoardFilter = "all"; // campaign filter on the campaigns board: "all" | campaign id
 
 async function loadMeta() {
   const { stages, labels } = await GET("/api/deals");
@@ -513,318 +461,332 @@ async function loadMeta() {
   const res = await fetch("/api/meta-colors").then((r) => r.ok ? r.json() : null).catch(() => null);
   state.colors = res?.colors || {};
 }
-function stageColor(s) {
-  return state.colors[s] || { prospecting: "var(--phase-early)", qualification: "var(--ctp-lavender)", proposal: "var(--phase-middle)", negotiation: "var(--ctp-yellow)", closed_won: "var(--phase-end)", closed_lost: "var(--ctp-maroon)" }[s] || "var(--ctp-overlay0)";
-}
-/* Funnel-phase color coding: the workspace's ordered stages are split into
-   thirds by position (early / middle / end), so the coding survives stage
-   renames, reorders and additions. closed_won/closed_lost sit at the end of
-   the order and land in the "end" third naturally. Unknown stages (not in
-   the workspace order) get no phase. --urgent is never used here: it is
-   reserved for overdue / upcoming-soon emphasis. */
-function stagePhase(s) {
-  const order = state.stages;
-  const i = order.indexOf(s);
-  if (i < 0 || order.length === 0) return null;
-  const third = order.length / 3;
-  return i < third ? "early" : i < 2 * third ? "middle" : "end";
-}
-const PHASE_VARS = { early: "var(--phase-early)", middle: "var(--phase-middle)", end: "var(--phase-end)" };
-function phaseColor(p) { return PHASE_VARS[p] || null; }
-/* Funnel-aware stage color for board/strip/chips: phase color when the stage
-   is in the workspace order, otherwise the legacy per-stage color. */
-function stageFunnelColor(s) { return phaseColor(stagePhase(s)) || stageColor(s); }
+const stageColor = (s) =>
+  state.colors[s] || { prospecting: "#4c8dff", qualification: "#8b9cf0", proposal: "#8b7cf6", negotiation: "#f5b83d", closed_won: "#22c07a", closed_lost: "#f06a7a" }[s] || "#999";
 
 async function vDashboard() {
-  const k = await GET("/api/kpis");
-  const acts = (await GET("/api/activities")).activities;
-  const deals = (await GET("/api/deals")).deals;
-  const maxV = Math.max(1, ...k.by_stage.map((s) => s.v));
-  const closing = deals
-    .filter((d) => !["closed_won", "closed_lost"].includes(d.stage) && d.expected_close)
-    .sort((a, b) => (a.expected_close < b.expected_close ? -1 : 1))
-    .slice(0, 6);
-  view.innerHTML = `
-    <div class="kpis">
-      <div class="kpi"><div class="kpi-top"><span class="kpi-dot" style="background:var(--phase-early)"></span><div class="label">Open pipeline</div></div>
-        <div class="value">${money(k.pipeline_value)}</div>
-        <div class="sub">${k.open_deals} active deals</div></div>
-      <div class="kpi"><div class="kpi-top"><span class="kpi-dot" style="background:var(--phase-middle)"></span><div class="label">Weighted pipeline</div></div>
-        <div class="value">${money(k.weighted_value)}</div>
-        <div class="sub">probability-adjusted</div></div>
-      <div class="kpi"><div class="kpi-top"><span class="kpi-dot" style="background:var(--phase-end)"></span><div class="label">Won this quarter</div></div>
-        <div class="value">${money(k.won_this_quarter)}</div>
-        <div class="sub">closed won since Jul 1</div></div>
-      <div class="kpi"><div class="kpi-top"><span class="kpi-dot" style="background:var(--ctp-yellow)"></span><div class="label">Open tasks</div></div>
-        <div class="value">${k.tasks_open}</div>
-        <div class="sub">need attention</div></div>
-    </div>
-    <div class="panel"><h2>✦ Milton insights</h2>
-      <div id="dash-widgets"><div class="empty">Loading widgets…</div></div>
-    </div>
-    <div class="panel"><h2>Calendar</h2>
-      <div id="dash-cal"></div>
-    </div>
-    <div class="cols2">
-      <div>
-        <div class="panel"><h2>Pipeline by stage</h2>
-          ${state.stages.map((s) => {
-            const row = k.by_stage.find((x) => x.stage === s) || { n: 0, v: 0 };
-            return `<div class="stagebar">
-              <div class="name">${esc(state.labels[s])} (${row.n})</div>
-              <div class="track"><div class="fill" style="width:${Math.round((row.v / maxV) * 100)}%;background:${stageColor(s)}"></div></div>
-              <div class="amt">${moneyShort(row.v)}</div></div>`;
-          }).join("")}
-        </div>
-        <div class="panel"><h2>Closing soon</h2>
-          ${closing.length ? closing.map((d) => `
-            <div class="activity"><div class="dot" style="background:${stageColor(d.stage)}"></div>
-              <div class="text"><b>${esc(d.title)}</b> · ${esc(d.company_name || "")}<br>
-              <span style="color:var(--text-3);font-size:12.5px">${money(d.value)} · ${d.probability}% · closes ${esc(d.expected_close)}</span></div>
-            </div>`).join("") : `<div class="empty">Nothing on the near horizon.</div>`}
-        </div>
+  // Dashboard is Milton insights only: the Review → Action → Outcome cycle
+  // compass. KPIs, stage bars and activity lists used to live here; they are
+  // gone — Milton's playbook already watches the pipeline and says what
+  // needs attention, grouped by phase.
+  const PHASES = ["review", "action", "outcome"];
+  const PHASE_LABEL = { review: "Review", action: "Action", outcome: "Outcome" };
+  const PHASE_HINT = {
+    review: "prep, research & strategy",
+    action: "the touch — log it in Outreach",
+    outcome: "what came back",
+  };
+  const PHASE_COLOR = { review: "#4c8dff", action: "#f5b83d", outcome: "#22c07a" };
+  let filter = "all";
+  let data = null;
+  let err = "";
+  try {
+    data = await GET("/api/milton/hygiene");
+    if (data && data.error) { err = data.error; data = null; }
+  } catch (e) { err = e.message || "milton unreachable"; }
+
+  const render = () => {
+    if (!data) {
+      view.innerHTML = `<div class="panel"><h2>Milton insights</h2>
+        <div class="empty">${esc(err || "Milton didn't return insights.")}<br><br>
+        The Dashboard shows only Milton's playbook insights now. Start Milton
+        (default <code>http://127.0.0.1:3009</code>) and reload — or set
+        <code>MILTON_URL</code> on exec-crm if Milton runs on another host.</div></div>`;
+      return;
+    }
+    const items = data.items.filter((i) => filter === "all" || i.phase === filter);
+    const groups = PHASES
+      .map((ph) => ({ ph, items: items.filter((i) => i.phase === ph) }))
+      .filter((g) => g.items.length);
+    view.innerHTML = `
+      <div class="cycle-strip" role="group" aria-label="Review, Action, Outcome">
+        ${PHASES.map((ph, idx) => `
+          <button class="cycle-step ${filter === ph ? "sel" : ""}" data-phase="${ph}">
+            <span class="cycle-dot" style="background:${PHASE_COLOR[ph]}"></span>
+            <span class="cycle-name">${PHASE_LABEL[ph]}</span>
+            <span class="cycle-count">${data.counts[ph] || 0}</span>
+            <span class="cycle-hint">${PHASE_HINT[ph]}</span>
+          </button>${idx < 2 ? `<span class="cycle-arrow">→</span>` : ""}`).join("")}
       </div>
-      <div class="panel"><h2>Recent activity</h2>
-        ${acts.map((a) => `
-          <div class="activity">
-            <div class="dot" style="background:${a.kind === "deal" ? "var(--phase-end)" : a.kind === "task" ? "var(--ctp-yellow)" : "var(--phase-early)"}"></div>
-            <div class="text">${esc(a.text)}<div class="time">${esc(a.created_at.slice(0, 16).replace("T", " "))}</div></div>
-          </div>`).join("")}
-      </div>
-    </div>`;
-  loadDashboardWidgets();
-  await mountCalendar($("#dash-cal"), "global", null, { onItem: openCalItem });
+      <p class="dash-lead">${esc(data.lead)}</p>
+      ${groups.length ? groups.map((g) => `
+        <div class="panel"><h2><span class="cycle-dot sm" style="background:${PHASE_COLOR[g.ph]}"></span>
+          ${PHASE_LABEL[g.ph]} <span class="count">${g.items.length}</span></h2>
+          ${g.items.map((i) => `
+            <div class="finding"><span class="f-icon">${esc(i.icon)}</span>
+              <div class="text">${esc(i.text)}${i.fix ? `<div class="fix">${esc(i.fix)}</div>` : ""}</div>
+            </div>`).join("")}
+        </div>`).join("") : `<div class="panel"><div class="empty">${esc(data.lead)}</div></div>`}
+      <p class="dash-foot">Insights by Milton's playbook ·
+        <a href="#/milton">ask Milton</a> · <a href="#/outreach">log outreach</a></p>`;
+    view.querySelectorAll(".cycle-step").forEach((b) => {
+      b.onclick = () => { filter = filter === b.dataset.phase ? "all" : b.dataset.phase; render(); };
+    });
+  };
+  render();
 }
 
-/* Dashboard widget section: user-pinned Milton widgets first, then the default
-   set (forecast, pipeline analysis, hygiene, top deals) computed server-side.
-   The defaults always render — no Milton round-trip required. */
-/* Dashboard Milton widgets: single source GET /api/dashboard/widgets. Pinned
-   widgets (Milton-saved, carry ids) render first and are deletable; the
-   server-computed defaults render after, without delete buttons. */
-async function loadDashboardWidgets() {
-  const root = $("#dash-widgets");
-  if (!root) return;
-  let widgets = [];
-  try {
-    const d = await GET("/api/dashboard/widgets");
-    widgets = d.widgets || [];
-  } catch (e) {
-    root.innerHTML = `<div class="empty">Couldn't load widgets: ${esc(e.message)}</div>`;
-    return;
-  }
-  const pinned = widgets.filter((w) => w.id != null);
-  const defaults = widgets.filter((w) => w.id == null);
-  const group = (label, ws, deletable) => ws.length ? `
-    <div class="mw-sub">${esc(label)}</div>
-    <div class="mw-grid">${ws.map((w) => mwCardHtml(w, { deletable })).join("")}</div>` : "";
-  root.innerHTML =
-    group("Pinned", pinned, true) +
-    group("Suggested", defaults, false) ||
-    `<div class="empty">No widgets yet — ask Milton to pin one from chat.</div>`;
-  root.querySelectorAll("[data-mw-del]").forEach((b) => {
-    b.onclick = async () => { await DEL(`/api/milton/widgets/${b.dataset.mwDel}`); loadDashboardWidgets(); };
+/* ---------- outreach: every channel, one log (the Action phase) ---------- */
+let outreachFilter = "all";
+const OUTREACH_ICONS = { call: "📞", email: "✉️", social: "💬", video: "🎥", in_person: "🤝" };
+
+async function vOutreach() {
+  const [{ outreach, channels }, { deals }, { contacts }] = await Promise.all([
+    GET("/api/outreach"), GET("/api/deals"), GET("/api/contacts"),
+  ]);
+  const labelOf = Object.fromEntries(channels.map((c) => [c.value, c.label]));
+  const openDeals = deals.filter((d) => !["closed_won", "closed_lost"].includes(d.stage));
+  const rows = outreach.filter((o) => outreachFilter === "all" || o.channel === outreachFilter);
+  const today = new Date().toISOString().slice(0, 10);
+
+  view.innerHTML = `
+    <div class="outreach-head">
+      <div class="outreach-sub">Every touch, every channel — the <b>Action</b> log of your
+        Review &rarr; Action &rarr; Outcome cycle.</div>
+      <div class="spacer"></div>
+      <button class="btn" id="or-log">＋ Log outreach</button>
+    </div>
+    <div class="chip-row" role="group" aria-label="Filter by channel">
+      <button class="chip ${outreachFilter === "all" ? "sel" : ""}" data-ch="all">All</button>
+      ${channels.map((c) => `<button class="chip ${outreachFilter === c.value ? "sel" : ""}" data-ch="${c.value}">${OUTREACH_ICONS[c.value] || ""} ${esc(c.label)}</button>`).join("")}
+    </div>
+    <div class="panel"><h2>Outreach <span class="count">${rows.length}</span></h2>
+      ${rows.length ? rows.map((o) => `
+        <div class="orow">
+          <div class="orow-icon" title="${esc(labelOf[o.channel] || o.channel)}">${OUTREACH_ICONS[o.channel] || "•"}</div>
+          <div class="orow-body">
+            <div class="orow-top"><b>${esc(labelOf[o.channel] || o.channel)}</b>
+              ${o.deal_title ? `<span class="orow-deal">${esc(o.deal_title)}</span>` : ""}
+              ${o.contact_name ? `<span class="orow-contact">· ${esc(o.contact_name)}</span>` : ""}
+              <span class="orow-date">${esc((o.happened_at || o.created_at || "").slice(0, 10))}</span></div>
+            ${o.note ? `<div class="orow-note">${esc(o.note)}</div>` : ""}
+            ${o.outcome
+              ? `<div class="orow-outcome"><span class="oc-label">Outcome</span> ${esc(o.outcome)}</div>`
+              : `<button class="linklike" data-or-outcome="${o.id}">＋ log the outcome</button>`}
+          </div>
+          <button class="btn ghost small" data-or-del="${o.id}" title="Delete">Delete</button>
+        </div>`).join("")
+        : `<div class="empty">No outreach logged yet — calls, emails, social messages, video calls and in-person touches all live here.</div>`}
+    </div>`;
+
+  view.querySelectorAll(".chip").forEach((b) => {
+    b.onclick = () => { outreachFilter = b.dataset.ch; route(); };
+  });
+  $("#or-log").onclick = () => outreachModal(null, channels, openDeals, contacts, today);
+  view.querySelectorAll("[data-or-del]").forEach((b) => {
+    b.onclick = async () => {
+      if (confirm("Delete this outreach entry?")) { await DEL(`/api/outreach/${b.dataset.orDel}`); route(); }
+    };
+  });
+  view.querySelectorAll("[data-or-outcome]").forEach((b) => {
+    b.onclick = () => {
+      const o = outreach.find((x) => x.id === Number(b.dataset.orOutcome));
+      openModal("Log outcome", `
+        <p style="color:var(--text-3);font-size:12.5px;margin-top:0">
+          What came back from the ${esc((labelOf[o.channel] || o.channel).toLowerCase())}${o.deal_title ? ` on <b>${esc(o.deal_title)}</b>` : ""}?
+          This is the <b>Outcome</b> phase — voicemail, bounced, meeting booked, not interested…</p>
+        ${field("Outcome", input("outcome", o.outcome || ""))}`,
+        async (d) => { await PATCH(`/api/outreach/${o.id}`, { outcome: d.outcome }); route(); },
+        "Save outcome");
+    };
   });
 }
 
-/* Shared drag-and-drop pipeline kanban board: every deal grouped into a column
-   per stage (workspace stage order, closed stages last). When campNameById (a
-   Map of campaign id -> name) is passed, each deal card carries a campaign
-   badge so the board reads as the cross-campaign pipeline. Deal cards are
-   wired by initDealDrag (drag between columns persists via PATCH /api/deals/:id;
-   plain click opens the deal editor). */
-function boardHtml(deals, campNameById, selSet, selectable) {
+function outreachModal(o, channels, deals, contacts, today) {
+  const isNew = !o;
+  openModal(isNew ? "Log outreach" : "Edit outreach", `
+    <div class="formgrid">
+      ${field("Channel", select("channel", channels.map((c) => [c.value, c.label]), o ? o.channel : "call"))}
+      ${field("Date", input("happened_at", o ? (o.happened_at || today) : today, "date"))}
+    </div>
+    <div class="formgrid">
+      ${field("Deal", select("deal_id", [["", "—"]].concat(deals.map((d) => [d.id, d.title])), o ? (o.deal_id || "") : ""))}
+      ${field("Contact", select("contact_id", [["", "—"]].concat(contacts.map((c) => [c.id, c.name])), o ? (o.contact_id || "") : ""))}
+    </div>
+    ${field("Note", `<textarea name="note" rows="3" placeholder="What was said, sent, or shown…">${esc(o ? (o.note || "") : "")}</textarea>`)}
+    ${field("Outcome (optional — the Outcome phase)", input("outcome", o ? (o.outcome || "") : "", "text"))}`,
+    async (d) => {
+      const payload = {
+        channel: d.channel,
+        happened_at: d.happened_at || "",
+        deal_id: d.deal_id || null,
+        contact_id: d.contact_id || null,
+        note: d.note || "",
+        outcome: d.outcome || "",
+      };
+      if (isNew) await POST("/api/outreach", payload);
+      else await PATCH(`/api/outreach/${o.id}`, payload);
+      route();
+    }, isNew ? "Log it" : "Save changes");
+}
+
+/* ---------- milton: the agent, embedded ---------- */
+/* ---------- milton page: embedded agent --------------------------------------
+   Same-origin chat shell: the browser only talks to /api/milton/* on this
+   origin; exec-crm proxies to Milton server-side, so MILTON_URL never leaks
+   and no cross-origin iframe is needed. One Milton session per workspace,
+   remembered in localStorage; the server re-validates the session against
+   the active workspace on every call. */
+const miltonSessKey = () => `exec-crm-milton-session-${wsId}`;
+const miltonGetSession = () => localStorage.getItem(miltonSessKey()) || "";
+const miltonSetSession = (sid) =>
+  (sid ? localStorage.setItem(miltonSessKey(), sid) : localStorage.removeItem(miltonSessKey()));
+
+const miltonTextHtml = (t) => esc(t).replace(/\n/g, "<br>");
+
+function miltonCardHtml(c) {
+  let h = `<div class="mcard">`;
+  if (c.title) h += `<div class="mcard-title">${esc(c.title)}</div>`;
+  for (const s of c.stats || [])
+    h += `<div class="mstat"><span>${esc(s.label)}</span><b>${esc(s.value)}</b></div>`;
+  for (const o of c.options || [])
+    h += `<button class="mopt" data-send="${o.n}"><b>${o.n}.</b> ${esc(o.label)}${o.sub ? ` <span class="sub">${esc(o.sub)}</span>` : ""}</button>`;
+  for (const it of c.items || []) {
+    const label = it.title || it.name || it.label || it.text || "";
+    const sub = it.stage || it.value != null ? ` <span class="sub">${esc(it.stage || "")}${it.value != null ? " · " + money(it.value) : ""}</span>` : "";
+    if (label) h += `<div class="mitem">• ${esc(String(label))}${sub}</div>`;
+  }
+  for (const r of c.rows || [])
+    h += `<div class="mitem">• ${esc(Array.isArray(r) ? r.join(" · ") : String(r))}</div>`;
+  if (c.ocrText) h += `<pre class="mocr">${esc(c.ocrText)}</pre>`;
+  return h + `</div>`;
+}
+
+async function vMilton() {
+  let st = { reachable: false };
+  try { st = await GET("/api/milton/status"); } catch { /* unreachable */ }
+  if (!st.reachable) {
+    view.innerHTML = `<div class="panel"><h2>Milton</h2>
+      <div class="empty">Milton isn't running.<br><br>
+      Start it with <code>bun src/server.ts</code> in the milton project (default port 3009),
+      then reload this page. If Milton lives on another host, set
+      <code>MILTON_URL</code> on exec-crm.</div></div>`;
+    return;
+  }
+  view.innerHTML = `
+    <div class="milton-wrap">
+      <div class="milton-head">
+        <h2>Milton</h2>
+        <span class="milton-status"><span class="dot-ok"></span>listening</span>
+        <span class="flex-sp"></span>
+        <button class="btn ghost sm" id="milton-new">New conversation</button>
+      </div>
+      <div class="milton-msgs" id="milton-msgs" aria-live="polite"></div>
+      <div class="milton-chips" id="milton-chips"></div>
+      <form class="milton-input" id="milton-form">
+        <input id="milton-text" placeholder="Ask Milton — try “morning brief” or “pipeline hygiene”" autocomplete="off">
+        <button class="btn" type="submit">Send</button>
+      </form>
+    </div>`;
+  const msgs = $("#milton-msgs"), chipsEl = $("#milton-chips"),
+    form = $("#milton-form"), input = $("#milton-text");
+  let thread = []; // {role: "user"|"milton", html}
+  const paint = () => {
+    msgs.innerHTML = thread.map((m) =>
+      `<div class="msg ${m.role}"><div class="bubble">${m.html}</div></div>`).join("");
+    msgs.scrollTop = msgs.scrollHeight;
+  };
+  const paintChips = (chips) => {
+    chipsEl.innerHTML = (chips || []).map((c) =>
+      `<button class="chip" data-send="${esc(c)}">${esc(c)}</button>`).join("");
+  };
+  const push = (role, html) => { thread.push({ role, html }); paint(); };
+  const send = async (text) => {
+    text = String(text || "").trim();
+    if (!text || form.dataset.busy) return;
+    form.dataset.busy = "1";
+    input.value = "";
+    paintChips([]);
+    push("user", miltonTextHtml(text));
+    push("milton", `<span class="thinking">…</span>`);
+    try {
+      const rep = await POST("/api/milton/chat",
+        { message: text, session: miltonGetSession() || undefined });
+      if (rep.session) miltonSetSession(rep.session);
+      else if (rep.activeSession) miltonSetSession(rep.activeSession.id);
+      let html = miltonTextHtml(rep.text || "(no reply)");
+      for (const c of rep.cards || []) html += miltonCardHtml(c);
+      thread[thread.length - 1] = { role: "milton", html };
+      paint();
+      paintChips(rep.chips);
+    } catch (e) {
+      thread[thread.length - 1] =
+        { role: "milton", html: `<span class="merror">${esc(e.message || "send failed")}</span>` };
+      paint();
+    }
+    delete form.dataset.busy;
+    input.focus();
+  };
+  chipsEl.onclick = (e) => {
+    const b = e.target.closest("[data-send]");
+    if (b) send(b.dataset.send);
+  };
+  msgs.onclick = (e) => {
+    const b = e.target.closest("[data-send]");
+    if (b) send(b.dataset.send);
+  };
+  form.onsubmit = (e) => { e.preventDefault(); send(input.value); };
+  $("#milton-new").onclick = () => {
+    miltonSetSession("");
+    thread = [{
+      role: "milton",
+      html: miltonTextHtml("Fresh thread. I'm scoped to this workspace — ask me anything."),
+    }];
+    paint(); paintChips([]); input.focus();
+  };
+  // load history for the remembered session, else greet
+  const sid = miltonGetSession();
+  if (sid) {
+    try {
+      const h = await GET(`/api/milton/history?session=${encodeURIComponent(sid)}`);
+      if (h.session) miltonSetSession(h.session);
+      thread = (h.messages || []).map((m) => ({
+        role: m.role === "user" ? "user" : "milton", html: miltonTextHtml(m.text || ""),
+      }));
+    } catch { miltonSetSession(""); }
+  }
+  if (!thread.length) {
+    thread = [{
+      role: "milton",
+      html: miltonTextHtml(
+        "Hi — I'm Milton, your pipeline agent for this workspace.\nAsk for the morning brief or pipeline hygiene, or tell me what happened: “log outcome” after a call keeps the Review → Action → Outcome cycle honest."),
+    }];
+  }
+  paint();
+  input.focus();
+}
+
+/* Pipeline board markup — extracted verbatim from the old standalone vPipeline
+   and rewired into the campaigns overview. Stage columns in workspace stage
+   order (closed stages last); each deal card carries its campaign badge so the
+   board reads as the cross-campaign pipeline. Drag & drop still runs through
+   initDealDrag + PATCH /api/deals/:id. */
+function pipelineBoardHtml(deals, campById) {
   const closedStages = ["closed_won", "closed_lost"];
-  const sel = selSet || new Set();
-  // the campaigns-overview board is selectable for bulk actions; the
-  // campaign-badge column keeps badges, selection only when asked for
-  const canSel = selectable === undefined ? !campNameById : selectable;
-  // stages not in the workspace order still get their own column so their
-  // deals never vanish from the board (same convention as the strip)
-  const extra = [...new Set(deals.map((d) => d.stage))].filter((s) => !state.stages.includes(s));
-  const order = [...state.stages.filter((s) => !closedStages.includes(s)), ...extra, ...closedStages];
   return `<div class="board" id="board">
-    ${order.map((s) => {
+    ${[...state.stages.filter((s) => !closedStages.includes(s)), ...closedStages].map((s) => {
       const ds = deals.filter((d) => d.stage === s);
-      const tot = ds.reduce((a, d) => a + (Number(d.value) || 0), 0);
+      const tot = ds.reduce((a, d) => a + d.value, 0);
       return `<div class="column" data-stage="${s}">
-        <div class="chead"><div class="dot" style="background:${stageFunnelColor(s)}"></div>
-          <div class="cname">${esc(state.labels[s] || s)}</div>
+        <div class="chead"><div class="dot" style="background:${stageColor(s)}"></div>
+          <div class="cname">${esc(state.labels[s])}</div>
           <div class="ctotal">${ds.length} · ${moneyShort(tot)}</div></div>
         ${ds.map((d) => `
-          <div class="deal-card${canSel && sel.has(d.id) ? " selected" : ""}" data-id="${d.id}">
-            ${canSel ? `<input type="checkbox" class="sel" data-id="${d.id}" title="Select" ${sel.has(d.id) ? "checked" : ""}>` : ""}
-            <div class="trow"><span class="sdot" style="background:${stageFunnelColor(s)}"></span><div class="t">${esc(d.title)}</div></div>
+          <div class="deal-card" data-id="${d.id}">
+            <div class="trow"><span class="sdot" style="background:${stageColor(s)}"></span><div class="t">${esc(d.title)}</div></div>
+            ${campById.get(d.campaign_id) ? `<div class="crow"><span class="camp-badge">${esc(campById.get(d.campaign_id))}</span></div>` : ``}
             <div class="co">${esc(d.company_name || "—")}${d.contact_name ? " · " + esc(d.contact_name) : ""}</div>
-            ${campNameById ? `<div style="margin-top:6px"><span class="pill" style="background:var(--border-soft);color:var(--text-2)">${esc(campNameById.get(d.campaign_id) || "No campaign")}</span></div>` : ""}
-            ${d.source ? `<div style="margin-top:6px"><span class="pill" style="background:var(--ctp-surface1);color:var(--text-2)">${esc(d.source)}</span></div>` : ""}
-            <div class="row"><div class="val">${money(d.value)}</div><div class="prob">${d.probability}%${d.owner ? " · " + esc(d.owner) : ""}</div></div>
+            <div class="row"><div class="val">${money(d.value)}</div><div class="prob">${d.probability}%</div></div>
           </div>`).join("")}
       </div>`;
     }).join("")}
   </div>`;
 }
 
-/* ---------- pipeline board: filters, saved views, bulk selection ----------
-   The live board lives inside the campaigns overview (vCampaigns); these
-   helpers render and wire its filter toolbar, saved views and bulk bar. */
-let pipeFilters = { search: "", owner: "", stage: "", source: "", min_value: "" };
-let bulkSel = new Set(); // selected deal ids across re-renders
-let savedViewsCache = [];
-let dealSourcesCache = [];
-let dealOwnersCache = [];
-
-// client-side mirror of the /api/deals filter params (the overview needs the
-// full deal list for the per-campaign strips, so the board filters locally)
-function applyPipeFilters(deals) {
-  const f = pipeFilters;
-  return (deals || []).filter((d) => {
-    if (f.owner && (d.owner || "") !== f.owner) return false;
-    if (f.stage && d.stage !== f.stage) return false;
-    if (f.source && (d.source || "") !== f.source) return false;
-    if (f.min_value && (Number(d.value) || 0) < Number(f.min_value)) return false;
-    if (f.search) {
-      const q = f.search.toLowerCase();
-      if (!((d.title || "").toLowerCase().includes(q) ||
-            (d.company_name || "").toLowerCase().includes(q))) return false;
-    }
-    return true;
-  });
-}
-
-function savedViewsHtml() {
-  return `
-    <select id="view-sel" title="Saved views">
-      <option value="">Saved views…</option>
-      ${savedViewsCache.map((v) => `<option value="${v.id}">${esc(v.name)}</option>`).join("")}
-    </select>
-    <button class="btn ghost small" id="view-save">Save view</button>
-    <button class="btn ghost small" id="view-del" title="Delete the selected saved view">Delete view</button>`;
-}
-
-function dealFiltersHtml() {
-  return `
-    <div class="filters">
-      <input id="f-search" placeholder="Search deals…" value="${esc(pipeFilters.search)}">
-      <select id="f-owner"><option value="">All owners</option>
-        ${dealOwnersCache.map((o) => `<option value="${esc(o)}" ${pipeFilters.owner === o ? "selected" : ""}>${esc(o)}</option>`).join("")}
-      </select>
-      <select id="f-stage"><option value="">All stages</option>
-        ${state.stages.map((s) => `<option value="${esc(s)}" ${pipeFilters.stage === s ? "selected" : ""}>${esc(state.labels[s] || s)}</option>`).join("")}
-      </select>
-      <select id="f-source"><option value="">All sources</option>
-        ${dealSourcesCache.map((s) => `<option value="${esc(s)}" ${pipeFilters.source === s ? "selected" : ""}>${esc(s)}</option>`).join("")}
-      </select>
-      <input id="f-min" type="number" min="0" placeholder="Min $" value="${esc(pipeFilters.min_value)}">
-      <button class="btn ghost small" id="f-clear">Clear</button>
-    </div>`;
-}
-
-function wirePipeControls() {
-  const applyFilters = () => {
-    pipeFilters.search = $("#f-search").value.trim();
-    pipeFilters.owner = $("#f-owner").value;
-    pipeFilters.stage = $("#f-stage").value;
-    pipeFilters.source = $("#f-source").value;
-    pipeFilters.min_value = $("#f-min").value.trim();
-    route();
-  };
-  let searchT = null;
-  const si = $("#f-search");
-  if (si) si.oninput = () => { clearTimeout(searchT); searchT = setTimeout(applyFilters, 400); };
-  ["#f-owner", "#f-stage", "#f-source", "#f-min"].forEach((s) => {
-    const el = $(s);
-    if (el) el.onchange = applyFilters;
-  });
-  const fc = $("#f-clear");
-  if (fc) fc.onclick = () => {
-    pipeFilters = { search: "", owner: "", stage: "", source: "", min_value: "" };
-    route();
-  };
-  const vs = $("#view-sel");
-  if (vs) vs.onchange = (e) => {
-    const v = savedViewsCache.find((x) => x.id === Number(e.target.value));
-    if (!v) return;
-    pipeFilters = { search: "", owner: "", stage: "", source: "", min_value: "", ...v.filters };
-    route();
-  };
-  const sv = $("#view-save");
-  if (sv) sv.onclick = () => openModal("Save current view", `
-    <div class="field"><label>Name</label><input name="name" placeholder="e.g. Enterprise Q4"></div>`,
-    async (d) => {
-      await POST("/api/saved-views", { name: d.name, filters: pipeFilters });
-      route();
-    });
-  const dv = $("#view-del");
-  if (dv) dv.onclick = async () => {
-    const id = Number($("#view-sel").value);
-    if (!id) { toast("Pick a saved view first", "err"); return; }
-    const v = savedViewsCache.find((x) => x.id === id);
-    if (!confirm(`Delete the saved view "${v ? v.name : id}"?`)) return;
-    await DEL(`/api/saved-views/${id}`);
-    route();
-  };
-}
-
-function renderBulkBar() {
-  const host = $("#bulkbar-host");
-  if (!host) return;
-  if (!bulkSel.size) { host.innerHTML = ""; return; }
-  const stageOpts = state.stages.map((s) => `<option value="${esc(s)}">${esc(state.labels[s] || s)}</option>`).join("");
-  host.innerHTML = `
-    <div class="bulkbar">
-      <b>${bulkSel.size} selected</b>
-      <select id="b-stage">${stageOpts}</select>
-      <button class="btn ghost small" id="b-move">Move stage</button>
-      <input id="b-owner" placeholder="Owner">
-      <button class="btn ghost small" id="b-owner-go">Set owner</button>
-      <input id="b-source" placeholder="Source" list="bulk-sources">
-      <datalist id="bulk-sources">${dealSourcesCache.map((s) => `<option value="${esc(s)}">`).join("")}</datalist>
-      <button class="btn ghost small" id="b-source-go">Set source</button>
-      <button class="btn danger small" id="b-del">Delete</button>
-      <button class="btn ghost small" id="b-clear">Clear</button>
-    </div>`;
-  $("#b-move").onclick = async () => {
-    await POST("/api/deals/bulk", { ids: [...bulkSel], action: "move_stage", value: $("#b-stage").value });
-    bulkSel.clear();
-    route();
-  };
-  $("#b-owner-go").onclick = async () => {
-    await POST("/api/deals/bulk", { ids: [...bulkSel], action: "set_owner", value: $("#b-owner").value.trim() });
-    bulkSel.clear();
-    route();
-  };
-  $("#b-source-go").onclick = async () => {
-    await POST("/api/deals/bulk", { ids: [...bulkSel], action: "set_source", value: $("#b-source").value.trim() });
-    bulkSel.clear();
-    route();
-  };
-  $("#b-del").onclick = () => {
-    const n = bulkSel.size;
-    openModal(`Delete ${n} deal${n > 1 ? "s" : ""}?`, `
-      <p style="color:var(--text-2)">This is destructive. Type <b>DELETE</b> to confirm.</p>
-      <div class="field"><input name="ack" placeholder="DELETE"></div>`,
-      async (d) => {
-        if (d.ack !== "DELETE") throw new Error("confirmation text didn't match");
-        await POST("/api/deals/bulk", { ids: [...bulkSel], action: "delete", confirm: true });
-        bulkSel.clear();
-        route();
-      }, "Delete");
-  };
-  $("#b-clear").onclick = () => { bulkSel.clear(); route(); };
-}
-
-function wireBulkBar(deals) {
-  const board = $("#board");
-  if (!board) return;
-  board.addEventListener("change", (e) => {
-    if (!e.target.classList.contains("sel")) return;
-    const id = Number(e.target.dataset.id);
-    if (e.target.checked) bulkSel.add(id);
-    else bulkSel.delete(id);
-    e.target.closest(".deal-card")?.classList.toggle("selected", e.target.checked);
-    renderBulkBar();
-  });
+/* Client-side campaign filter for the campaigns board (pure, for testing). */
+function filterDealsByCampaign(deals, filter) {
+  if (filter === "all") return deals || [];
+  return (deals || []).filter((d) => String(d.campaign_id) === String(filter));
 }
 
 /* Per-deal Gantt: bar runs from created_at to expected_close.
@@ -976,7 +938,6 @@ function initDealDrag(deals) {
   board.querySelectorAll(".deal-card").forEach((card) => {
     card.addEventListener("pointerdown", (e) => {
       if (e.button !== 0) return;
-      if (e.target.classList.contains("sel")) return; // selection checkbox: not a drag
       e.preventDefault();
       drag = {
         card, id: card.dataset.id, sx: e.clientX, sy: e.clientY,
@@ -1032,10 +993,9 @@ function initDealDrag(deals) {
 }
 
 async function editDealModal(d) {
-  const [{ companies }, { contacts }, { campaigns }, { sources }] = await Promise.all([
-    GET("/api/companies"), GET("/api/contacts"), GET("/api/campaigns"),
-    GET("/api/deal-sources").catch(() => ({ sources: [] })),
-  ]);
+  const { companies } = await GET("/api/companies");
+  const { contacts } = await GET("/api/contacts");
+  const { campaigns } = await GET("/api/campaigns");
   const close = openModal("Edit deal", `
     <div class="formgrid">
       ${field("Title", input("title", d.title))}
@@ -1047,11 +1007,7 @@ async function editDealModal(d) {
       ${field("Probability %", input("probability", d.probability, "number"))}
       ${field("Expected close", input("expected_close", d.expected_close || "", "date"))}
       ${field("Owner", input("owner", d.owner || ""))}
-      ${field("Source", `<input name="source" list="deal-sources" value="${esc(d.source || "")}"><datalist id="deal-sources">${sources.map((s) => `<option value="${esc(s)}">`).join("")}</datalist>`)}
-    </div>
-    <div class="journey"><h3>Journey</h3><div id="deal-journey"><div class="empty">Loading…</div></div></div>
-    <div class="field"><label>Calendar</label><div id="deal-cal"><div class="empty">Loading…</div></div></div>
-    ${callSectionHtml("deal", d.id)}`,
+    </div>`,
     async (data) => {
       if (data.company_id === "") data.company_id = null;
       if (data.contact_id === "") data.contact_id = null;
@@ -1059,42 +1015,6 @@ async function editDealModal(d) {
       await PATCH(`/api/deals/${d.id}`, data);
       route();
     }, "Save changes");
-  wireCallSection("deal", d.id, { deal_id: d.id, company_id: d.company_id || undefined, contact_id: d.contact_id || undefined });
-  // mini read-only calendar: this deal's expected close + its tasks' due dates
-  (async () => {
-    try {
-      const now = new Date();
-      const anchor = /^\d{4}-\d{2}-\d{2}$/.test(d.expected_close || "")
-        ? d.expected_close.split("-").map(Number)
-        : [now.getFullYear(), now.getMonth() + 1];
-      const { from, to } = calVisibleRange(anchor[0], anchor[1] - 1);
-      const { items } = await GET(`/api/calendar?scope=deal&id=${d.id}&from=${from}&to=${to}`);
-      const byDate = {};
-      for (const it of items) (byDate[it.date] = byDate[it.date] || []).push(it);
-      const host = document.querySelector("#deal-cal");
-      if (host) host.innerHTML =
-        monthGridHtml(anchor[0], anchor[1] - 1, byDate, { mini: true, today: toISODate(new Date()) }) +
-        (items.length ? "" : `<div class="empty" style="margin-top:6px">No dates set — add an expected close date or task due dates.</div>`);
-    } catch { /* calendar is decorative; never block the editor */ }
-  })();
-  // stage-transition journey timeline
-  (async () => {
-    try {
-      const { history } = await GET(`/api/deals/${d.id}/history`);
-      const host = document.querySelector("#deal-journey");
-      if (!host) return;
-      host.innerHTML = history.length
-        ? history.map((h) => `
-          <div class="j-item">
-            <div><b>${esc(h.from_name || "Opened")}</b> → <b>${esc(h.to_name)}</b></div>
-            <div class="jd">${esc((h.created_at || "").replace(" ", " · ").slice(0, 20))}</div>
-          </div>`).join("")
-        : `<div class="empty">No history yet.</div>`;
-    } catch {
-      const host = document.querySelector("#deal-journey");
-      if (host) host.innerHTML = `<div class="empty">Couldn't load history.</div>`;
-    }
-  })();
   const actions = document.querySelector("#modal-root .modal .actions");
   if (actions) {
     const del = document.createElement("button");
@@ -1113,10 +1033,9 @@ async function editDealModal(d) {
 }
 
 async function newDealModal() {
-  const [{ companies }, { contacts }, { campaigns }, { sources }] = await Promise.all([
-    GET("/api/companies"), GET("/api/contacts"), GET("/api/campaigns"),
-    GET("/api/deal-sources").catch(() => ({ sources: [] })),
-  ]);
+  const { companies } = await GET("/api/companies");
+  const { contacts } = await GET("/api/contacts");
+  const { campaigns } = await GET("/api/campaigns");
   openModal("New deal", `
     <div class="formgrid">
       ${field("Title", input("title", "", "text", "required"))}
@@ -1128,7 +1047,6 @@ async function newDealModal() {
       ${field("Probability %", input("probability", "20", "number"))}
       ${field("Expected close", input("expected_close", "", "date"))}
       ${field("Owner", input("owner", "You"))}
-      ${field("Source", `<input name="source" list="deal-sources"><datalist id="deal-sources">${sources.map((s) => `<option value="${esc(s)}">`).join("")}</datalist>`)}
     </div>`,
     async (d) => { await POST("/api/deals", d); route(); }, "Create deal");
 }
@@ -1150,30 +1068,26 @@ async function newContactModal(presetCampaignId) {
 
 async function vContacts() {
   const q = new URLSearchParams(location.hash.split("?")[1] || "").get("q") || "";
-  const [{ contacts }, { companies }, fields] = await Promise.all([
+  const [{ contacts }, { companies }] = await Promise.all([
     GET(`/api/contacts?q=${encodeURIComponent(q)}`),
     GET("/api/companies"),
-    getSchemaFields("contact"),
   ]);
-  const hasContactCf = fields.length > 0;
   view.innerHTML = `
     <div class="toolbar">
       <input class="search" id="q" placeholder="Search name or email…" value="${esc(q)}">
       <button class="btn ghost" id="go">Search</button>
       <div class="spacer"></div>
-      <button class="btn ghost" id="dupes">Duplicates</button>
       <button class="btn" id="new-contact">+ New contact</button>
     </div>
     <p class="hint">Tip: click any cell to edit it in place — Enter saves, Esc cancels.</p>
     <div class="panel"><table>
-      <tr><th>Name</th><th>Title</th><th>Company</th><th>Email</th><th>Phone</th>${hasContactCf ? "<th>Custom</th>" : ""}<th></th></tr>
+      <tr><th>Name</th><th>Title</th><th>Company</th><th>Email</th><th>Phone</th><th></th></tr>
       ${contacts.map((c) => `<tr>
         <td data-cid="${c.id}" data-f="name"><b>${esc(c.name)}</b></td>
         <td data-cid="${c.id}" data-f="title">${esc(c.title) || "—"}</td>
         <td data-cid="${c.id}" data-f="company_id">${esc(c.company_name || "—")}</td>
         <td data-cid="${c.id}" data-f="email">${esc(c.email) || "—"}</td>
         <td data-cid="${c.id}" data-f="phone">${esc(c.phone) || "—"}</td>
-        ${hasContactCf ? `<td>${cfReadonlyHtml(c.custom_fields) || "—"}</td>` : ""}
         <td class="rowact"><button class="btn ghost small" data-edit="${c.id}">Edit</button></td>
       </tr>`).join("")}
     </table>${contacts.length ? "" : `<div class="empty">No contacts match.</div>`}</div>`;
@@ -1182,82 +1096,6 @@ async function vContacts() {
   $("#q").addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
   wireContactCells(contacts, companies);
   $("#new-contact").onclick = () => newContactModal();
-  $("#dupes").onclick = () => { dupMode = true; route(); };
-}
-
-/* ---------- duplicate detection & merge UI ---------- */
-let dupMode = false;
-let dupType = "contact";
-
-async function vDuplicates() {
-  const { pairs } = await GET(`/api/duplicates?type=${dupType}`);
-  view.innerHTML = `
-    <div class="toolbar">
-      <button class="btn ghost" id="dup-back">← Contacts</button>
-      <div class="seg small">
-        <button data-dt="contact" class="${dupType === "contact" ? "on" : ""}">Contacts</button>
-        <button data-dt="company" class="${dupType === "company" ? "on" : ""}">Companies</button>
-      </div>
-      <div class="spacer"></div>
-      <span style="color:var(--text-2)">${pairs.length} possible duplicate${pairs.length === 1 ? "" : "s"}</span>
-    </div>
-    ${pairs.length ? pairs.map((p, i) => dupPairHtml(p, i)).join("") :
-      `<div class="empty">No duplicates found — clean.</div>`}`;
-  $("#dup-back").onclick = () => { dupMode = false; route(); };
-  document.querySelectorAll("[data-dt]").forEach((b) =>
-    (b.onclick = () => { dupType = b.dataset.dt; route(); }));
-  document.querySelectorAll(".dup-col input[type=radio]").forEach((r) =>
-    (r.onchange = () => {
-      const pair = r.closest(".dup-pair");
-      pair.querySelectorAll(".dup-col").forEach((c) =>
-        c.classList.toggle("keep", c.querySelector("input").checked));
-    }));
-  document.querySelectorAll("[data-merge]").forEach((b) =>
-    (b.onclick = () => dupMergeModal(pairs[Number(b.dataset.merge)], Number(b.dataset.merge))));
-}
-
-function dupPairHtml(p, i) {
-  const isC = dupType === "contact";
-  const fieldsHtml = (r) => isC
-    ? `<div class="fname">${esc(r.name)}</div>
-       <div class="frow">${esc(r.title || "—")}${r.company_name ? " · " + esc(r.company_name) : ""}</div>
-       <div class="frow">${esc(r.email || "—")}</div>
-       <div class="frow">${esc(r.phone || "—")}</div>`
-    : `<div class="fname">${esc(r.name)}</div>
-       <div class="frow">${esc(r.industry || "—")}</div>
-       <div class="frow">${esc(r.website || "—")}</div>`;
-  return `<div class="dup-pair">
-    <span class="pill" style="background:var(--ctp-surface1);color:var(--text-2)">${esc(p.reason)}</span>
-    <div class="dup-cols">
-      <div class="dup-col keep"><label class="keep-pick"><input type="radio" name="win-${i}" value="a" checked> Keep</label>${fieldsHtml(p.a)}</div>
-      <div class="dup-col"><label class="keep-pick"><input type="radio" name="win-${i}" value="b"> Keep</label>${fieldsHtml(p.b)}</div>
-    </div>
-    <button class="btn danger small" data-merge="${i}">Merge…</button>
-  </div>`;
-}
-
-function dupMergeModal(p, i) {
-  const isC = dupType === "contact";
-  const keepA = document.querySelector(`.dup-pair input[name="win-${i}"]:checked`)?.value !== "b";
-  const winner = keepA ? p.a : p.b;
-  const loser = keepA ? p.b : p.a;
-  openModal("Merge duplicates", `
-    <p style="color:var(--text-2)">This is destructive — one record is deleted and all its
-    ${isC ? "deals, captures, custom values and activities" : "deals, contacts, custom values and activities"}
-    move to the survivor. Winner keeps its fields.</p>
-    <div class="dup-cols">
-      <div class="dup-col keep"><label class="keep-pick">Keep</label><div class="fname">${esc(winner.name)}</div><div class="frow">id ${winner.id}</div></div>
-      <div class="dup-col"><label class="keep-pick">Merge & delete</label><div class="fname">${esc(loser.name)}</div><div class="frow">id ${loser.id}</div></div>
-    </div>
-    <p style="color:var(--text-2)">Type <b>MERGE</b> to confirm.</p>
-    <div class="field"><input name="ack" placeholder="MERGE"></div>`,
-    async (d) => {
-      if (d.ack !== "MERGE") throw new Error("confirmation text didn't match");
-      await POST("/api/duplicates/merge", {
-        type: dupType, winner_id: winner.id, loser_id: loser.id, confirm: true,
-      });
-      route();
-    }, "Merge");
 }
 
 async function editContactModal(c) {
@@ -1268,25 +1106,15 @@ async function editContactModal(c) {
       ${field("Title", input("title", c.title))}
       ${field("Company", select("company_id", [["", "—"]].concat(companies.map((x) => [x.id, x.name])), c.company_id || ""))}
       ${field("Email", input("email", c.email, "email"))}
-      ${field("Phone", `<div style="display:flex;gap:8px;align-items:center">${input("phone", c.phone, "tel")}${c.phone ? `<a class="btn ghost small" href="tel:${esc(c.phone.replace(/[^+\d]/g, ""))}" title="Call ${esc(c.phone)}">Call</a>` : ""}</div>`)}
+      ${field("Phone", input("phone", c.phone))}
       ${field("Campaign", select("campaign_id", [["", "—"]].concat(campaigns.map((x) => [x.id, x.name])), c.campaign_id || ""))}
     </div>
-    <div class="formgrid">
-      ${field("Email opt-out", `<label class="check"><input type="checkbox" id="f-email-optout" ${c.email_opt_out ? "checked" : ""}> Skip in email campaigns</label>`)}
-      ${field("SMS opt-out", `<label class="check"><input type="checkbox" id="f-sms-optout" ${c.sms_opt_out ? "checked" : ""}> Skip in SMS campaigns</label>`)}
-    </div>
-    ${field("SMS gateway", input("sms_gateway", c.sms_gateway || "", "text", 'placeholder="15551234567@vtext.com"'))}
-    <p class="hint" style="margin-top:-6px">Used for Email-to-SMS gateway delivery. Find yours from your mobile carrier (e.g. <span class="tag">number@vtext.com</span>).</p>
-    ${cfFieldsHtml(fields, c.custom)}
-    ${callSectionHtml("contact", c.id)}`,
+    ${cfFieldsHtml(fields, c.custom)}`,
     async (d) => {
       if (d.company_id === "") d.company_id = null;
       if (d.campaign_id === "") d.campaign_id = null;
-      d.email_opt_out = $("#f-email-optout").checked;
-      d.sms_opt_out = $("#f-sms-optout").checked;
       await PATCH(`/api/contacts/${c.id}`, d); route();
     }, "Save changes");
-  wireCallSection("contact", c.id, { contact_id: c.id, company_id: c.company_id || undefined });
 }
 
 async function newCompanyModal(presetCampaignId) {
@@ -1299,20 +1127,18 @@ async function newCompanyModal(presetCampaignId) {
 }
 
 async function vCompanies() {
-  const [{ companies }, fields] = await Promise.all([GET("/api/companies"), getSchemaFields("company")]);
-  const hasCompanyCf = fields.length > 0;
+  const { companies } = await GET("/api/companies");
   view.innerHTML = `
     <div class="toolbar"><div class="spacer"></div>
       <button class="btn" id="new-company">+ New company</button></div>
     <p class="hint">Tip: click any cell to edit it in place — Enter saves, Esc cancels.</p>
     <div class="panel"><table>
-      <tr><th>Company</th><th>Industry</th><th>Website</th><th>Deals</th><th>Open pipeline</th>${hasCompanyCf ? "<th>Custom</th>" : ""}<th></th></tr>
+      <tr><th>Company</th><th>Industry</th><th>Website</th><th>Deals</th><th>Open pipeline</th><th></th></tr>
       ${companies.map((c) => `<tr>
         <td data-cid="${c.id}" data-f="name"><b>${esc(c.name)}</b></td>
         <td data-cid="${c.id}" data-f="industry">${esc(c.industry) || "—"}</td>
         <td data-cid="${c.id}" data-f="website">${esc(c.website) || "—"}</td>
         <td>${c.deal_count}</td><td><b>${money(c.open_value)}</b></td>
-        ${hasCompanyCf ? `<td>${cfReadonlyHtml(c.custom_fields) || "—"}</td>` : ""}
         <td class="rowact"><button class="btn ghost small" data-edit="${c.id}">Edit</button></td>
       </tr>`).join("")}
     </table></div>`;
@@ -1325,46 +1151,11 @@ async function editCompanyModal(c) {
   openModal("Edit company", `
     ${field("Name", input("name", c.name))}
     <div class="formgrid">${field("Industry", input("industry", c.industry))}${field("Website", input("website", c.website))}${field("Campaign", select("campaign_id", [["", "—"]].concat(campaigns.map((x) => [x.id, x.name])), c.campaign_id || ""))}</div>
-    ${cfFieldsHtml(fields, c.custom)}
-    ${callSectionHtml("company", c.id)}
-    <div style="margin-top:14px"><button class="btn danger small" id="m-del-company">Delete company</button></div>`,
+    ${cfFieldsHtml(fields, c.custom)}`,
     async (d) => {
       if (d.campaign_id === "") d.campaign_id = null;
       await PATCH(`/api/companies/${c.id}`, d); route();
     }, "Save changes");
-  wireCallSection("company", c.id, { company_id: c.id });
-  $("#m-del-company").onclick = () => deleteCompany(c);
-}
-
-/* Delete a company. First attempt goes without confirm; a 409 carries the
-   linked-record counts, which surface in a typed-DELETE confirm modal before
-   retrying with ?confirm=true. Linked records are orphaned, never deleted. */
-async function deleteCompany(c) {
-  const attempt = async (confirm) => {
-    const res = await fetch(wsParam(`/api/companies/${c.id}${confirm ? "?confirm=true" : ""}`), { method: "DELETE" });
-    if (res.status === 409) {
-      const j = await res.json().catch(() => ({}));
-      const parts = [];
-      if (j.contacts) parts.push(`${j.contacts} contact${j.contacts > 1 ? "s" : ""}`);
-      if (j.deals) parts.push(`${j.deals} deal${j.deals > 1 ? "s" : ""}`);
-      if (j.campaigns) parts.push(`${j.campaigns} campaign${j.campaigns > 1 ? "s" : ""}`);
-      openModal(`Delete "${c.name}"?`, `
-        <p style="color:var(--text-2)">This company is linked to <b>${parts.join(", ")}</b>. Deleting it will <b>orphan</b> those records — they'll lose their company link but stay in the CRM. Nothing else is deleted.</p>
-        <p style="color:var(--text-2)">This can't be undone. Type <b>DELETE</b> to confirm.</p>
-        <div class="field"><input name="ack" placeholder="DELETE"></div>`,
-        async (d) => {
-          if (d.ack !== "DELETE") throw new Error("confirmation text didn't match");
-          await attempt(true);
-          $("#modal-root").innerHTML = "";
-          route();
-        }, "Delete company");
-      return;
-    }
-    if (!res.ok) throw new Error(`delete company -> ${res.status}`);
-    $("#modal-root").innerHTML = "";
-    route();
-  };
-  return attempt(false);
 }
 
 /* ---------- campaigns ---------- */
@@ -1419,65 +1210,41 @@ function campaignPipelineStrip(deals) {
   const total = [...totals.values()].reduce((a, v) => a + v, 0);
   const segs = ordered.map((s) => {
     const v = totals.get(s) || 0;
-    return `<span title="${esc(state.labels[s] || s)}: ${money(v)}" style="display:block;height:100%;width:${total ? ((v / total) * 100).toFixed(1) : 0}%;background:${stageFunnelColor(s)}"></span>`;
+    return `<span title="${esc(state.labels[s] || s)}: ${money(v)}" style="display:block;height:100%;width:${total ? ((v / total) * 100).toFixed(1) : 0}%;background:${stageColor(s)}"></span>`;
   }).join("");
   return `<div style="display:flex;align-items:center;gap:8px;min-width:170px;max-width:260px">
     <div style="display:flex;height:8px;flex:1;border-radius:99px;overflow:hidden;background:var(--border-soft)">${segs}</div>
     <span style="font-size:12.5px;color:var(--text-2);white-space:nowrap">${deals.length} · <b>${moneyShort(total)}</b></span></div>`;
 }
 
-/* client-side campaign filter for the campaigns-overview pipeline board:
-   "all" | a campaign id | "none" (deals not linked to any campaign) */
-function filterBoardDeals(deals, filter) {
-  if (filter === "all") return deals;
-  if (filter === "none") return deals.filter((d) => d.campaign_id == null);
-  return deals.filter((d) => String(d.campaign_id) === String(filter));
-}
-
-/* ---------- campaigns: Overview | Pipeline | Email | SMS tabs ---------- */
-const CAMPAIGN_TABS = [["overview", "Overview"], ["pipeline", "Pipeline"], ["email", "Email"], ["sms", "SMS"]];
-function campaignTabsHtml(active) {
-  return `<div class="seg" role="tablist" aria-label="Campaign sections" style="margin-bottom:16px">${CAMPAIGN_TABS.map(([id, label]) =>
-    `<button type="button" role="tab" aria-selected="${id === active}" class="${id === active ? "on" : ""}" data-ctab="${id}">${label}</button>`).join("")}</div>`;
-}
-function wireCampaignTabs() {
-  document.querySelectorAll("[data-ctab]").forEach((b) => {
-    b.onclick = () => { location.hash = `#/campaigns/${b.dataset.ctab}`; };
-  });
-}
-
-async function vCampaigns(tab = "overview") {
-  view.innerHTML = campaignTabsHtml(tab) + `<div id="ctab-body"></div>`;
-  wireCampaignTabs();
-  if (tab === "email" || tab === "sms") return vMsgTab(tab);
-  if (tab === "pipeline") return vCampaignPipeline();
-  return vCampaignOverview();
-}
-
-/* Overview + pipeline tabs share one data fetch. */
-async function campaignTabData() {
-  const [{ campaigns }, { companies }, { deals }, { sources }, { views }] = await Promise.all([
+async function vCampaigns() {
+  const [{ campaigns }, { companies }, { deals }] = await Promise.all([
     GET("/api/campaigns"), GET("/api/companies"), GET("/api/deals"),
-    GET("/api/deal-sources").catch(() => ({ sources: [] })),
-    GET("/api/saved-views").catch(() => ({ views: [] })),
   ]);
-  savedViewsCache = views;
-  dealSourcesCache = sources;
-  dealOwnersCache = [...new Set((deals || []).map((d) => d.owner).filter(Boolean))].sort();
   const dealsByCamp = new Map();
   for (const d of deals || []) {
     if (d.campaign_id == null) continue;
     if (!dealsByCamp.has(d.campaign_id)) dealsByCamp.set(d.campaign_id, []);
     dealsByCamp.get(d.campaign_id).push(d);
   }
-  return { campaigns, companies, deals: deals || [], dealsByCamp };
-}
-
-async function vCampaignOverview() {
-  const { campaigns, companies, dealsByCamp } = await campaignTabData();
-  $("#ctab-body").innerHTML = `
-    <div class="toolbar"><div class="spacer"></div>
+  const campById = new Map((campaigns || []).map((c) => [c.id, c.name]));
+  const boardDeals = filterDealsByCampaign(deals, campBoardFilter);
+  const boardValue = boardDeals.reduce((a, d) => a + (Number(d.value) || 0), 0);
+  view.innerHTML = `
+    <div class="toolbar">
+      <div class="seg">
+        <button data-ct="overview" class="${campTab === "overview" ? "on" : ""}">Overview</button>
+        <button data-ct="board" class="${campTab === "board" ? "on" : ""}">Pipeline</button>
+      </div>
+      <div class="spacer"></div>
+      ${campTab === "board" ? `
+        <select id="board-filter" title="Filter board by campaign">
+          <option value="all"${campBoardFilter === "all" ? " selected" : ""}>All campaigns</option>
+          ${(campaigns || []).map((c) => `<option value="${c.id}"${String(campBoardFilter) === String(c.id) ? " selected" : ""}>${esc(c.name)}</option>`).join("")}
+        </select>
+        <span style="color:var(--text-2);font-size:12.5px;white-space:nowrap">${boardDeals.length} deals · <b>${moneyShort(boardValue)}</b></span>` : ``}
       <button class="btn" id="new-campaign">+ New campaign</button></div>
+    ${campTab === "overview" ? `
     <div class="panel"><table>
       <tr><th>Campaign</th><th>Company</th><th>Status</th><th>Start</th><th>End</th><th>Budget</th><th>Pipeline</th></tr>
       ${campaigns.map((c) => `<tr class="clickable" data-id="${c.id}"><td><b>${esc(c.name)}</b></td>
@@ -1485,11 +1252,22 @@ async function vCampaignOverview() {
         <td>${statusPill(c.status)}</td><td>${esc(c.start_date) || "—"}</td><td>${esc(c.end_date) || "—"}</td>
         <td><b>${money(c.budget)}</b></td>
         <td>${campaignPipelineStrip(dealsByCamp.get(c.id) || [])}</td></tr>`).join("")}
-    </table>${campaigns.length ? "" : `<div class="empty">No campaigns yet — launch your first one.</div>`}</div>
-`;
-  document.querySelectorAll("#view tr.clickable").forEach((tr) => {
-    tr.onclick = () => { location.hash = `#/campaigns/${tr.dataset.id}`; };
-  });
+    </table>${campaigns.length ? "" : `<div class="empty">No campaigns yet — launch your first one.</div>`}</div>` : `
+    <div class="panel" style="padding:14px">
+      ${pipelineBoardHtml(boardDeals, campById)}
+      ${boardDeals.length ? "" : `<div class="empty">No deals${campBoardFilter === "all" ? " yet — add one from a campaign" : " in this campaign"}.</div>`}
+    </div>`}`;
+  document.querySelectorAll("[data-ct]").forEach((b) =>
+    (b.onclick = () => { campTab = b.dataset.ct; route(); }));
+  const bf = $("#board-filter");
+  if (bf) bf.onchange = () => { campBoardFilter = bf.value; route(); };
+  if (campTab === "overview") {
+    document.querySelectorAll("#view tr.clickable").forEach((tr) => {
+      tr.onclick = () => { location.hash = `#/campaigns/${tr.dataset.id}`; };
+    });
+  } else {
+    initDealDrag(deals || []);
+  }
   $("#new-campaign").onclick = async () => {
     const fields = await getSchemaFields("campaign");
     openModal("New campaign", `
@@ -1554,46 +1332,9 @@ async function editCampaignModal(c) {
     if (confirm(`Delete campaign "${c.name}"?`)) {
       await DEL(`/api/campaigns/${c.id}`);
       $("#modal-root").innerHTML = "";
-      location.hash = "#/campaigns/overview";
+      location.hash = "#/campaigns";
     }
   };
-}
-
-async function vCampaignPipeline() {
-  const { campaigns, deals } = await campaignTabData();
-  const campNameById = new Map(campaigns.map((c) => [c.id, c.name]));
-  const allDeals = deals;
-  const boardDeals = applyPipeFilters(filterBoardDeals(allDeals, campBoardFilter));
-  // selection only survives for deals still visible
-  bulkSel = new Set([...bulkSel].filter((id) => boardDeals.some((d) => d.id === id)));
-  const boardOpen = boardDeals.filter((d) => !["closed_won", "closed_lost"].includes(d.stage));
-  const boardValue = boardOpen.reduce((a, d) => a + (Number(d.value) || 0), 0);
-  $("#ctab-body").innerHTML = `
-    <div class="panel">
-      <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap">
-        <h2 style="margin:0">Pipeline</h2>
-        <select id="board-camp-filter" style="max-width:230px;width:auto">
-          <option value="all" ${campBoardFilter === "all" ? "selected" : ""}>All campaigns</option>
-          ${campaigns.map((c) => `<option value="${c.id}" ${String(campBoardFilter) === String(c.id) ? "selected" : ""}>${esc(c.name)}</option>`).join("")}
-          <option value="none" ${campBoardFilter === "none" ? "selected" : ""}>No campaign</option>
-        </select>
-        ${savedViewsHtml()}
-        <span style="color:var(--text-2);font-size:12.5px">${boardOpen.length} open deals · ${money(boardValue)} pipeline</span>
-        <div class="spacer"></div>
-        <button class="btn" id="new-deal">+ New deal</button>
-      </div>
-      ${dealFiltersHtml()}
-      ${boardHtml(boardDeals, campNameById, bulkSel, true)}
-      <div id="bulkbar-host"></div>
-    </div>`;
-  $("#board-camp-filter").onchange = (e) => { campBoardFilter = e.target.value; route(); };
-  $("#new-deal").onclick = () => newDealModal();
-  wirePipeControls();
-  if ($("#board")) {
-    initDealDrag(allDeals);
-    wireBulkBar();
-    renderBulkBar();
-  }
 }
 
 /* ---------- campaign detail: workflow task spreadsheet + widgets ---------- */
@@ -1678,7 +1419,6 @@ function renderCampaignDetail(c, tasks, deals, camp) {
           <span>💰 <b>${money(c.budget)}</b></span>
         </div>
         ${c.notes ? `<p class="camp-notes">${esc(c.notes)}</p>` : ""}
-        ${cfReadonlyHtml(c.custom_fields)}
       </div>
     </div>
     <div class="widgets">
@@ -1691,8 +1431,8 @@ function renderCampaignDetail(c, tasks, deals, camp) {
         <div><div class="w-num">${pct}%</div><div class="w-label">complete</div></div>
       </div>
       <div class="widget"><div><div class="w-num">${open.length}</div><div class="w-label">open</div></div></div>
-      <div class="widget"><div><div class="w-num" style="color:var(--danger)">${overdue.length}</div><div class="w-label">overdue</div></div></div>
-      <div class="widget"><div><div class="w-num" style="color:var(--ok)">${done.length}</div><div class="w-label">done</div></div></div>
+      <div class="widget"><div><div class="w-num" style="color:#e5484d">${overdue.length}</div><div class="w-label">overdue</div></div></div>
+      <div class="widget"><div><div class="w-num" style="color:#18a058">${done.length}</div><div class="w-label">done</div></div></div>
       ${next ? `<div class="widget wide"><div><div class="w-label">next up</div>
         <div class="w-next">${esc(next.title)}</div><div class="w-due">due ${esc(next.due_date)}</div></div></div>` : ""}
     </div>
@@ -1700,20 +1440,11 @@ function renderCampaignDetail(c, tasks, deals, camp) {
       ${campaignContactsHtml(camp.contacts)}
       ${campaignCompaniesHtml(camp.companies)}
     </div>
-    <div class="panel">
-      <h2 style="margin-top:0">Calendar</h2>
-      <div id="camp-cal"></div>
-    </div>
     <div class="panel sheet-wrap">
       <div class="sheet-head">
-        <button type="button" class="collapse-toggle" id="tasks-toggle" aria-expanded="false" aria-controls="tasks-body">
-          <span class="chev" aria-hidden="true">▸</span>
-          <span>Workflow tasks</span>
-          <span class="count">${tasks.length}</span>
-        </button>
+        <h3 style="margin:0">Workflow tasks</h3>
         <button class="btn small" id="add-task">+ Add task</button>
       </div>
-      <div id="tasks-body" hidden>
       <table class="sheet">
         <thead><tr>
           <th class="c-done"></th><th>Task</th><th>Owner</th><th>Due</th><th></th><th></th>
@@ -1730,7 +1461,6 @@ function renderCampaignDetail(c, tasks, deals, camp) {
         </tbody>
       </table>
       ${tasks.length ? "" : `<div class="empty">No tasks yet — add the first step.</div>`}
-      </div>
     </div>`;
   $("#edit-campaign").onclick = () => editCampaignModal(c);
   $("#add-campaign-contact").onclick = () => newContactModal(c.id);
@@ -1750,8 +1480,8 @@ function renderCampaignDetail(c, tasks, deals, camp) {
   // done toggles
   document.querySelectorAll('#view input[data-toggle]').forEach((cb) => {
     cb.onchange = async () => {
-      const r = await toggleTask(cb.dataset.toggle, cb, null);
-      if (r) refreshCampaignDetail(c, deals);
+      await POST(`/api/tasks/${cb.dataset.toggle}/toggle`);
+      refreshCampaignDetail(c, deals);
     };
   });
   // full edit (custom fields)
@@ -1778,38 +1508,21 @@ function renderCampaignDetail(c, tasks, deals, camp) {
     const td = document.querySelector(`#view td[data-tid="${task.id}"][data-f="title"]`);
     if (td) td.click();
   };
-  // workflow tasks collapsed by default; header toggles the table
-  const tasksToggle = $("#tasks-toggle");
-  if (tasksToggle) tasksToggle.onclick = () => {
-    const body = $("#tasks-body");
-    const opening = body.hidden;
-    body.hidden = !opening;
-    tasksToggle.setAttribute("aria-expanded", String(opening));
-    const chev = tasksToggle.querySelector(".chev");
-    if (chev) chev.textContent = opening ? "▾" : "▸";
-  };
-  // per-campaign calendar: deal close dates + campaign/deal task due dates
-  const campCal = $("#camp-cal");
-  if (campCal) mountCalendar(campCal, "campaign", c.id, { onItem: openCalItem });
 }
 
 /* shared task row + wiring (used by Daily Feed and campaign detail) */
 function taskRow(t) {
   return `<div class="task ${t.done ? "done" : ""}">
     <input type="checkbox" data-id="${t.id}" ${t.done ? "checked" : ""}>
-    <div><div class="tt">${esc(t.title)}${t.is_blocked && !t.done ? `<span class="blocked-badge">Blocked</span>` : ""}</div>
-      <div class="meta">${t.deal_title ? esc(t.deal_title) + " · " : ""}${t.due_date ? "due " + esc(t.due_date) + " · " : ""}${esc(t.owner)}</div>${cfReadonlyHtml(t.custom_fields)}</div>
+    <div><div class="tt">${esc(t.title)}</div>
+      <div class="meta">${t.deal_title ? esc(t.deal_title) + " · " : ""}${t.due_date ? "due " + esc(t.due_date) + " · " : ""}${esc(t.owner)}</div></div>
     <div class="spacer"></div>
     <button class="btn ghost small" data-edit="${t.id}">Edit</button>
   </div>`;
 }
 function wireTaskRows(tasks, deals) {
   document.querySelectorAll('#view .task input[type="checkbox"]').forEach((cb) => {
-    cb.onchange = async () => {
-      const t = tasks.find((x) => x.id === Number(cb.dataset.id));
-      const r = await toggleTask(cb.dataset.id, cb, t);
-      if (r) route();
-    };
+    cb.onchange = async () => { await POST(`/api/tasks/${cb.dataset.id}/toggle`); route(); };
   });
   document.querySelectorAll("#view [data-edit]").forEach((b) => {
     b.onclick = () => {
@@ -1822,582 +1535,72 @@ function wireTaskRows(tasks, deals) {
 const toISODate = (d) =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 
-/* ---------- calendar views (global, per-campaign, per-deal) ----------
-   Read-only month grids over existing dated data: deal expected_close dates
-   and task due dates. All arithmetic is local calendar days (toISODate);
-   weeks start Monday. No event creation or drag-reschedule here. */
-const CAL_DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-
-/* 42 cells (6 full weeks) covering the month; each { date: "YYYY-MM-DD", inMonth }. */
-function calCells(year, month) {
-  const lead = (new Date(year, month, 1).getDay() + 6) % 7; // Monday-first offset
-  const start = new Date(year, month, 1 - lead);
-  const cells = [];
-  for (let i = 0; i < 42; i++) {
-    const d = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i);
-    cells.push({ date: toISODate(d), inMonth: d.getMonth() === month });
-  }
-  return cells;
-}
-function calVisibleRange(year, month) {
-  const cells = calCells(year, month);
-  return { from: cells[0].date, to: cells[cells.length - 1].date };
-}
-function calMonthLabel(year, month) {
-  return new Date(year, month, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
-}
-function calDayLabel(iso) {
-  const [y, m, d] = iso.split("-").map(Number);
-  return new Date(y, m - 1, d).toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
-}
-/* One calendar chip. Deal chips carry a funnel-phase left border so the stage
-   position reads at a glance. Pure HTML — no DOM access, unit-testable. */
-function calChipHtml(it, date, today, opts = {}) {
-  const doneish = it.type === "task" ? !!it.done : ["closed_won", "closed_lost"].includes(it.stage);
-  const cls = `cal-chip ${it.type}${doneish ? " is-dim" : ""}${!doneish && date < today ? " is-overdue" : ""}`;
-  const inner = esc(it.title);
-  const phase = it.type === "deal" ? ` style="border-left:3px solid ${stageFunnelColor(it.stage)}"` : "";
-  return opts.mini
-    ? `<span class="${cls}"${phase} title="${inner}">${inner}</span>`
-    : `<button type="button" class="${cls}"${phase} data-cal-item="${it.type}:${it.id}" title="${inner}">${inner}</button>`;
-}
-function calChipsHtml(items, date, today, opts = {}) {
-  const maxChips = opts.mini ? 2 : 3;
-  const sorted = items.slice().sort((a, b) => a.type.localeCompare(b.type) || a.id - b.id);
-  const shown = sorted.slice(0, maxChips);
-  const extra = sorted.length - shown.length;
-  return shown.map((it) => calChipHtml(it, date, today, opts)).join("") +
-    (extra > 0 ? `<span class="cal-more">+${extra}</span>` : "");
-}
-/* byDate: { "YYYY-MM-DD": [ { type:"deal"|"task", id, title, date, done?, stage? } ] }.
-   Pure HTML — no DOM access, so it is unit-testable. */
-function monthGridHtml(year, month, byDate, opts = {}) {
-  const today = opts.today || toISODate(new Date());
-  const days = calCells(year, month).map((c) => {
-    const chips = calChipsHtml(byDate[c.date] || [], c.date, today, opts);
-    const cls = ["cal-day"];
-    if (!c.inMonth) cls.push("is-out");
-    if (c.date === today) cls.push("is-today");
-    if (opts.selected === c.date) cls.push("is-selected");
-    return `<div class="${cls.join(" ")}" data-cal-day="${c.date}" role="button" tabindex="0" aria-label="${c.date}">` +
-      `<span class="cal-num">${Number(c.date.slice(8, 10))}</span>` +
-      `<div class="cal-chips">${chips}</div></div>`;
-  }).join("");
-  return `<div class="cal-grid${opts.mini ? " cal-mini" : ""}" role="grid" aria-label="${esc(calMonthLabel(year, month))}">` +
-    CAL_DOW.map((d) => `<div class="cal-dow">${d}</div>`).join("") + days + `</div>`;
-}
-/* 7 cells (Monday-first week) containing the anchor date (ISO "YYYY-MM-DD"). */
-function weekCells(anchorIso) {
-  const [y, m, d] = anchorIso.split("-").map(Number);
-  const dt = new Date(y, m - 1, d);
-  const off = (dt.getDay() + 6) % 7; // Monday-first offset
-  const start = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate() - off);
-  const cells = [];
-  for (let i = 0; i < 7; i++) {
-    const dd = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i);
-    cells.push({ date: toISODate(dd) });
-  }
-  return cells;
-}
-function calWeekLabel(anchorIso) {
-  const cells = weekCells(anchorIso);
-  const fmt = (iso) => {
-    const [y, m, d] = iso.split("-").map(Number);
-    return new Date(y, m - 1, d).toLocaleDateString(undefined, { month: "short", day: "numeric" });
-  };
-  return `${fmt(cells[0].date)} – ${fmt(cells[6].date)}, ${cells[6].date.slice(0, 4)}`;
-}
-/* Week grid: 7 taller day columns headed by weekday + date number.
-   Pure HTML — unit-testable. */
-function weekGridHtml(anchorIso, byDate, opts = {}) {
-  const today = opts.today || toISODate(new Date());
-  const cells = weekCells(anchorIso);
-  const head = cells.map((c) => {
-    const [y, m, d] = c.date.split("-").map(Number);
-    const dow = CAL_DOW[(new Date(y, m - 1, d).getDay() + 6) % 7];
-    return `<div class="cal-dow${c.date === today ? " is-today" : ""}">${dow} <span class="cal-dow-num">${d}</span></div>`;
-  }).join("");
-  const days = cells.map((c) => {
-    const cls = ["cal-day"];
-    if (c.date === today) cls.push("is-today");
-    if (opts.selected === c.date) cls.push("is-selected");
-    return `<div class="${cls.join(" ")}" data-cal-day="${c.date}" role="button" tabindex="0" aria-label="${c.date}">` +
-      `<div class="cal-chips">${calChipsHtml(byDate[c.date] || [], c.date, today, opts)}</div></div>`;
-  }).join("");
-  return `<div class="cal-grid cal-week" role="grid" aria-label="${esc(calWeekLabel(anchorIso))}">${head}${days}</div>`;
-}
-/* One row in a calendar day-detail list. Carries data-cal-item for the shared binder. */
-function calDayRowHtml(it, today) {
-  const doneish = it.type === "task" ? !!it.done
-    : it.type === "campaign" ? it.status === "sent"
-    : ["closed_won", "closed_lost"].includes(it.stage);
-  const od = !doneish && it.date < today;
-  const meta = it.type === "deal"
-    ? `${money(it.value)} · ${esc(it.stage_name || it.stage || "")}${it.company_name ? ` · ${esc(it.company_name)}` : ""}`
-    : it.type === "campaign"
-    ? `campaign ${it.edge === "ends" ? "ends" : "starts"}${it.company_name ? ` · ${esc(it.company_name)}` : ""}`
-    : `${it.done ? "done" : `due ${esc(it.date)}`}${it.deal_title ? ` · ${esc(it.deal_title)}` : ""}`;
-  return `<div class="cal-row${od ? " is-overdue" : ""}" data-cal-item="${it.type}:${it.id}" role="button" tabindex="0">` +
-    `<span class="cal-dot ${it.type}"${it.type === "deal" ? ` style="background:${stageFunnelColor(it.stage)}"` : ""}></span>` +
-    `<div class="cal-row-text"><b>${esc(it.title)}</b><span>${meta}</span></div></div>`;
-}
-/* Click + keyboard delegation for grids and day lists. onDay(iso), onItem(type, id). */
-function bindCalendarGrid(root, onDay, onItem) {
-  root.addEventListener("click", (e) => {
-    const item = e.target.closest("[data-cal-item]");
-    if (item && onItem) {
-      e.stopPropagation();
-      const [type, id] = item.dataset.calItem.split(":");
-      onItem(type, Number(id));
-      return;
-    }
-    const day = e.target.closest("[data-cal-day]");
-    if (day && onDay) onDay(day.dataset.calDay);
-  });
-  root.addEventListener("keydown", (e) => {
-    if (e.key !== "Enter" && e.key !== " ") return;
-    const t = e.target.closest("[data-cal-day],[data-cal-item]");
-    if (!t) return;
-    e.preventDefault();
-    if (t.hasAttribute("data-cal-item") && onItem) {
-      const [type, id] = t.dataset.calItem.split(":");
-      onItem(type, Number(id));
-    } else if (onDay) onDay(t.dataset.calDay);
-  });
-}
-/* Self-contained calendar. scope: global|campaign|deal. opts: { mini, view }.
-   Week view is the default (mini stays month-only). Fetches its own data,
-   renders nav + view toggle + grid + day list, opens entities via onItem.
-   Returns a redraw function. */
-async function mountCalendar(el, scope, id, opts = {}) {
-  const now = new Date();
-  let view = opts.mini ? "month" : (opts.view || "week");
-  let anchor = toISODate(now); // week anchor (any date in the shown week)
-  let y = now.getFullYear(), m = now.getMonth(); // month cursor
-  let selected = toISODate(now);
-  const q = scope === "global" ? "" : `&id=${id}`;
-  const stepNav = (step) => {
-    if (view === "week") {
-      const [ay, am, ad] = anchor.split("-").map(Number);
-      anchor = toISODate(new Date(ay, am - 1, ad + step * 7));
-    } else {
-      const d = new Date(y, m + step, 1);
-      y = d.getFullYear(); m = d.getMonth();
-    }
-  };
-  const goToday = () => {
-    const n = new Date();
-    anchor = toISODate(n); y = n.getFullYear(); m = n.getMonth(); selected = toISODate(n);
-  };
-  async function draw() {
-    const today = toISODate(new Date());
-    let from, to, label, grid, panel = "";
-    if (view === "week") {
-      const cells = weekCells(anchor);
-      from = cells[0].date; to = cells[6].date;
-      label = calWeekLabel(anchor);
-      const { items } = await GET(`/api/calendar?scope=${scope}${q}&from=${from}&to=${to}`);
-      lastItems = items; lastDeals = items.filter((i) => i.type === "deal");
-      const byDate = {};
-      for (const it of items) (byDate[it.date] = byDate[it.date] || []).push(it);
-      grid = weekGridHtml(anchor, byDate, { selected, today });
-      panel = calDayPanelHtml(byDate, selected, today, items, "week");
-    } else {
-      ({ from, to } = calVisibleRange(y, m));
-      label = calMonthLabel(y, m);
-      const { items } = await GET(`/api/calendar?scope=${scope}${q}&from=${from}&to=${to}`);
-      const byDate = {};
-      for (const it of items) (byDate[it.date] = byDate[it.date] || []).push(it);
-      grid = monthGridHtml(y, m, byDate, { mini: opts.mini, selected: opts.mini ? undefined : selected, today });
-      if (!opts.mini) {
-        lastItems = items; lastDeals = items.filter((i) => i.type === "deal");
-        panel = calDayPanelHtml(byDate, selected, today, items, "month");
-      }
-    }
-    el.innerHTML = `
-      ${opts.mini ? "" : `<div class="cal-head">
-        <div class="cal-nav">
-          <button class="btn ghost small" data-cal-nav="-1" aria-label="Previous ${view}">←</button>
-          <button class="btn ghost small" data-cal-nav="0">Today</button>
-          <button class="btn ghost small" data-cal-nav="1" aria-label="Next ${view}">→</button>
-        </div>
-        <div class="cal-view" role="group" aria-label="Calendar view">
-          <button class="btn ghost small" data-cal-view="week" aria-pressed="${view === "week"}">Week</button>
-          <button class="btn ghost small" data-cal-view="month" aria-pressed="${view === "month"}">Month</button>
-        </div>
-        <h2 style="margin:0">${esc(label)}</h2>
-        <div class="cal-legend">
-          <span class="cal-legend-item"><span class="cal-dot deal"></span>Deal closes</span>
-          <span class="cal-legend-item"><span class="cal-dot task"></span>Task due</span>
-          <span class="cal-legend-item"><span class="cal-dot campaign"></span>Campaign</span>
-        </div>
-      </div>`}
-      ${grid}
-      ${opts.mini ? "" : `<div class="cal-daypanel">${panel}</div>`}`;
-    el.querySelectorAll("[data-cal-nav]").forEach((b) => {
-      b.onclick = () => {
-        const step = Number(b.dataset.calNav);
-        if (step === 0) goToday(); else stepNav(step);
-        draw();
-      };
-    });
-    el.querySelectorAll("[data-cal-view]").forEach((b) => {
-      b.onclick = () => { view = b.dataset.calView; draw(); };
-    });
-    // bindCalendarGrid is bound once per mount (not per draw): draw() replaces
-    // innerHTML but the root element persists, so per-draw binding would pile
-    // up duplicate click/keydown handlers on every navigation.
-  }
-  let lastItems = [], lastDeals = [];
-  bindCalendarGrid(el,
-    (d) => { selected = d; draw(); },
-    opts.onItem ? (type, itemId) => opts.onItem(type, itemId, lastItems, lastDeals) : undefined);
-  const _draw = draw;
-  await _draw();
-  return _draw;
-}
-/* Day-detail panel under the grid. Separated so week/month share it.
-   Pure HTML given its inputs — unit-testable. */
-function calDayPanelHtml(byDate, selected, today, items, view) {
-  const selItems = (byDate[selected] || []).slice().sort((a, b) =>
-    a.type.localeCompare(b.type) || a.id - b.id);
-  return `
-    <h3>${esc(calDayLabel(selected))} <span class="count">${selItems.length}</span></h3>
-    ${selItems.length ? selItems.map((it) => calDayRowHtml(it, today)).join("")
-      : `<div class="empty">${items.length ? "Nothing scheduled this day." : `No dated items this ${view} — set expected close dates on deals or due dates on tasks.`}</div>`}`;
-}
-/* Open a calendar item in its editor modal. items/deals come from the calendar payload. */
-function openCalItem(type, id, items, deals) {
-  const it = items.find((x) => x.type === type && x.id === id);
-  if (!it) return;
-  if (type === "deal") editDealModal(it);
-  else if (type === "campaign") location.hash = `#/campaigns/${id}`;
-  else editTaskModal(it, deals);
-}
-/* Global calendar view: nav-level month grid over the whole workspace. */
-async function vCalendar() {
-  view.innerHTML = `<div id="cal-root"></div>`;
-  await mountCalendar($("#cal-root"), "global", null, { onItem: openCalItem });
-}
-
-/* ---------- daily feed: what needs you today ----------
-   One chronological stream (blocked → due → prep → hygiene) of CRM-derived
-   suggestions, plus Milton's take when reachable. Dated items sort first,
-   ascending; undated nudges follow. Task cards keep the same
-   checkbox/edit-modal behavior as the Tasks view. */
-const FEED_LABEL_STYLE = {
-  Blocked: "var(--urgent)",
-  Plan: "var(--phase-middle)",
-  Prep: "var(--phase-early)",
-  Hygiene: "var(--ctp-yellow)",
-};
-function feedItemHtml(it) {
-  const pillColor = FEED_LABEL_STYLE[it.label] || "var(--text-3)";
-  const pill = `<span class="feed-pill" style="border-color:${pillColor};color:${pillColor}">${esc(it.label)}</span>`;
-  let main = "", actions = "";
-  if (it.type === "task") {
-    const t = it.task || {};
-    const blocked = Array.isArray(it.blocked_by) && it.blocked_by.length
-      ? `blocked by ${esc(it.blocked_by.map((b) => b.title).join(", "))}` : "";
-    const today = toISODate(new Date());
-    const when = !t.due_date ? "no due date"
-      : t.due_date < today ? `overdue since ${esc(t.due_date)}`
-      : `due ${esc(t.due_date)}`;
-    const sub = [blocked, when, t.owner ? esc(t.owner) : ""].filter(Boolean).join(" · ");
-    main = `<b>${esc(t.title)}</b><br>
-      <span style="color:var(--text-3);font-size:12.5px">${sub}</span>`;
-    actions = `<input type="checkbox" data-task-id="${t.id}" ${t.done ? "checked" : ""} aria-label="Mark done">
-      <button class="btn ghost small" data-edit="${t.id}">Edit</button>`;
-  } else if (it.type === "prep") {
-    const p = it.prep || {};
-    const href = p.kind === "company" ? `#/companies?q=${encodeURIComponent(p.name || "")}` : `#/contacts?q=${encodeURIComponent(p.name || "")}`;
-    // the reason already carries its relevant date ("task due 2026-09-11: …" / "closes 2026-09-25")
-    main = `<b>${esc(p.name)}</b><br>
-      <span style="color:var(--text-3);font-size:12.5px">${esc(p.sub || "")} · ${esc(p.reason || "")}</span>`;
-    actions = `<a class="btn ghost small" style="text-decoration:none" href="${href}">Open</a>`;
-  } else if (it.type === "deal") {
-    const d = it.deal || {};
-    main = `<b>${esc(d.title)}</b>${d.company_name ? ` · ${esc(d.company_name)}` : ""}<br>
-      <span style="color:var(--text-3);font-size:12.5px">${money(d.value)} · ${esc(d.stage_name || d.stage || "")} · ${esc(it.note || "")}</span>`;
-    actions = `<button class="btn ghost small" data-deal-open="${d.id}">Open</button>`;
-  }
-  return `<div class="feed-item">
-    <div class="feed-item-main">${pill}<div class="text">${main}</div></div>
-    <div class="spacer"></div>
-    ${actions}
-  </div>`;
-}
+/* ---------- daily feed: what needs you today ---------- */
 async function vFeed() {
-  const feed = await GET("/api/daily-feed").catch(() => ({
-    milton: { available: false, take: null }, due_count: 0, items: [],
-  }));
-  const items = Array.isArray(feed.items) ? feed.items : [];
+  const [{ tasks }, { deals }] = await Promise.all([GET("/api/tasks"), GET("/api/deals")]);
   const now = new Date();
-  const dow = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][now.getDay()];
-  const hr = now.getHours();
-  const greet = hr < 12 ? "Good morning" : hr < 18 ? "Good afternoon" : "Good evening";
+  const today = toISODate(now);
+  const plus7 = toISODate(new Date(now.getTime() + 7 * 86400000));
+  const h = now.getHours();
+  const greet = h < 5 ? "Still up" : h < 12 ? "Good morning" : h < 17 ? "Good afternoon" : "Good evening";
+  const byDue = (a, b) => (a.due_date || "9999").localeCompare(b.due_date || "9999");
+
+  const open = tasks.filter((t) => !t.done);
+  const overdue = open.filter((t) => t.due_date && t.due_date < today).sort(byDue);
+  const todayTasks = open.filter((t) => !t.due_date || t.due_date === today).sort(byDue);
+  const upcoming = open.filter((t) => t.due_date > today && t.due_date <= plus7).sort(byDue);
+  const closing = deals
+    .filter((d) => !["closed_won", "closed_lost"].includes(d.stage) && d.expected_close >= today && d.expected_close <= plus7)
+    .sort((a, b) => a.expected_close.localeCompare(b.expected_close));
+  const needYou = overdue.length + todayTasks.length;
+
+  const section = (title, rows, emptyMsg) => `
+    <div class="panel"><h2>${title} <span class="count">${rows.length}</span></h2>
+      ${rows.length ? rows.map(taskRow).join("") : `<div class="empty">${emptyMsg}</div>`}
+    </div>`;
+
   view.innerHTML = `
     <div class="feed-head">
       <div>
         <div class="feed-greet">${greet}</div>
-        <div class="feed-sub">${dow}, ${now.toLocaleDateString(undefined, { month: "long", day: "numeric" })} ·
-          <b>${feed.due_count || 0}</b> things need you today</div>
+        <div class="feed-sub">${now.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })} ·
+          ${needYou ? `<b>${needYou}</b> thing${needYou === 1 ? "" : "s"} need${needYou === 1 ? "s" : ""} you today` : "nothing due — clear runway"}</div>
       </div>
       <div class="feed-add">
         <input id="qa-title" placeholder="Quick add a task for today…" autocomplete="off">
         <button class="btn" id="qa-add">Add</button>
       </div>
     </div>
-    <div class="panel feed-take"><h2>✦ Milton's take</h2>${feed.milton?.available && feed.milton?.take
-      ? `<div class="feed-take-text">${feed.milton.take.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/\n/g, "<br>")}</div>`
-      : `<div class="empty">Milton is unreachable — showing the CRM-derived stream only.</div>`}</div>
-    <div class="panel">
-      <h2>Today's stream <span class="count">${items.length}</span></h2>
-      ${items.length ? items.map(feedItemHtml).join("") : `<div class="empty">Nothing due — a clear runway. Add a task above to seed it.</div>`}
+    <div class="cols2">
+      <div>
+        ${section("Overdue", overdue, "Nothing overdue. Nice.")}
+        ${section("Today", todayTasks, "Nothing due today.")}
+        ${section("Coming up", upcoming, "Nothing on the horizon.")}
+      </div>
+      <div class="panel"><h2>Closing this week <span class="count">${closing.length}</span></h2>
+        ${closing.length ? closing.map((d) => `
+          <div class="activity"><div class="dot" style="background:${stageColor(d.stage)}"></div>
+            <div class="text"><b>${esc(d.title)}</b> · ${esc(d.company_name || "")}<br>
+            <span style="color:var(--text-3);font-size:12.5px">${money(d.value)} · ${d.probability}% · closes ${esc(d.expected_close)}</span></div>
+          </div>`).join("") : `<div class="empty">No deals closing in the next 7 days.</div>`}
+      </div>
     </div>`;
-  // task completion + edit wiring (same flow as the Tasks view)
-  document.querySelectorAll("[data-task-id]").forEach((cb) => {
-    cb.onchange = async () => {
-      const it = items.find((x) => x.type === "task" && x.task && String(x.task.id) === cb.dataset.taskId);
-      await toggleTask(cb.dataset.taskId, cb, it ? it.task : null);
-      if (!cb.disabled) { /* stays in place; change persisted server-side */ }
-      route();
-    };
-  });
-  document.querySelectorAll("[data-edit]").forEach((b) => {
-    b.onclick = () => {
-      const it = items.find((x) => x.type === "task" && x.task && String(x.task.id) === b.dataset.edit);
-      if (it) editTaskModal(it.task);
-    };
-  });
-  document.querySelectorAll("[data-deal-open]").forEach((b) => {
-    b.onclick = () => editDealModal({ id: Number(b.dataset.dealOpen) });
-  });
+  wireTaskRows(tasks, deals);
+
   const add = async () => {
     const title = $("#qa-title").value.trim();
     if (!title) return;
-    await POST("/api/tasks", { title, due_date: toISODate(new Date()), owner: "You" });
+    await POST("/api/tasks", { title, due_date: today, owner: "You" });
     route();
   };
   $("#qa-add").onclick = add;
   $("#qa-title").addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
 }
 
-/* ---------- data workshop: captures · schema · automation in one place ---------- *//* ---------- data workshop: captures · schema · automation in one place ---------- */
-const WORKSHOP_TABS = [
-  ["captures", "Captures"],
-  ["schema", "Schema"],
-  ["automation", "Automation"],
-  ["sandbox", "Sandbox"],
-];
-async function vWorkshop(sub) {
-  const tab = WORKSHOP_TABS.some(([t]) => t === sub) ? sub : "captures";
-  view.innerHTML = `
-    <div class="toolbar">
-      <div class="seg" id="ws-seg" role="tablist" aria-label="Data workshop">
-        ${WORKSHOP_TABS.map(([t, label]) =>
-          `<button data-tab="${t}" class="${t === tab ? "on" : ""}" role="tab" aria-selected="${t === tab}">${label}</button>`).join("")}
-      </div>
-    </div>
-    <div id="ws-body"></div>`;
-  document.querySelectorAll("#ws-seg button").forEach((b) => {
-    b.onclick = () => { location.hash = `#/workshop/${b.dataset.tab}`; };
-  });
-  const root = $("#ws-body");
-  if (tab === "schema") await vSchema(root);
-  else if (tab === "automation") await vAutomations(root);
-  else if (tab === "sandbox") await vSandbox(root);
-  else await vCaptures(root);
-}
-
-/* ---------- data sandbox: staged mass contact imports ---------- */
-// Nothing lands in the live contacts table until a batch is committed.
-let sbOpenBatch = null;
-
-const SB_STATUS_PILL = {
-  clean: ["Clean", "var(--ok)"],
-  duplicate: ["Duplicate", "var(--urgent)"],
-  flagged: ["Flagged", "var(--ctp-yellow)"],
-};
-const SB_DECISION_PILL = {
-  approved: ["Approved", "var(--ok)"],
-  rejected: ["Rejected", "var(--ctp-red)"],
-  pending: ["Pending", "var(--text-3)"],
-};
-
-async function vSandbox(root) {
-  const el = root || view;
-  if (sbOpenBatch) return vSandboxDetail(el, sbOpenBatch);
-  const { batches } = await GET("/api/sandbox/batches");
-  el.innerHTML = `
-    <div class="toolbar">
-      <span style="color:var(--text-2)">${batches.length} import batch${batches.length === 1 ? "" : "es"}</span>
-      <div class="spacer"></div>
-      <a class="btn ghost small" href="/api/contacts/import/template">CSV template</a>
-    </div>
-    <div class="sb-drop" id="sb-drop">
-      <div><b>Drop a contacts file here</b> or <label class="link" for="sb-file" style="cursor:pointer">choose a file</label></div>
-      <div class="sb-hint">CSV or VCF (vCard) — columns: name, email, phone, company, title, notes; extra columns are ignored. Staged rows stay out of your contacts until you approve them.</div>
-      <input type="file" id="sb-file" accept=".csv,.vcf,text/csv,text/vcard" hidden>
-    </div>
-    <div id="sb-status"></div>
-    <div class="sb-list">
-      ${batches.map((b) => {
-        const s = b.summary || {};
-        const srcBadge = b.source === "vcf"
-          ? `<span class="feed-pill" style="border-color:var(--brand);color:var(--brand)">VCF</span>`
-          : `<span class="feed-pill" style="border-color:var(--text-3);color:var(--text-3)">CSV</span>`;
-        return `
-        <div class="sb-card">
-          <div class="info">
-            <div class="name">${esc(b.name)} ${srcBadge} ${b.status === "complete" ? `<span class="feed-pill" style="border-color:var(--ok);color:var(--ok)">imported</span>` : `<span class="feed-pill" style="border-color:var(--brand);color:var(--brand)">open</span>`}</div>
-            <div class="sb-meta">${b.filename ? esc(b.filename) + " · " : ""}${esc((b.created_at || "").slice(0, 16).replace("T", " "))}</div>
-            <div class="sb-counts"><span><b>${s.total || 0}</b> rows</span><span style="color:var(--ok)">${s.clean || 0} clean</span><span style="color:var(--urgent)">${s.duplicates || 0} duplicates</span><span style="color:var(--ctp-yellow)">${s.flagged || 0} flagged</span></div>
-          </div>
-          <div class="sb-actions">
-            <button class="btn small" data-sb-open="${b.id}">Review</button>
-            <button class="btn danger small" data-sb-del="${b.id}">Delete</button>
-          </div>
-        </div>`;
-      }).join("") || `<div class="empty">No imports yet — drop a CSV or VCF above to stage your first batch.</div>`}
-    </div>`;
-
-  const readAndStage = (file) => {
-    if (!file) return;
-    const rd = new FileReader();
-    rd.onload = async () => {
-      $("#sb-status").innerHTML = `<div class="empty">Analyzing ${esc(file.name)}…</div>`;
-      try {
-        const text = String(rd.result || "");
-        const isVcf = /\.vcf$/i.test(file.name) || /^\s*BEGIN:VCARD/im.test(text.slice(0, 500));
-        const payload = { name: file.name.replace(/\.(csv|vcf)$/i, ""), filename: file.name };
-        if (isVcf) payload.vcf = text; else payload.csv = text;
-        const { batch } = await POST("/api/sandbox/batches", payload);
-        sbOpenBatch = batch.id;
-        route();
-      } catch (err) {
-        $("#sb-status").innerHTML = `<div class="empty" style="color:var(--ctp-red)">Upload failed: ${esc(err.message)}</div>`;
-      }
-    };
-    rd.readAsText(file);
-  };
-  $("#sb-file").onchange = (e) => readAndStage(e.target.files[0]);
-  const dz = $("#sb-drop");
-  ["dragenter", "dragover"].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("over"); }));
-  ["dragleave", "drop"].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove("over"); }));
-  dz.addEventListener("drop", (e) => readAndStage(e.dataTransfer.files[0]));
-
-  document.querySelectorAll("[data-sb-open]").forEach((b) => {
-    b.onclick = () => { sbOpenBatch = Number(b.dataset.sbOpen); route(); };
-  });
-  document.querySelectorAll("[data-sb-del]").forEach((b) => {
-    b.onclick = async () => {
-      if (!confirm("Delete this import batch? Staged rows are discarded; your live contacts are untouched.")) return;
-      await DEL(`/api/sandbox/batches/${b.dataset.sbDel}`);
-      route();
-    };
-  });
-}
-
-async function vSandboxDetail(el, batchId) {
-  const { batch, rows } = await GET(`/api/sandbox/batches/${batchId}`);
-  const s = batch.summary || {};
-  const open = batch.status === "open";
-  const approvable = rows.filter((r) => r.decision === "approved" && r.status !== "duplicate").length;
-  el.innerHTML = `
-    <div class="toolbar">
-      <button class="btn ghost small" id="sb-back">← All imports</button>
-      <div class="spacer"></div>
-      ${open ? `<button class="btn ghost small" id="sb-bulk-clean">Approve all clean</button>
-      <button class="btn ghost small" id="sb-bulk-dup">Reject all duplicates</button>
-      <button class="btn small" id="sb-commit" ${approvable ? "" : "disabled"}>Import approved (${approvable})</button>
-      <button class="btn danger small" id="sb-del">Delete batch</button>` : ``}
-    </div>
-    <div class="camp-head">
-      <h2 style="margin:0">${esc(batch.name)} ${batch.source === "vcf" ? `<span class="feed-pill" style="border-color:var(--brand);color:var(--brand)">VCF</span>` : `<span class="feed-pill" style="border-color:var(--text-3);color:var(--text-3)">CSV</span>`}</h2>
-      <div class="sb-meta">${batch.filename ? esc(batch.filename) + " · " : ""}staged ${esc((batch.created_at || "").slice(0, 16).replace("T", " "))}${batch.status === "complete" ? " · imported " + esc((batch.completed_at || "").slice(0, 16).replace("T", " ")) : ""}</div>
-      <div class="sb-summary">
-        <span><b>${s.total || 0}</b> rows</span>
-        <span style="color:var(--ok)"><b>${s.clean || 0}</b> clean</span>
-        <span style="color:var(--urgent)"><b>${s.duplicates || 0}</b> duplicates</span>
-        <span style="color:var(--ctp-yellow)"><b>${s.flagged || 0}</b> flagged</span>
-        <span><b>${s.approved || 0}</b> approved</span>
-        <span><b>${s.rejected || 0}</b> rejected</span>
-      </div>
-    </div>
-    <div class="sb-table-wrap"><table class="sb-table">
-      <thead><tr><th>#</th><th>Contact</th><th>Email</th><th class="sb-phone-col">Phone</th><th>Status</th><th>Decision</th></tr></thead>
-      <tbody>
-      ${rows.map((r) => {
-        const [sl, sc] = SB_STATUS_PILL[r.status] || SB_STATUS_PILL.clean;
-        const [dl, dc] = SB_DECISION_PILL[r.decision] || SB_DECISION_PILL.pending;
-        const dupNote = r.dup_contact
-          ? `↳ matches <b>${esc(r.dup_contact.name)}</b> in contacts`
-          : r.dup_row ? `↳ same as row #${r.dup_row.row_num} (${esc(r.dup_row.name || "unnamed")})` : "";
-        const flags = r.flags || [];
-        const flagHtml = flags.length ? `
-          <div style="margin-top:6px"><button class="link" data-sb-flags="${r.id}">⚠ ${flags.length} flag${flags.length === 1 ? "" : "s"}</button>
-          <ul class="sb-flags" id="sb-flags-${r.id}" hidden>${flags.map((f) => `<li>${esc(f.reason)}</li>`).join("")}</ul></div>` : "";
-        return `
-        <tr>
-          <td style="color:var(--text-3)">${r.row_num}</td>
-          <td><b>${esc(r.name) || `<span style="color:var(--text-3)">(no name)</span>`}</b>${r.title ? `<div class="sb-meta">${esc(r.title)}</div>` : ""}${r.company ? `<div class="sb-meta">🏢 ${esc(r.company)}</div>` : ""}</td>
-          <td class="sb-email">${esc(r.email)}</td>
-          <td class="sb-phone-col">${esc(r.phone)}</td>
-          <td><span class="feed-pill" style="border-color:${sc};color:${sc}">${sl}</span>${dupNote ? `<div class="sb-meta sb-status-note">${dupNote}</div>` : ""}${flagHtml}</td>
-          <td>${open ? `
-            <span class="feed-pill" style="border-color:${dc};color:${dc}">${dl}</span>
-            <div class="sb-actions" style="margin-top:6px">
-              ${r.decision !== "approved" ? `<button class="btn ghost small" data-sb-approve="${r.id}">Approve</button>` : ""}
-              ${r.decision !== "rejected" ? `<button class="btn ghost small" data-sb-reject="${r.id}">Reject</button>` : ""}
-              <button class="btn ghost small" data-sb-edit="${r.id}">Edit</button>
-            </div>` : `<span class="feed-pill" style="border-color:${dc};color:${dc}">${dl}</span>`}</td>
-        </tr>`;
-      }).join("")}
-      </tbody>
-    </table></div>`;
-
-  $("#sb-back").onclick = () => { sbOpenBatch = null; route(); };
-  document.querySelectorAll("[data-sb-flags]").forEach((b) => {
-    b.onclick = () => { const u = $(`#sb-flags-${b.dataset.sbFlags}`); if (u) u.hidden = !u.hidden; };
-  });
-  if (!open) return;
-  const refresh = () => route();
-  const setDecision = async (id, decision) => { await PATCH(`/api/sandbox/rows/${id}`, { decision }); refresh(); };
-  document.querySelectorAll("[data-sb-approve]").forEach((b) => { b.onclick = () => setDecision(b.dataset.sbApprove, "approved"); });
-  document.querySelectorAll("[data-sb-reject]").forEach((b) => { b.onclick = () => setDecision(b.dataset.sbReject, "rejected"); });
-  document.querySelectorAll("[data-sb-edit]").forEach((b) => {
-    b.onclick = async () => {
-      const r = rows.find((x) => x.id === Number(b.dataset.sbEdit));
-      if (!r) return;
-      openModal(`Edit row #${r.row_num}`,
-        field("Name", input("name", r.name)) + field("Title", input("title", r.title)) +
-        field("Email", input("email", r.email)) + field("Phone", input("phone", r.phone)) +
-        field("Company", input("company", r.company)) + field("Notes", `<textarea name="notes" rows="2">${esc(r.notes)}</textarea>`),
-        async (data) => { await PATCH(`/api/sandbox/rows/${r.id}`, data); refresh(); });
-    };
-  });
-  $("#sb-bulk-clean").onclick = async () => { await POST(`/api/sandbox/batches/${batch.id}/decision`, { action: "approve-clean" }); refresh(); };
-  $("#sb-bulk-dup").onclick = async () => { await POST(`/api/sandbox/batches/${batch.id}/decision`, { action: "reject-duplicates" }); refresh(); };
-  $("#sb-commit").onclick = async () => {
-    if (!confirm(`Import ${approvable} approved contact${approvable === 1 ? "" : "s"}? Duplicate rows are skipped; this can't be undone in bulk.`)) return;
-    const r = await POST(`/api/sandbox/batches/${batch.id}/commit`, {});
-    alert(`Imported ${r.imported}, skipped ${r.skipped} duplicate${r.skipped === 1 ? "" : "s"}.`);
-    refresh();
-  };
-  $("#sb-del").onclick = async () => {
-    if (!confirm("Delete this import batch? Staged rows are discarded; your live contacts are untouched.")) return;
-    await DEL(`/api/sandbox/batches/${batch.id}`);
-    sbOpenBatch = null;
-    route();
-  };
-}
-
 /* ---------- captures: business cards & client notes ---------- */
-async function vCaptures(root) {
-  const el = root || view;
+async function vCaptures() {
   const [{ captures }, { contacts }] = await Promise.all([GET("/api/captures"), GET("/api/contacts")]);
-  el.innerHTML = `
+  view.innerHTML = `
     <div class="toolbar">
       <span style="color:var(--text-2)">${captures.length} captured</span>
       <div class="spacer"></div>
@@ -2458,9 +1661,7 @@ function editCaptureModal(c, contacts) {
 }
 
 async function editTaskModal(t, deals) {
-  const [fields, { tasks }] = await Promise.all([getSchemaFields("task"), GET("/api/tasks")]);
-  const depIds = new Set((t.blocked_by || []).map((x) => x.id));
-  const others = tasks.filter((x) => x.id !== t.id);
+  const fields = await getSchemaFields("task");
   openModal("Edit task", `
     ${field("Title", input("title", t.title))}
     <div class="formgrid">
@@ -2468,21 +1669,8 @@ async function editTaskModal(t, deals) {
       ${field("Due date", input("due_date", t.due_date || "", "date"))}
     </div>
     ${field("Owner", input("owner", t.owner))}
-    <div class="field"><label>Blocked by (finish these first)</label>
-      <div class="dep-list">
-        ${others.length ? others.map((o) => `
-          <label class="dep"><input type="checkbox" name="depends_on" value="${o.id}" ${depIds.has(o.id) ? "checked" : ""}> ${esc(o.title)}${o.done ? " ✓" : ""}</label>`).join("")
-          : `<div class="empty">No other tasks.</div>`}
-      </div>
-    </div>
     ${cfFieldsHtml(fields, t.custom)}`,
-    async (d) => {
-      const deps = (d.depends_on || []).map(Number).filter((n) => n > 0);
-      await POST(`/api/tasks/${t.id}/dependencies`, { depends_on: deps });
-      delete d.depends_on;
-      await PATCH(`/api/tasks/${t.id}`, d);
-      route();
-    }, "Save changes");
+    async (d) => { await PATCH(`/api/tasks/${t.id}`, d); route(); }, "Save changes");
 }
 
 function webhookFormHtml(w, events) {
@@ -2498,105 +1686,12 @@ function webhookFormHtml(w, events) {
       ${headersEditorHtml(w.headers || [])}`;
 }
 
-/* ---------- Milton widgets tab ----------
-   Renders widgets published by the Milton chat bot (POST /api/milton/widgets).
-   Pure HTML builders — no DOM access, unit-testable. */
-function mwRelTime(ts) {
-  const d = Date.now() - Number(ts);
-  if (!Number.isFinite(d) || d < 0) return "just now";
-  const m = Math.floor(d / 60000);
-  if (m < 1) return "just now";
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  const days = Math.floor(h / 24);
-  if (days < 7) return `${days}d ago`;
-  return new Date(Number(ts)).toLocaleDateString();
-}
-function mwFormatBarValue(v, format) {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return "—";
-  if (format === "percent") return `${Math.round(n * 100) / 100}%`;
-  if (format === "currency") return moneyShort(n);
-  return n.toLocaleString("en-US");
-}
-function mwCardHtml(w, opts = {}) {
-  const deletable = opts.deletable !== false && w.id != null;
-  const p = w.payload || {};
-  let body = "";
-  if (w.kind === "stat") {
-    body = `<div class="mw-stat">
-      <div class="mw-stat-val">${esc(p.value)}</div>
-      <div class="mw-stat-label">${esc(p.label)}</div>
-      ${p.delta ? `<div class="mw-delta">${esc(p.delta)}</div>` : ""}
-    </div>`;
-  } else if (w.kind === "table") {
-    const heads = Array.isArray(p.headers) ? p.headers : [];
-    const rows = Array.isArray(p.rows) ? p.rows : [];
-    body = `<div class="mw-scroll"><table class="mw-table"><thead><tr>${heads.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead>
-      <tbody>${rows.map((r) => `<tr>${(Array.isArray(r) ? r : []).map((c) => `<td>${esc(c)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
-  } else if (w.kind === "bars") {
-    const items = Array.isArray(p.items) ? p.items : [];
-    const max = Math.max(1, ...items.map((i) => Number(i.value) || 0));
-    const summary = p.summary
-      ? `<div class="mw-bars-summary"><div class="mw-stat-val">${esc(p.summary)}</div>
-        ${p.summary_label ? `<div class="mw-stat-label">${esc(p.summary_label)}</div>` : ""}
-        ${p.summary_sub ? `<div class="mw-delta">${esc(p.summary_sub)}</div>` : ""}</div>`
-      : "";
-    body = summary + `<div class="mw-bars">${items.map((i) => {
-      const v = Number(i.value) || 0;
-      const pct = Math.max(2, Math.round((v / max) * 100));
-      return `<div class="mw-bar-row">
-        <span class="mw-bar-label">${esc(i.label)}</span>
-        <div class="mw-bar-track"><div class="mw-bar-fill" style="width:${pct}%"></div></div>
-        <span class="mw-bar-val">${esc(mwFormatBarValue(v, p.format))}</span>
-      </div>`;
-    }).join("")}</div>`;
-  } else if (w.kind === "list") {
-    const items = Array.isArray(p.items) ? p.items : [];
-    body = `<ul class="mw-list">${items.map((i) => `<li>
-      <div class="mw-list-text">${esc(i.text)}</div>
-      ${i.sub ? `<div class="mw-list-sub">${esc(i.sub)}</div>` : ""}
-    </li>`).join("")}</ul>`;
-  } else {
-    body = `<div class="empty">Unknown widget kind.</div>`;
-  }
-  return `<div class="mw-card">
-    <div class="mw-card-head">
-      <div class="mw-card-title">${esc(w.title)}</div>
-      <div class="spacer"></div>
-      <span class="mw-time">${esc(mwRelTime(w.created_at))}</span>
-      ${deletable ? `<button class="btn ghost small mw-x" data-mw-del="${w.id}" aria-label="Remove widget">×</button>` : ""}
-    </div>
-    ${body}
-  </div>`;
-}
-
-async function vMilton() {
-  const { widgets } = await GET("/api/milton/widgets");
-  view.innerHTML = `
-    <div class="toolbar">
-      <span style="color:var(--text-2)">✦ ${widgets.length} pinned widget${widgets.length === 1 ? "" : "s"}</span>
-      <div class="spacer"></div>
-      <button class="btn ghost small" id="mw-refresh">↻ Refresh</button>
-    </div>
-    ${widgets.length
-      ? `<div class="mw-grid">${widgets.map(mwCardHtml).join("")}</div>`
-      : `<div class="empty" style="margin-top:24px">No widgets yet — ask Milton to pin one from chat.<br><span style="color:var(--text-3)">Try “top deals”, then “pin this as a widget”.</span></div>`}
-  `;
-  $("#mw-refresh").onclick = () => route();
-  document.querySelectorAll("[data-mw-del]").forEach((b) => {
-    b.onclick = async () => { await DEL(`/api/milton/widgets/${b.dataset.mwDel}`); route(); };
-  });
-}
-
-async function vAutomations(root) {
-  const el = root || view;
+async function vAutomations() {
   const { webhooks, events } = await GET("/api/webhooks");
   const { deliveries } = await GET("/api/deliveries");
   const { hooks } = await GET(showAllHooks ? "/api/hooks?all=1" : "/api/hooks");
   const base = location.origin;
-  el.innerHTML = `
+  view.innerHTML = `
     <div class="panel">
       <h2>Outgoing webhooks <span style="color:var(--text-3);font-weight:400;font-size:13px">— CRM → Zapier / Make / n8n</span></h2>
       <p style="color:var(--text-2);margin-top:-6px">POSTs JSON on deal, contact, campaign, and task events. Point it at a Zapier Catch Hook, Make webhook, or n8n Webhook node.</p>
@@ -2630,7 +1725,7 @@ async function vAutomations(root) {
       </div>
       ${hooks.map((h) => `
         <div class="hook"><div class="info"><div class="name">${esc(h.name)}
-            <span class="tag"><span class="ws-dot" style="background:${esc(h.workspace_color || "var(--ctp-overlay0)")}"></span>${esc(h.workspace_name || "—")}</span></div>
+            <span class="tag"><span class="ws-dot" style="background:${esc(h.workspace_color || "#999")}"></span>${esc(h.workspace_name || "—")}</span></div>
           <div class="url">${esc(base)}/api/hooks/in/${esc(h.key)}</div></div>
           <select data-hws="${h.id}" title="Move hook to another workspace">${workspaces.map((x) => `<option value="${x.id}" ${x.id === h.workspace_id ? "selected" : ""}>→ ${esc(x.name)}</option>`).join("")}</select>
           <button class="btn ghost small" data-copy="${esc(base)}/api/hooks/in/${esc(h.key)}">Copy URL</button>
@@ -2697,7 +1792,7 @@ Content-Type: application/json
   $("#add-hook").onclick = () => {
     const w = workspaces.find((x) => x.id === wsId);
     openModal("New incoming hook",
-      `<p style="color:var(--text-2);font-size:13px;margin:0 0 8px">Creates in <span class="tag"><span class="ws-dot" style="background:${esc((w && w.color) || "var(--ctp-overlay0)")}"></span>${esc((w && w.name) || "—")}</span> — switch workspaces in the topbar to change it.</p>` +
+      `<p style="color:var(--text-2);font-size:13px;margin:0 0 8px">Creates in <span class="tag"><span class="ws-dot" style="background:${esc((w && w.color) || "#999")}"></span>${esc((w && w.name) || "—")}</span> — switch workspaces in the topbar to change it.</p>` +
       field("Name", input("name", "n8n deal intake")),
       async (d) => { const r = await POST("/api/hooks", d); alert("Hook URL:\n" + location.origin + "/api/hooks/in/" + r.hook.key); route(); }, "Create hook");
   };
@@ -2734,36 +1829,10 @@ const SCHEMA_ENTITIES = [
 ];
 let schemaEntity = "contact";
 
-async function vSchema(root) {
-  const el = root || view;
-  const [{ fields }, { stages }] = await Promise.all([
-    GET(`/api/schema/${schemaEntity}`),
-    GET("/api/stages"),
-  ]);
+async function vSchema() {
+  const { fields } = await GET(`/api/schema/${schemaEntity}`);
   const entLabel = SCHEMA_ENTITIES.find(([e]) => e === schemaEntity)[1];
-  el.innerHTML = `
-    <div class="panel">
-      <div style="display:flex;align-items:center;gap:10px">
-        <h2 style="margin:0">Pipeline stages <span class="count">${stages.length}</span></h2>
-        <div class="spacer"></div>
-        <button class="btn" id="new-stage">+ New stage</button>
-      </div>
-      <p style="color:var(--text-2);margin:8px 0 4px">Stages are workspace-wide and drive the pipeline board, dashboard and feed. Renames keep existing deals in place.</p>
-      ${stages.map((s, i) => `
-        <div class="schema-field">
-          <div class="info">
-            <div class="name"><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${esc(s.color || "var(--ctp-overlay0)")}"></span> ${esc(s.name)}
-              ${s.deals ? `<span class="pill">${s.deals} deal${s.deals === 1 ? "" : "s"}</span>` : ""}</div>
-            <div class="url">${esc(s.slug)}</div>
-          </div>
-          <div class="schema-actions">
-            <button class="btn ghost small" data-stage-move="-1" data-slug="${esc(s.slug)}" ${i === 0 ? "disabled" : ""}>\u2191</button>
-            <button class="btn ghost small" data-stage-move="1" data-slug="${esc(s.slug)}" ${i === stages.length - 1 ? "disabled" : ""}>\u2193</button>
-            <button class="btn ghost small" data-stage-rename="${esc(s.slug)}">Rename</button>
-            <button class="btn danger small" data-stage-del="${esc(s.slug)}">Delete</button>
-          </div>
-        </div>`).join("") || `<div class="empty">No stages.</div>`}
-    </div>
+  view.innerHTML = `
     <div class="toolbar">
       <div class="seg" id="schema-seg">
         ${SCHEMA_ENTITIES.map(([e, l]) => `<button data-ent="${e}" class="${e === schemaEntity ? "on" : ""}">${l}</button>`).join("")}
@@ -2779,7 +1848,7 @@ async function vSchema(root) {
         try { opts = JSON.parse(f.options || "[]"); } catch {}
         return `<div class="schema-field">
           <div class="info">
-            <div class="name">${esc(f.label)} ${f.required ? `<span class="pill" style="background:var(--danger-soft);color:var(--danger)">required</span>` : ""}</div>
+            <div class="name">${esc(f.label)} ${f.required ? `<span class="pill" style="background:#e5484d22;color:#e5484d">required</span>` : ""}</div>
             <div class="url">${esc(f.name)} · ${FIELD_TYPES.find(([t]) => t === f.type)?.[1] || f.type}${opts.length ? ` · ${esc(opts.join(", "))}` : ""}</div>
           </div>
           <div class="schema-actions">
@@ -2793,49 +1862,6 @@ async function vSchema(root) {
     </div>`;
   document.querySelectorAll("#schema-seg button").forEach((b) => {
     b.onclick = () => { schemaEntity = b.dataset.ent; route(); };
-  });
-  // ---- pipeline stages ----
-  const refreshStages = async () => { await loadMeta(); route(); };
-  $("#new-stage").onclick = () => stageModal(null, stages);
-  document.querySelectorAll("[data-stage-move]").forEach((b) => {
-    b.onclick = async () => {
-      const slug = b.dataset.slug;
-      const i = stages.findIndex((s) => s.slug === slug);
-      const j = i + Number(b.dataset.stageMove);
-      if (i < 0 || j < 0 || j >= stages.length) return;
-      await PATCH(`/api/stages/${slug}`, Number(b.dataset.stageMove) < 0
-        ? { before: stages[j].slug } : { after: stages[j].slug });
-      refreshStages();
-    };
-  });
-  document.querySelectorAll("[data-stage-rename]").forEach((b) => {
-    b.onclick = () => {
-      const s = stages.find((x) => x.slug === b.dataset.stageRename);
-      if (s) stageModal(s, stages);
-    };
-  });
-  document.querySelectorAll("[data-stage-del]").forEach((b) => {
-    b.onclick = async () => {
-      const s = stages.find((x) => x.slug === b.dataset.stageDel);
-      if (!s) return;
-      if (s.deals > 0) {
-        // populated stage: pick the receiving stage first, then confirm
-        const targets = stages.filter((x) => x.slug !== s.slug);
-        openModal(`Delete stage "${s.name}"`, `
-          <p style="color:var(--text-2);font-size:13px">This stage holds <b>${s.deals}</b> deal${s.deals === 1 ? "" : "s"}. Move them to another stage before deleting.</p>
-          ${field("Move deals to", select("move_to", targets.map((t) => [t.slug, t.name]), targets[0].slug))}`,
-          async (d) => {
-            if (!confirm(`Move ${s.deals} deal${s.deals === 1 ? "" : "s"} to "${d.move_to}" and delete "${s.name}"?`)) return;
-            await DEL(`/api/stages/${s.slug}?move_to=${encodeURIComponent(d.move_to)}`);
-            refreshStages();
-          }, "Move & delete");
-        return;
-      }
-      if (confirm(`Delete stage "${s.name}"?`)) {
-        await DEL(`/api/stages/${s.slug}`);
-        refreshStages();
-      }
-    };
   });
   document.querySelectorAll("[data-move]").forEach((b) => {
     b.onclick = async () => {
@@ -2900,33 +1926,6 @@ function fieldModal(f) {
   syncOpts();
 }
 
-/* Pipeline stage add/rename modal. Follows the openModal conventions of the
-   other schema modals; delete-with-move_to asks for the receiving stage first. */
-function stageModal(s, stages) {
-  const isNew = !s;
-  const others = stages.filter((x) => !s || x.slug !== s.slug);
-  openModal(isNew ? "New pipeline stage" : `Rename stage "${s.name}"`, `
-    ${field("Name", input("name", s ? s.name : "", "text", "required"))}
-    ${isNew ? field("Position", select("position", [["end", "At the end"]].concat(
-        others.flatMap((t) => [[`before:${t.slug}`, `Before ${t.name}`], [`after:${t.slug}`, `After ${t.name}`]])), "end"))
-      : ""}
-    ${!isNew ? field("Color", `<input name="color" type="color" value="${esc(s.color || ctp("blue"))}" style="width:48px;height:32px;padding:2px">`) : ""}`,
-    async (d) => {
-      if (isNew) {
-        const body = { name: d.name };
-        if (d.position !== "end") {
-          const [key, ref] = d.position.split(":");
-          body[key] = ref;
-        }
-        await POST("/api/stages", body);
-      } else {
-        await PATCH(`/api/stages/${s.slug}`, { name: d.name, color: d.color });
-      }
-      await loadMeta();
-      route();
-    }, isNew ? "Add stage" : "Save");
-}
-
 /* ---------- command palette (⌘K quick find) ---------- */
 function initPalette() {
   const root = $("#palette-root");
@@ -2940,10 +1939,9 @@ function initPalette() {
   async function buildItems() {
     if (cache && cacheWs === wsId) return cache;
     const NAV = [
-      ["Dashboard", "#/dashboard"], ["Daily Feed", "#/feed"],
-      ["Calendar", "#/calendar"], ["Campaigns", "#/campaigns"],
-      ["Calls", "#/calls"],
-      ["Data Workshop", "#/workshop"], ["Milton", "#/milton"],
+      ["Dashboard", "#/dashboard"], ["Milton", "#/milton"], ["Outreach", "#/outreach"],
+      ["Campaigns", "#/campaigns"], ["Daily Feed", "#/feed"], ["Captures", "#/captures"],
+      ["Automations", "#/automations"], ["Schema", "#/schema"],
     ];
     const out = NAV.map(([label, hash]) => ({
       group: "Go to", kind: "view", label,
@@ -3031,445 +2029,11 @@ function initPalette() {
   });
 }
 
-/* ================= message campaigns (email / SMS) + call logging ================= */
-const CALL_OUTCOMES = ["connected", "voicemail", "no answer", "busy", "wrong number", "follow-up"];
-const OUTCOME_COLORS = {
-  connected: "var(--ctp-green)", voicemail: "var(--ctp-blue)",
-  "no answer": "var(--ctp-yellow)", busy: "var(--ctp-peach)",
-  "wrong number": "var(--ctp-overlay2)", "follow-up": "var(--ctp-mauve)",
-};
-const outcomePill = (o) => {
-  const c = OUTCOME_COLORS[o] || "var(--ctp-overlay0)";
-  return `<span class="pill" style="background:color-mix(in srgb, ${c} 14%, transparent);color:${c}">${esc(o || "—")}</span>`;
-};
-const MERGE_TAGS = ["first_name", "last_name", "name", "company", "title", "email"];
-const mergeHintHtml = () =>
-  `<p class="hint">Merge tags: ${MERGE_TAGS.map((t) => `<span class="tag">{{${t}}}</span>`).join(" ")} — empty when the contact has no value.</p>`;
-const cap = (s) => (s ? s[0].toUpperCase() + s.slice(1) : s);
-
-/* client-side SMS segment estimate (mirrors the server counter) */
-const GSM7_BASIC = "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà";
-const GSM7_EXT = "^{}\\[~]|€";
-function smsSegCount(text) {
-  let septets = 0;
-  for (const ch of text) {
-    if (GSM7_BASIC.includes(ch)) septets += 1;
-    else if (GSM7_EXT.includes(ch)) septets += 2;
-    else {
-      const chars = [...text].length;
-      return { chars, encoding: "Unicode", segments: chars <= 70 ? 1 : Math.ceil(chars / 67) };
-    }
-  }
-  return { chars: septets, encoding: "GSM-7", segments: septets <= 160 ? 1 : Math.ceil(septets / 153) };
-}
-function renderMergeJs(tpl, c) {
-  const parts = String(c.name || "").split(/\s+/).filter(Boolean);
-  const vals = {
-    name: c.name || "", first_name: parts[0] || "", last_name: parts.slice(1).join(" "),
-    company: c.company_name || "", title: c.title || "", email: c.email || "",
-  };
-  return String(tpl ?? "").replace(/{{\s*([a-z_]+)\s*}}/g, (m, k) => (k in vals ? vals[k] : m));
-}
-
-/* ---------- email / SMS campaign tabs ---------- */
-async function vMsgTab(kind) {
-  const host = $("#ctab-body");
-  const label = kind === "email" ? "Email" : "SMS";
-  const lower = label.toLowerCase();
-  host.innerHTML = `<div class="skel" style="height:120px;margin-bottom:16px"></div><div class="skel" style="height:220px"></div>`;
-  const [{ templates }, { campaigns }, settings] = await Promise.all([
-    GET(`/api/${kind}-templates`), GET(`/api/${kind}-campaigns`), GET("/api/msg-settings"),
-  ]);
-  host.innerHTML = `
-    <div class="toolbar"><div class="spacer"></div>
-      <button class="btn" id="msg-new-tpl">+ New template</button>
-      <button class="btn" id="msg-new-camp">+ New ${lower} campaign</button></div>
-    <div class="panel"><h3 style="margin-top:0">Templates</h3>
-      ${templates.length ? `<div style="overflow-x:auto"><table>
-        <tr><th>Name</th>${kind === "email" ? "<th>Subject</th>" : ""}<th>Message</th><th></th></tr>
-        ${templates.map((t) => `<tr>
-          <td><b>${esc(t.name)}</b></td>
-          ${kind === "email" ? `<td>${esc(t.subject) || "—"}</td>` : ""}
-          <td style="max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(t.body)}">${esc(t.body)}</td>
-          <td class="rowact" style="white-space:nowrap"><button class="btn ghost small" data-tedit="${t.id}">Edit</button>
-            <button class="btn ghost small" data-tdel="${t.id}">Delete</button></td>
-        </tr>`).join("")}
-      </table></div>` : `<div class="empty">No ${lower} templates yet — create one to start a campaign.</div>`}
-    </div>
-    <div class="panel"><h3 style="margin-top:0">Campaigns</h3>
-      ${campaigns.length ? `<div style="overflow-x:auto"><table>
-        <tr><th>Name</th><th>Template</th><th>Status</th><th>Sent</th><th>Failed</th><th>Created</th><th></th></tr>
-        ${campaigns.map((c) => `<tr class="clickable" data-camp="${c.id}">
-          <td><b>${esc(c.name)}</b></td><td>${esc(c.template_name || "—")}</td>
-          <td>${statusPill(c.status)}</td><td>${c.sent_count || 0}</td><td>${c.failed_count || 0}</td>
-          <td style="white-space:nowrap">${esc((c.created_at || "").slice(0, 10))}</td>
-          <td class="rowact">${c.status === "draft" ? `<button class="btn ghost small" data-cdel="${c.id}">Delete</button>` : ""}</td>
-        </tr>`).join("")}
-      </table></div>` : `<div class="empty">No ${lower} campaigns yet.</div>`}
-    </div>
-    ${msgSettingsHtml(settings)}`;
-  $("#msg-new-tpl").onclick = () => msgTemplateModal(kind);
-  $("#msg-new-camp").onclick = () => msgCampaignModal(kind);
-  host.querySelectorAll("[data-tedit]").forEach((b) => b.onclick = (e) => {
-    e.stopPropagation();
-    msgTemplateModal(kind, templates.find((t) => t.id === Number(b.dataset.tedit)));
-  });
-  host.querySelectorAll("[data-tdel]").forEach((b) => b.onclick = async (e) => {
-    e.stopPropagation();
-    const t = templates.find((x) => x.id === Number(b.dataset.tdel));
-    if (confirm(`Delete ${lower} template "${t.name}"?`)) { await DEL(`/api/${kind}-templates/${t.id}`); route(); }
-  });
-  host.querySelectorAll("[data-camp]").forEach((tr) => tr.onclick = (e) => {
-    if (e.target.closest("[data-cdel]")) return;
-    location.hash = `#/campaigns/${kind}/${tr.dataset.camp}`;
-  });
-  host.querySelectorAll("[data-cdel]").forEach((b) => b.onclick = async (e) => {
-    e.stopPropagation();
-    const c = campaigns.find((x) => x.id === Number(b.dataset.cdel));
-    if (confirm(`Delete draft ${lower} campaign "${c.name}"?`)) { await DEL(`/api/${kind}-campaigns/${c.id}`); route(); }
-  });
-  wireMsgSettings();
-}
-
-async function msgTemplateModal(kind, tpl) {
-  const isEmail = kind === "email";
-  const label = isEmail ? "Email" : "SMS";
-  openModal(`${tpl ? "Edit" : "New"} ${label.toLowerCase()} template`, `
-    ${field("Name", input("name", tpl ? tpl.name : ""))}
-    ${isEmail ? field("Subject", input("subject", tpl ? tpl.subject || "" : "")) : ""}
-    ${field("Message", `<textarea name="body" id="msg-tpl-body" rows="6">${esc(tpl ? tpl.body || "" : "")}</textarea>`)}
-    ${isEmail ? "" : `<div id="msg-seg-hint"></div>`}
-    ${mergeHintHtml()}`,
-    async (d) => {
-      if (!d.name.trim()) { alert("Name is required."); return; }
-      if (tpl) await PATCH(`/api/${kind}-templates/${tpl.id}`, d);
-      else await POST(`/api/${kind}-templates`, d);
-      route();
-    }, tpl ? "Save changes" : "Create template");
-  if (!isEmail) {
-    const ta = $("#msg-tpl-body"), hint = $("#msg-seg-hint");
-    const upd = () => {
-      const s = smsSegCount(ta.value);
-      hint.innerHTML = `<p class="hint">${s.chars} characters · ${s.segments} segment${s.segments === 1 ? "" : "s"} (${s.encoding})</p>`;
-    };
-    ta.addEventListener("input", upd); upd();
-  }
-}
-
-async function msgCampaignModal(kind) {
-  const label = kind === "email" ? "Email" : "SMS";
-  const [{ templates }, { contacts }] = await Promise.all([GET(`/api/${kind}-templates`), GET("/api/contacts")]);
-  if (!templates.length) { alert(`Create an ${label.toLowerCase()} template first.`); return; }
-  openModal(`New ${label.toLowerCase()} campaign`, `
-    ${field("Name", input("name"))}
-    ${field("Template", select("template_id", templates.map((t) => [t.id, t.name])))}
-    <div class="field"><label>Audience</label>
-      <label class="check"><input type="radio" name="audmode" value="all" checked> All contacts (${contacts.length})</label>
-      <label class="check"><input type="radio" name="audmode" value="sel"> Selected contacts</label>
-      <select id="msg-aud-contacts" multiple size="8" style="display:none;margin-top:8px;width:100%">
-        ${contacts.map((c) => `<option value="${c.id}">${esc(c.name)}${c.email ? ` &lt;${esc(c.email)}&gt;` : ""}</option>`).join("")}
-      </select></div>
-    ${mergeHintHtml()}`,
-    async (d) => {
-      if (!d.name.trim()) { alert("Name is required."); return; }
-      const sel = document.querySelector("#msg-aud-contacts");
-      const ids = [...sel.selectedOptions].map((o) => Number(o.value));
-      const all = document.querySelector('input[name="audmode"]:checked').value === "all";
-      if (!all && !ids.length) { alert("Select at least one contact."); return; }
-      const { campaign } = await POST(`/api/${kind}-campaigns`, {
-        name: d.name.trim(), template_id: Number(d.template_id),
-        audience: all ? { mode: "all" } : { contact_ids: ids },
-      });
-      location.hash = `#/campaigns/${kind}/${campaign.id}`;
-    }, "Create campaign");
-  document.querySelectorAll('input[name="audmode"]').forEach((r) => r.addEventListener("change", () => {
-    document.querySelector("#msg-aud-contacts").style.display =
-      document.querySelector('input[name="audmode"]:checked').value === "sel" ? "" : "none";
-  }));
-}
-
-/* messaging settings (SMTP + SMS provider). Secrets are write-only. */
-function msgSettingsHtml(s) {
-  const v = s.values || {}, set = s.secrets_set || {};
-  return `<details class="panel"><summary style="cursor:pointer"><b>Messaging settings</b>
-    <span class="hint">SMTP &amp; SMS provider</span>
-    ${set.smtp_pass ? `<span class="tag">SMTP password set</span>` : ""}
-    ${set.twilio_token ? `<span class="tag">Twilio token set</span>` : ""}</summary>
-    <div style="margin-top:14px">
-      <h4 style="margin:0 0 8px">Email (SMTP)</h4>
-      <div class="formgrid">
-        ${field("SMTP host", input("smtp_host", v.smtp_host || ""))}
-        ${field("Port", input("smtp_port", v.smtp_port || "", "number"))}
-        ${field("Security", select("smtp_secure", [["", "—"], ["none", "None"], ["starttls", "STARTTLS"], ["tls", "Implicit TLS"]], v.smtp_secure || ""))}
-        ${field("Username", input("smtp_user", v.smtp_user || ""))}
-        ${field("Password",
-          `<input name="smtp_pass" type="password" autocomplete="new-password" placeholder="${set.smtp_pass ? "•••••• (unchanged — type to replace)" : ""}">${set.smtp_pass ? ' <span class="tag">set</span>' : ""}`)}
-        ${field("From name", input("smtp_from_name", v.smtp_from_name || ""))}
-        ${field("From email", input("smtp_from_email", v.smtp_from_email || "", "email"))}
-      </div>
-      <h4 style="margin:16px 0 8px">SMS</h4>
-      <div class="formgrid">
-        ${field("Provider", select("sms_provider", [["", "—"], ["twilio", "Twilio"], ["gateway", "Email-to-SMS gateway"]], v.sms_provider || ""))}
-        ${field("Twilio account SID", input("twilio_sid", v.twilio_sid || ""))}
-        ${field("Auth token",
-          `<input name="twilio_token" type="password" autocomplete="new-password" placeholder="${set.twilio_token ? "•••••• (unchanged — type to replace)" : ""}">${set.twilio_token ? ' <span class="tag">set</span>' : ""}`)}
-        ${field("Twilio from number", input("twilio_from", v.twilio_from || "", "tel"))}
-      </div>
-      <p class="hint">Gateway mode sends each SMS through your SMTP server to the contact's <b>SMS gateway</b> address (set on the contact). Secrets are write-only — they are never shown back.</p>
-      <button class="btn" id="msg-settings-save">Save settings</button>
-      <span id="msg-settings-msg" class="hint" style="margin-left:8px"></span>
-    </div></details>`;
-}
-function wireMsgSettings() {
-  const btn = $("#msg-settings-save");
-  if (!btn) return;
-  btn.onclick = async () => {
-    const host = btn.closest("details");
-    const d = {};
-    host.querySelectorAll("[name]").forEach((el) => { d[el.name] = el.value; });
-    const msg = $("#msg-settings-msg");
-    try {
-      await PATCH("/api/msg-settings", d);
-      msg.textContent = "Saved.";
-      setTimeout(route, 600);
-    } catch (e) { msg.textContent = e.message; }
-  };
-}
-
-/* how many recipients would a draft campaign reach right now? */
-async function msgAudienceInfo(kind, camp) {
-  const aud = JSON.parse(camp.audience_json || "{}");
-  const [{ contacts }, settings] = await Promise.all([GET("/api/contacts"), GET("/api/msg-settings")]);
-  let list = aud.mode === "all" || !aud.contact_ids ? contacts : contacts.filter((x) => aud.contact_ids.includes(x.id));
-  if (kind === "email") list = list.filter((x) => x.email && !x.email_opt_out);
-  else {
-    const viaTwilio = settings.values.sms_provider === "twilio";
-    list = list.filter((x) => !x.sms_opt_out && (viaTwilio ? x.phone : x.sms_gateway));
-  }
-  return { count: list.length, sample: list[0] || null, provider: settings.values.sms_provider || "" };
-}
-
-async function vMsgCampaignDetail(kind, id) {
-  const label = kind === "email" ? "Email" : "SMS";
-  const lower = label.toLowerCase();
-  let data;
-  try { data = await GET(`/api/${kind}-campaigns/${id}`); }
-  catch {
-    view.innerHTML = `<div class="empty">Campaign not found. <a href="#/campaigns/${kind}">Back to ${lower} campaigns</a>.</div>`;
-    return;
-  }
-  const c = data.campaign, sends = data.sends || [];
-  const isDraft = c.status === "draft";
-  view.innerHTML = `
-    <div class="toolbar"><a href="#/campaigns/${kind}" class="btn ghost small">← ${label} campaigns</a><div class="spacer"></div>
-      ${isDraft ? `<button class="btn ghost" id="msg-camp-del">Delete</button>
-      <button class="btn" id="msg-camp-send">Send now</button>` : ""}</div>
-    <div class="panel">
-      <h2 style="margin:0 0 6px">${esc(c.name)}</h2>
-      <p class="hint" style="margin:0">Template <b>${esc(c.template_name || "—")}</b> · ${statusPill(c.status)} · created ${esc((c.created_at || "").slice(0, 16))}</p>
-      ${isDraft ? `<div id="msg-aud" style="margin-top:12px"><div class="empty">Loading audience…</div></div>
-      <div id="msg-preview"></div>` : ""}
-    </div>
-    <div class="panel"><h3 style="margin-top:0">Delivery log${sends.length ? ` (${sends.length})` : ""}</h3>
-      ${sends.length ? `<div style="overflow-x:auto"><table>
-        <tr><th>To</th><th>Contact</th><th>Status</th><th>Detail</th><th>Sent at</th></tr>
-        ${sends.map((s) => `<tr><td style="white-space:nowrap">${esc(s.dest)}</td><td>${esc(s.contact_name || "—")}</td>
-          <td>${s.status === "sent"
-            ? `<span class="pill" style="background:color-mix(in srgb, var(--ctp-green) 14%, transparent);color:var(--ctp-green)">sent</span>`
-            : `<span class="pill" style="background:color-mix(in srgb, var(--ctp-red) 14%, transparent);color:var(--ctp-red)">failed</span>`}</td>
-          <td style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(s.error || "")}">${esc(s.error || "—")}</td>
-          <td style="white-space:nowrap">${esc((s.sent_at || "").slice(0, 19))}</td></tr>`).join("")}
-      </table></div>` : `<div class="empty">${isDraft ? "Nothing sent yet." : "No delivery rows."}</div>`}
-    </div>`;
-  if (!isDraft) return;
-  $("#msg-camp-del").onclick = async () => {
-    if (confirm(`Delete draft ${lower} campaign "${c.name}"?`)) {
-      await DEL(`/api/${kind}-campaigns/${id}`);
-      location.hash = `#/campaigns/${kind}`;
-    }
-  };
-  $("#msg-camp-send").onclick = async () => {
-    let n = "?";
-    try { n = (await msgAudienceInfo(kind, c)).count; } catch {}
-    if (!confirm(`Send "${c.name}" to ${n} recipient${n === 1 ? "" : "s"} now?`)) return;
-    const btn = $("#msg-camp-send");
-    btn.disabled = true; btn.textContent = "Sending…";
-    try {
-      const r = await POST(`/api/${kind}-campaigns/${id}/send`);
-      alert(`Done: ${r.sent} sent, ${r.failed} failed, ${r.total} total.`);
-    } catch (e) { alert(`Send failed: ${e.message}`); }
-    route();
-  };
-  // audience summary + merge preview against the first recipient
-  (async () => {
-    try {
-      const [{ templates }, info] = await Promise.all([GET(`/api/${kind}-templates`), msgAudienceInfo(kind, c)]);
-      const tpl = templates.find((t) => t.id === c.template_id);
-      const audHost = $("#msg-aud"), prevHost = $("#msg-preview");
-      if (!audHost) return;
-      audHost.innerHTML = `<p class="hint" style="margin:8px 0 0">Audience: <b>${info.count} recipient${info.count === 1 ? "" : "s"}</b>${kind === "sms" && !info.provider ? ` — <b>no SMS provider configured</b> (see Messaging settings on the ${lower} tab)` : ""}.</p>`;
-      if (tpl && info.sample) {
-        const subj = kind === "email" ? `<div><b>Subject:</b> ${esc(renderMergeJs(tpl.subject, info.sample))}</div>` : "";
-        prevHost.innerHTML = `<div class="field"><label>Preview — ${esc(info.sample.name)}</label>
-          <div class="panel" style="background:var(--ctp-mantle);margin:0">${subj}<div>${esc(renderMergeJs(tpl.body, info.sample)).replace(/\n/g, "<br>")}</div></div></div>`;
-      } else if (tpl) {
-        prevHost.innerHTML = `<p class="hint">No recipients — adjust the audience or opt-outs.</p>`;
-      }
-    } catch { const h = $("#msg-aud"); if (h) h.innerHTML = `<div class="empty">Couldn't load audience.</div>`; }
-  })();
-}
-
-/* ---------- calls ---------- */
-let callDirFilter = "", callOutcomeFilter = "", callQ = "";
-function fmtDuration(sec) {
-  sec = Math.max(0, Math.round(Number(sec) || 0));
-  if (sec < 60) return `${sec}s`;
-  const m = Math.floor(sec / 60), s = sec % 60;
-  return s ? `${m}m ${s}s` : `${m}m`;
-}
-const fmtWhen = (s) => (s || "").slice(0, 16);
-
-async function vCalls() {
-  const p = new URLSearchParams();
-  if (callDirFilter) p.set("direction", callDirFilter);
-  if (callOutcomeFilter) p.set("outcome", callOutcomeFilter);
-  if (callQ) p.set("q", callQ);
-  const qs = p.toString();
-  const { calls, outcomes } = await GET(`/api/calls${qs ? "?" + qs : ""}`);
-  view.innerHTML = `
-    <div class="toolbar">
-      <input class="search" id="call-q" placeholder="Search notes, names…" value="${esc(callQ)}">
-      <select id="call-dir" style="max-width:140px;width:auto">
-        <option value="">All directions</option>
-        <option value="out" ${callDirFilter === "out" ? "selected" : ""}>Outgoing</option>
-        <option value="in" ${callDirFilter === "in" ? "selected" : ""}>Incoming</option>
-      </select>
-      <select id="call-outcome" style="max-width:170px;width:auto">
-        <option value="">All outcomes</option>
-        ${(outcomes || []).map((o) => `<option value="${esc(o)}" ${callOutcomeFilter === o ? "selected" : ""}>${cap(esc(o))}</option>`).join("")}
-      </select>
-      <button class="btn ghost" id="call-go">Filter</button>
-      <div class="spacer"></div>
-      <button class="btn" id="log-call">+ Log a call</button>
-    </div>
-    <div class="panel"><div style="overflow-x:auto"><table>
-      <tr><th>When</th><th>Contact</th><th>Company</th><th>Deal</th><th>Dir.</th><th>Length</th><th>Outcome</th><th>Notes</th><th></th></tr>
-      ${calls.map((c) => `<tr>
-        <td style="white-space:nowrap">${esc(fmtWhen(c.called_at))}</td>
-        <td>${esc(c.contact_name || "—")}</td>
-        <td>${esc(c.company_name || "—")}</td>
-        <td>${esc(c.deal_title || "—")}</td>
-        <td>${c.direction === "in" ? "← In" : "Out →"}</td>
-        <td style="white-space:nowrap">${fmtDuration(c.duration_sec)}</td>
-        <td>${outcomePill(c.outcome)}</td>
-        <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(c.notes || "")}">${esc(c.notes || "—")}</td>
-        <td class="rowact" style="white-space:nowrap"><button class="btn ghost small" data-calledit="${c.id}">Edit</button>
-          <button class="btn ghost small" data-calldel="${c.id}">Delete</button></td>
-      </tr>`).join("")}
-    </table></div>${calls.length ? "" : `<div class="empty">No calls match. Log the first one above.</div>`}</div>`;
-  const apply = () => {
-    callQ = $("#call-q").value; callDirFilter = $("#call-dir").value; callOutcomeFilter = $("#call-outcome").value;
-    route();
-  };
-  $("#call-go").onclick = apply;
-  $("#call-q").addEventListener("keydown", (e) => { if (e.key === "Enter") apply(); });
-  $("#call-dir").onchange = apply;
-  $("#call-outcome").onchange = apply;
-  $("#log-call").onclick = () => logCallModal();
-  view.querySelectorAll("[data-calledit]").forEach((b) => b.onclick = () => editCallModal(Number(b.dataset.calledit)));
-  view.querySelectorAll("[data-calldel]").forEach((b) => b.onclick = async () => {
-    if (confirm("Delete this call log?")) { await DEL(`/api/calls/${b.dataset.calldel}`); route(); }
-  });
-}
-
-function callFormHtml(preset, contacts, companies, deals) {
-  const now = new Date();
-  const pad = (n) => String(n).padStart(2, "0");
-  const iso = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
-  const when = preset.called_at ? preset.called_at.slice(0, 16).replace(" ", "T") : iso;
-  const mins = preset.duration_sec != null && preset.duration_sec !== "" ? String(Math.round(Number(preset.duration_sec) / 6) / 10) : "";
-  return `
-    <div class="formgrid">
-      ${field("Contact", select("contact_id", [["", "—"]].concat(contacts.map((c) => [c.id, c.name])), preset.contact_id || ""))}
-      ${field("Company", select("company_id", [["", "—"]].concat(companies.map((c) => [c.id, c.name])), preset.company_id || ""))}
-      ${field("Deal", select("deal_id", [["", "—"]].concat(deals.map((d) => [d.id, d.title])), preset.deal_id || ""))}
-      ${field("Direction", select("direction", [["out", "Outgoing"], ["in", "Incoming"]], preset.direction || "out"))}
-      ${field("Outcome", select("outcome", CALL_OUTCOMES.map((o) => [o, cap(o)]), preset.outcome || "connected"))}
-      ${field("Duration (minutes)", input("duration_min", mins, "number", 'min="0" step="0.5"'))}
-    </div>
-    ${field("When", `<input name="called_at" type="datetime-local" value="${esc(when)}">`)}
-    ${field("Notes", `<textarea name="notes" rows="3">${esc(preset.notes || "")}</textarea>`)}`;
-}
-function collectCallBody(d) {
-  const num = (v) => (v === "" || v == null ? null : Number(v));
-  return {
-    contact_id: num(d.contact_id), company_id: num(d.company_id), deal_id: num(d.deal_id),
-    direction: d.direction === "in" ? "in" : "out",
-    outcome: d.outcome,
-    duration_sec: Math.max(0, Math.round(Number(d.duration_min || 0) * 60)),
-    called_at: d.called_at ? d.called_at.replace("T", " ") + ":00" : undefined,
-    notes: d.notes || "",
-  };
-}
-async function logCallModal(preset = {}) {
-  const [{ contacts }, { companies }, { deals }] = await Promise.all([GET("/api/contacts"), GET("/api/companies"), GET("/api/deals")]);
-  openModal("Log a call", callFormHtml(preset, contacts, companies, deals), async (d) => {
-    await POST("/api/calls", collectCallBody(d));
-    route();
-  }, "Log call");
-}
-async function editCallModal(id) {
-  const [{ call }, { contacts }, { companies }, { deals }] = await Promise.all([
-    GET(`/api/calls/${id}`), GET("/api/contacts"), GET("/api/companies"), GET("/api/deals"),
-  ]);
-  openModal("Edit call", callFormHtml(call, contacts, companies, deals) +
-    `<div style="margin-top:14px"><button type="button" class="btn danger small" id="call-del">Delete call</button></div>`,
-    async (d) => { await PATCH(`/api/calls/${id}`, collectCallBody(d)); route(); }, "Save changes");
-  $("#call-del").onclick = async () => {
-    if (confirm("Delete this call log?")) { await DEL(`/api/calls/${id}`); $("#modal-root").innerHTML = ""; route(); }
-  };
-}
-
-/* compact call history for entity modals */
-async function fillCallHistory(hostId, query) {
-  const host = document.getElementById(hostId);
-  if (!host) return;
-  try {
-    const { calls } = await GET(`/api/calls?${query}`);
-    host.innerHTML = calls.length ? `<table class="calls-mini">
-      ${calls.slice(0, 8).map((c) => `<tr>
-        <td style="white-space:nowrap">${esc(fmtWhen(c.called_at))}</td>
-        <td>${c.direction === "in" ? "←" : "→"}</td>
-        <td>${outcomePill(c.outcome)}</td>
-        <td style="white-space:nowrap">${fmtDuration(c.duration_sec)}</td>
-        <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(c.notes || "")}">${esc(c.notes || "—")}</td>
-        <td class="rowact"><button class="btn ghost small" data-hcalldel="${c.id}" title="Delete call">×</button></td>
-      </tr>`).join("")}
-    </table>${calls.length > 8 ? `<p class="hint" style="margin:6px 0 0">+ ${calls.length - 8} more in <a href="#/calls">Calls</a></p>` : ""}`
-      : `<div class="empty">No calls logged yet.</div>`;
-    host.querySelectorAll("[data-hcalldel]").forEach((b) => b.onclick = async () => {
-      if (confirm("Delete this call log?")) { await DEL(`/api/calls/${b.dataset.hcalldel}`); fillCallHistory(hostId, query); }
-    });
-  } catch { host.innerHTML = `<div class="empty">Couldn't load call history.</div>`; }
-}
-const callSectionHtml = (kind, id) =>
-  `<div class="field"><label>Call history</label>
-    <div id="calls-${kind}-${id}"><div class="empty">Loading…</div></div>
-    <button type="button" class="btn ghost small" id="logcall-${kind}-${id}" style="margin-top:8px">+ Log a call</button></div>`;
-function wireCallSection(kind, id, preset) {
-  fillCallHistory(`calls-${kind}-${id}`, `${kind}_id=${id}`);
-  const b = document.getElementById(`logcall-${kind}-${id}`);
-  if (b) b.onclick = () => logCallModal(preset);
-}
-
 /* ---------- router ---------- */
 async function route() {
   const [hash] = location.hash.split("?");
   const parts = (hash.replace("#/", "") || "dashboard").split("/");
   const r = parts[0];
-  // Captures / Automations / Schema moved into the Data Workshop tabs —
-  // old bookmarks and links land on the right tab instead of 404ing.
-  if (LEGACY_ROUTES[r]) { location.hash = `#/workshop/${LEGACY_ROUTES[r]}`; return; }
   const name = TITLES[r] ? r : "dashboard";
   document.querySelectorAll("#nav a").forEach((a) =>
     a.classList.toggle("active", a.dataset.r === name));
@@ -3477,27 +2041,14 @@ async function route() {
     <div class="skel" style="height:120px;margin-bottom:16px"></div>
     <div class="skel" style="height:220px"></div>`;
   try {
-    if (name === "campaigns") {
-      const sub = parts[1] || "overview";
-      if (["overview", "pipeline", "email", "sms"].includes(sub)) {
-        // msg campaign detail: #/campaigns/email/3
-        if (!parts[1]) { location.hash = "#/campaigns/overview"; return; }
-        $("#page-title").textContent = "Campaigns";
-        if ((sub === "email" || sub === "sms") && /^\d+$/.test(parts[2] || "")) {
-          await vMsgCampaignDetail(sub, Number(parts[2]));
-        } else {
-          await vCampaigns(sub);
-        }
-      } else {
-        $("#page-title").textContent = "Campaign";
-        await vCampaignDetail(Number(sub));
-      }
+    if (name === "campaigns" && parts[1]) {
+      $("#page-title").textContent = "Campaign";
+      await vCampaignDetail(Number(parts[1]));
     } else {
       $("#page-title").textContent = TITLES[name];
-      await { dashboard: vDashboard, feed: vFeed, calendar: vCalendar,
-        contacts: () => (dupMode ? vDuplicates() : vContacts()),
-        companies: vCompanies, campaigns: () => vCampaigns("overview"), calls: vCalls,
-        workshop: () => vWorkshop(parts[1]), milton: vMilton }[name]();
+      await { dashboard: vDashboard, milton: vMilton, outreach: vOutreach, feed: vFeed, contacts: vContacts,
+        companies: vCompanies, campaigns: vCampaigns, captures: vCaptures,
+        automations: vAutomations, schema: vSchema }[name]();
     }
   } catch (e) {
     view.innerHTML = `<div class="empty">Failed to load: ${esc(e.message)}</div>`;

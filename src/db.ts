@@ -27,6 +27,34 @@ export const STAGE_COLORS: Record<string, string> = {
   closed_lost: "#d974b9",
 };
 
+// Outreach channels — every communication channel the rep can log a touch on.
+// Mirrors Milton's outcome-method taxonomy (Call, Email, Social message,
+// Video call, In person): Outreach is the Action phase of the
+// Review → Action → Outcome cycle, logged in one place.
+export const OUTREACH_CHANNELS = [
+  "call",
+  "email",
+  "social",
+  "video",
+  "in_person",
+] as const;
+
+export const OUTREACH_CHANNEL_LABELS: Record<string, string> = {
+  call: "Call",
+  email: "Email",
+  social: "Social message",
+  video: "Video call",
+  in_person: "In person",
+};
+
+export const OUTREACH_CHANNEL_ICONS: Record<string, string> = {
+  call: "📞",
+  email: "✉️",
+  social: "💬",
+  video: "🎥",
+  in_person: "🤝",
+};
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS workspaces (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,15 +133,6 @@ CREATE TABLE IF NOT EXISTS incoming_hooks (
   workspace_id INTEGER REFERENCES workspaces(id),
   created_at TEXT DEFAULT (datetime('now'))
 );
-CREATE TABLE IF NOT EXISTS milton_widgets (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  workspace_id INTEGER NOT NULL,
-  kind TEXT NOT NULL,
-  title TEXT NOT NULL,
-  payload TEXT NOT NULL,
-  source TEXT,
-  created_at INTEGER NOT NULL
-);
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -170,139 +189,42 @@ CREATE TABLE IF NOT EXISTS custom_values (
   value TEXT DEFAULT '',
   UNIQUE(entity, record_id, field_id)
 );
-CREATE TABLE IF NOT EXISTS saved_views (
+CREATE TABLE IF NOT EXISTS outreach (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   workspace_id INTEGER REFERENCES workspaces(id),
-  name TEXT NOT NULL,
-  filters_json TEXT NOT NULL DEFAULT '{}',
-  created_at TEXT DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS sandbox_batches (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  workspace_id INTEGER REFERENCES workspaces(id),
-  name TEXT NOT NULL,
-  filename TEXT DEFAULT '',
-  source TEXT DEFAULT 'csv',
-  status TEXT DEFAULT 'open',
-  row_count INTEGER DEFAULT 0,
-  created_at TEXT DEFAULT (datetime('now')),
-  completed_at TEXT DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS sandbox_rows (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  batch_id INTEGER REFERENCES sandbox_batches(id),
-  workspace_id INTEGER REFERENCES workspaces(id),
-  row_num INTEGER DEFAULT 0,
-  name TEXT DEFAULT '',
-  title TEXT DEFAULT '',
-  email TEXT DEFAULT '',
-  phone TEXT DEFAULT '',
-  company TEXT DEFAULT '',
-  notes TEXT DEFAULT '',
-  status TEXT DEFAULT 'clean',
-  decision TEXT DEFAULT 'pending',
-  dup_of_contact_id INTEGER DEFAULT 0,
-  dup_of_row_id INTEGER DEFAULT 0,
-  flags TEXT DEFAULT '[]',
-  extra_flags TEXT DEFAULT '[]',
-  created_at TEXT DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS deal_stage_history (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  channel TEXT NOT NULL,
   deal_id INTEGER REFERENCES deals(id),
-  workspace_id INTEGER REFERENCES workspaces(id),
-  from_stage TEXT DEFAULT '',
-  to_stage TEXT NOT NULL,
-  created_at TEXT DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS task_dependencies (
-  task_id INTEGER NOT NULL REFERENCES tasks(id),
-  depends_on_task_id INTEGER NOT NULL REFERENCES tasks(id),
-  workspace_id INTEGER REFERENCES workspaces(id),
-  PRIMARY KEY (task_id, depends_on_task_id)
-);
-CREATE TABLE IF NOT EXISTS workspace_settings (
-  workspace_id INTEGER NOT NULL REFERENCES workspaces(id),
-  key TEXT NOT NULL,
-  value TEXT DEFAULT '',
-  PRIMARY KEY (workspace_id, key)
-);
-CREATE TABLE IF NOT EXISTS email_templates (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  workspace_id INTEGER REFERENCES workspaces(id),
-  name TEXT NOT NULL,
-  subject TEXT DEFAULT '',
-  body TEXT DEFAULT '',
-  created_at TEXT DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS email_campaigns (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  workspace_id INTEGER REFERENCES workspaces(id),
-  template_id INTEGER REFERENCES email_templates(id),
-  name TEXT NOT NULL,
-  status TEXT DEFAULT 'draft',
-  audience_json TEXT DEFAULT '{}',
-  created_at TEXT DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS email_sends (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  workspace_id INTEGER REFERENCES workspaces(id),
-  campaign_id INTEGER REFERENCES email_campaigns(id),
   contact_id INTEGER REFERENCES contacts(id),
-  to_email TEXT DEFAULT '',
-  status TEXT DEFAULT 'sent',
-  error TEXT DEFAULT '',
-  sent_at TEXT DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS sms_templates (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  workspace_id INTEGER REFERENCES workspaces(id),
-  name TEXT NOT NULL,
-  body TEXT DEFAULT '',
-  created_at TEXT DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS sms_campaigns (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  workspace_id INTEGER REFERENCES workspaces(id),
-  template_id INTEGER REFERENCES sms_templates(id),
-  name TEXT NOT NULL,
-  status TEXT DEFAULT 'draft',
-  audience_json TEXT DEFAULT '{}',
-  created_at TEXT DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS sms_sends (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  workspace_id INTEGER REFERENCES workspaces(id),
-  campaign_id INTEGER REFERENCES sms_campaigns(id),
-  contact_id INTEGER REFERENCES contacts(id),
-  to_phone TEXT DEFAULT '',
-  status TEXT DEFAULT 'sent',
-  error TEXT DEFAULT '',
-  sent_at TEXT DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS calls (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  workspace_id INTEGER REFERENCES workspaces(id),
-  contact_id INTEGER REFERENCES contacts(id),
-  company_id INTEGER REFERENCES companies(id),
-  deal_id INTEGER REFERENCES deals(id),
-  direction TEXT DEFAULT 'out',
-  duration_sec INTEGER DEFAULT 0,
+  note TEXT DEFAULT '',
   outcome TEXT DEFAULT '',
-  notes TEXT DEFAULT '',
-  called_at TEXT DEFAULT (datetime('now'))
+  happened_at TEXT DEFAULT '',
+  created_at TEXT DEFAULT (datetime('now'))
 );
 `;
 
 export function openDb(path: string): Database {
   const db = new Database(path, { create: true });
+  // Wait on lock contention instead of failing fast: two processes may open
+  // the same DB at once (e.g. a restart overlapping the old instance), and
+  // the migrations below take write locks.
+  db.exec("PRAGMA busy_timeout = 5000;");
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec(SCHEMA);
+  // Race-safe column migration: two processes opening the same DB can both see
+  // the column missing and both try ALTER TABLE; the loser gets
+  // "duplicate column name", which means the column is there — ignore it.
+  const addColumn = (table: string, ddl: string) => {
+    try {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+    } catch (e: any) {
+      if (!String(e?.message || e).includes("duplicate column name")) throw e;
+    }
+  };
   // migration: tasks gained campaign_id after the schema-editor release.
   // The index is created here (not in SCHEMA) so old DBs get the column first.
   const taskCols = db.query("PRAGMA table_info(tasks)").all() as any[];
   if (!taskCols.some((c) => c.name === "campaign_id")) {
-    db.exec("ALTER TABLE tasks ADD COLUMN campaign_id INTEGER REFERENCES campaigns(id)");
+    addColumn("tasks", "campaign_id INTEGER REFERENCES campaigns(id)");
   }
   db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_campaign ON tasks(campaign_id)");
   // migration: deals, contacts and companies can be linked to a campaign.
@@ -310,7 +232,7 @@ export function openDb(path: string): Database {
   for (const t of ["deals", "contacts", "companies"]) {
     const cols = db.query(`PRAGMA table_info(${t})`).all() as any[];
     if (!cols.some((c) => c.name === "campaign_id")) {
-      db.exec(`ALTER TABLE ${t} ADD COLUMN campaign_id INTEGER REFERENCES campaigns(id)`);
+      addColumn(t, "campaign_id INTEGER REFERENCES campaigns(id)");
     }
   }
   db.exec("CREATE INDEX IF NOT EXISTS idx_deals_campaign ON deals(campaign_id)");
@@ -319,7 +241,7 @@ export function openDb(path: string): Database {
   // migration: campaigns are now connected to a company
   const campCols = db.query("PRAGMA table_info(campaigns)").all() as any[];
   if (!campCols.some((c) => c.name === "company_id")) {
-    db.exec("ALTER TABLE campaigns ADD COLUMN company_id INTEGER REFERENCES companies(id)");
+    addColumn("campaigns", "company_id INTEGER REFERENCES companies(id)");
   }
   // migration: workspaces — every record lives in exactly one workspace.
   // settings stays global (app config). incoming_hooks are per-workspace so an
@@ -328,17 +250,19 @@ export function openDb(path: string): Database {
   const SCOPED = [
     "companies", "contacts", "deals", "tasks", "campaigns",
     "activities", "captures", "custom_fields", "webhooks", "incoming_hooks",
+    "outreach",
   ];
   for (const t of SCOPED) {
     const cols = db.query(`PRAGMA table_info(${t})`).all() as any[];
     if (!cols.some((c) => c.name === "workspace_id")) {
-      db.exec(`ALTER TABLE ${t} ADD COLUMN workspace_id INTEGER REFERENCES workspaces(id)`);
+      addColumn(t, "workspace_id INTEGER REFERENCES workspaces(id)");
     }
   }
   db.exec("CREATE INDEX IF NOT EXISTS idx_deals_ws ON deals(workspace_id)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_contacts_ws ON contacts(workspace_id)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_ws ON tasks(workspace_id)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_companies_ws ON companies(workspace_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_outreach_ws ON outreach(workspace_id)");
   const mainId = ensureMainWorkspace(db);
   for (const t of SCOPED) {
     db.exec(`UPDATE ${t} SET workspace_id = ${mainId} WHERE workspace_id IS NULL`);
@@ -370,73 +294,8 @@ export function openDb(path: string): Database {
   // Values are secrets; the API only ever exposes header names.
   const whCols = db.query("PRAGMA table_info(webhooks)").all() as any[];
   if (!whCols.some((c) => c.name === "headers")) {
-    db.exec("ALTER TABLE webhooks ADD COLUMN headers TEXT DEFAULT '{}'");
+    addColumn("webhooks", "headers TEXT DEFAULT '{}'");
   }
-  // migration: deals gained a free-text source field (lead origin), and the
-  // batch-5 tables: deal_stage_history, task_dependencies, saved_views.
-  const dealCols = db.query("PRAGMA table_info(deals)").all() as any[];
-  if (!dealCols.some((c) => c.name === "source")) {
-    db.exec("ALTER TABLE deals ADD COLUMN source TEXT DEFAULT ''");
-  }
-  // migration: sandbox batches gained a source type ('csv' or 'vcf'), and
-  // sandbox rows gained extra_flags (source-specific flags that survive
-  // re-analysis, e.g. vCard multi-email notes).
-  const sbBatchCols = db.query("PRAGMA table_info(sandbox_batches)").all() as any[];
-  if (!sbBatchCols.some((c) => c.name === "source")) {
-    db.exec("ALTER TABLE sandbox_batches ADD COLUMN source TEXT DEFAULT 'csv'");
-  }
-  const sbRowCols = db.query("PRAGMA table_info(sandbox_rows)").all() as any[];
-  if (!sbRowCols.some((c) => c.name === "extra_flags")) {
-    db.exec("ALTER TABLE sandbox_rows ADD COLUMN extra_flags TEXT DEFAULT '[]'");
-  }
-  for (const [t, sql] of [
-    ["deal_stage_history", `CREATE TABLE deal_stage_history (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      deal_id INTEGER REFERENCES deals(id),
-      workspace_id INTEGER REFERENCES workspaces(id),
-      from_stage TEXT DEFAULT '',
-      to_stage TEXT NOT NULL,
-      created_at TEXT DEFAULT (datetime('now')))`,],
-    ["task_dependencies", `CREATE TABLE task_dependencies (
-      task_id INTEGER NOT NULL REFERENCES tasks(id),
-      depends_on_task_id INTEGER NOT NULL REFERENCES tasks(id),
-      workspace_id INTEGER REFERENCES workspaces(id),
-      PRIMARY KEY (task_id, depends_on_task_id))`,],
-    ["saved_views", `CREATE TABLE saved_views (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      workspace_id INTEGER REFERENCES workspaces(id),
-      name TEXT NOT NULL,
-      filters_json TEXT NOT NULL DEFAULT '{}',
-      created_at TEXT DEFAULT (datetime('now')))`,],
-  ] as [string, string][]) {
-    const exists = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(t);
-    if (!exists) db.exec(sql);
-  }
-  db.exec("CREATE INDEX IF NOT EXISTS idx_stage_history_deal ON deal_stage_history(deal_id)");
-  db.exec("CREATE INDEX IF NOT EXISTS idx_stage_history_ws ON deal_stage_history(workspace_id)");
-  db.exec("CREATE INDEX IF NOT EXISTS idx_task_deps_ws ON task_dependencies(workspace_id)");
-  db.exec("CREATE INDEX IF NOT EXISTS idx_saved_views_ws ON saved_views(workspace_id)");
-  // migration: contacts gained messaging opt-outs and an SMS gateway address.
-  // email_opt_out / sms_opt_out default 0 (opted in); sms_gateway is the
-  // carrier email-to-SMS address (e.g. 5551234567@vtext.com), blank = none.
-  const contactCols = db.query("PRAGMA table_info(contacts)").all() as any[];
-  for (const [col, ddl] of [
-    ["email_opt_out", "INTEGER DEFAULT 0"],
-    ["sms_opt_out", "INTEGER DEFAULT 0"],
-    ["sms_gateway", "TEXT DEFAULT ''"],
-  ] as [string, string][]) {
-    if (!contactCols.some((c) => c.name === col)) {
-      db.exec(`ALTER TABLE contacts ADD COLUMN ${col} ${ddl}`);
-    }
-  }
-  for (const t of ["email_templates", "email_campaigns", "email_sends", "sms_templates", "sms_campaigns", "sms_sends", "calls", "workspace_settings"]) {
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_${t}_ws ON ${t}(workspace_id)`);
-  }
-  db.exec("CREATE INDEX IF NOT EXISTS idx_email_sends_camp ON email_sends(campaign_id)");
-  db.exec("CREATE INDEX IF NOT EXISTS idx_sms_sends_camp ON sms_sends(campaign_id)");
-  db.exec("CREATE INDEX IF NOT EXISTS idx_calls_contact ON calls(contact_id)");
-  db.exec("CREATE INDEX IF NOT EXISTS idx_calls_company ON calls(company_id)");
-  db.exec("CREATE INDEX IF NOT EXISTS idx_calls_deal ON calls(deal_id)");
   // migration: pipeline stages are editable per workspace (Milton schema editing).
   // deals.stage stays a TEXT slug; the stages table owns the per-workspace
   // ordered schema. Legacy DBs get the table created and seeded below.

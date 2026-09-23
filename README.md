@@ -15,32 +15,32 @@ PORT=4000 bun start
 
 Data lives in `./crm.db` (created + seeded on first run). Override with `CRM_DB`.
 
+Start Milton first (default port 3009), then exec-crm: the Milton page and
+Dashboard insights talk to Milton through exec-crm's same-origin proxy. If
+Milton runs on another host, set `MILTON_URL` on exec-crm — it stays
+server-side and is never exposed to the browser.
+
 ## Views
 
-- **Dashboard** — open pipeline, weighted pipeline, won this quarter, open
-  tasks; pipeline-by-stage bars; deals closing soon; activity feed.
-- **Pipeline** — kanban board, drag cards between stages (fires webhooks).
-- **Contacts / Companies / Campaigns / Tasks** — search, create, complete.
+The app is built around the **Review → Action → Outcome** cycle:
+
+- **Dashboard** — Milton insights only: Milton's pipeline-hygiene findings
+  grouped Review → Action → Outcome, with a cycle strip showing the counts.
+  No KPIs, no pipeline summary — those live where the work happens.
+- **Milton** — the Milton agent embedded in the CRM. Same-origin chat
+  (no iframe): one Milton session per workspace, remembered in the browser,
+  every call re-validated against the active workspace server-side.
+- **Outreach** — the Action log: every touch in one place — calls, emails,
+  social messages, video calls, in-person. Filter by channel, link each
+  touch to a deal and/or contact, and log the outcome when it lands.
+- **Campaigns** — pipeline kanban board (drag cards between stages, fires
+  webhooks), per-campaign detail, stage management.
+- **Contacts / Companies / Tasks** — search, create, complete.
 - **Schema editor** — add your own custom fields (text, long text, number,
   date, dropdown, checkbox, URL) to contacts, companies, campaigns, and
   tasks; fields show up on every form automatically.
 - **Daily Feed** — overdue, today's, and upcoming todos plus deals closing
   this week, with quick-add.
-- **Calendar** — week grid (default) or month grid of deal expected-close
-  dates and task due dates; global view in the sidebar, a Calendar panel on
-  every campaign page (in the prominent slot above the workflow tasks), and a
-  mini month calendar inside the deal editor. Read-only: dates change via the
-  deal and task forms. Overdue open items are muted terracotta; done tasks and
-  closed deals are dimmed. Deal chips carry a left border in their stage's
-  funnel-phase color.
-- **Funnel-phase colors** — the workspace's ordered stages are split into
-  thirds (early / middle / end) purely by position, so the coding survives
-  stage renames, reorders, and additions; closed stages sit at the end of the
-  order and land in the end third naturally. Applied to kanban column headers
-  and card dots, per-campaign pipeline strips, and calendar deal chips/dots.
-  Stages outside the workspace order fall back to their legacy color.
-- **Collapsible workflow tasks** — the campaign detail's task list starts
-  collapsed (chevron + count + Add task in the header); click to expand.
 - **Captures** — snap or upload photos of business cards and client notes
   (`capture="environment"` opens the camera on mobile); add a note and link
   each photo to a contact.
@@ -106,8 +106,7 @@ outgoing webhooks, so chains compose.
 `GET|POST /api/captures` (multipart `photos[]`) · `PATCH|DELETE /api/captures/:id` ·
 `GET /uploads/:file` ·
 `GET /api/schema/:entity` · `POST /api/schema/:entity` · `PATCH|DELETE /api/schema/fields/:id` ·
-`GET|POST /api/campaigns` · `PATCH|DELETE /api/campaigns/:id` ·\
-`GET /api/calendar?scope=global|campaign|deal&id=<n>&from=YYYY-MM-DD&to=YYYY-MM-DD`
+`GET|POST /api/campaigns` · `PATCH|DELETE /api/campaigns/:id`
 
 Captured photos land in `./uploads/` (created on boot; override with
 `CRM_UPLOADS`). Images only, 12 MB max each.

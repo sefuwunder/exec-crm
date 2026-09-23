@@ -1,14 +1,13 @@
-import { openDb, seedIfEmpty, ensureMainWorkspace, seedStages, workspaceStages, stageSlugs, slugifyStage, renumberStages } from "./db";
-import { sendMail } from "./smtp";
-import {
-  renderMerge, parseAudience, resolveEmailAudience, resolveSmsAudience,
-  getMsgSettings, maskedMsgSettings, saveMsgSettings,
-  smtpConfigured, twilioConfigured, sendTwilio, sendError,
-} from "./messaging";
+import { openDb, seedIfEmpty, ensureMainWorkspace, seedStages, workspaceStages, stageSlugs, slugifyStage, renumberStages, OUTREACH_CHANNELS, OUTREACH_CHANNEL_LABELS } from "./db";
 
 const PORT = Number(process.env.PORT || 3001);
 const db = openDb(process.env.CRM_DB || "./crm.db");
 seedIfEmpty(db);
+
+// Milton agent: exec-crm's Dashboard renders Milton's playbook insights and
+// the Milton page embeds the agent's chat UI. Same box by default; override
+// with MILTON_URL when Milton runs elsewhere.
+const MILTON_URL = (process.env.MILTON_URL || "http://127.0.0.1:3009").replace(/\/+$/, "");
 
 // ---- captured photos (business cards, client notes)
 const UPLOAD_DIR = process.env.CRM_UPLOADS || "./uploads";
@@ -31,7 +30,7 @@ function extFor(mime: string, originalName: string): string {
 // ---------------------------------------------------------------- custom fields
 const CUSTOM_ENTITIES = ["contact", "company", "campaign", "task"];
 const CORE_COLUMNS: Record<string, string[]> = {
-  contact: ["id", "company_id", "name", "title", "email", "phone", "sms_gateway", "email_opt_out", "sms_opt_out", "notes", "created_at", "company_name"],
+  contact: ["id", "company_id", "name", "title", "email", "phone", "notes", "created_at", "company_name"],
   company: ["id", "name", "industry", "website", "size", "created_at", "deal_count", "open_value"],
   campaign: ["id", "name", "status", "start_date", "end_date", "budget", "notes", "created_at"],
   task: ["id", "title", "deal_id", "due_date", "done", "owner", "created_at", "deal_title"],
@@ -52,70 +51,12 @@ function attachCustom(entity: string, rows: any[]) {
     )
     .all(entity, ...rows.map((r) => r.id)) as any[];
   const byRecord = new Map<number, Record<string, string>>();
-  const valsByField = new Map<number, Map<number, string>>();
   for (const v of vals) {
     if (!byRecord.has(v.record_id)) byRecord.set(v.record_id, {});
     byRecord.get(v.record_id)![v.field_id] = v.value;
-    if (!valsByField.has(v.record_id)) valsByField.set(v.record_id, new Map());
-    valsByField.get(v.record_id)!.set(v.field_id, v.value);
   }
   for (const r of rows) r.custom = byRecord.get(r.id) || {};
-  // merged defs for detail GETs: custom_fields: [{id, name, field_type, value}]
-  const w = (rows[0] as any).workspace_id;
-  if (w != null) {
-    const defs = getCustomFields(entity, Number(w));
-    for (const r of rows) {
-      const vm = valsByField.get(r.id) || new Map<number, string>();
-      r.custom_fields = defs.map((f: any) => ({
-        id: f.id,
-        name: f.label,
-        field_type: f.type,
-        value: vm.get(f.id) ?? "",
-      }));
-    }
-  }
   return rows;
-}
-
-/* Validate a custom-field value against its type. Empty string means "clear". */
-function validateCustomValue(
-  f: any,
-  raw: unknown
-): { ok: true; stored: string } | { ok: false; error: string } {
-  const v = raw == null ? "" : String(raw).trim();
-  if (v === "") return { ok: true, stored: "" };
-  switch (f.type) {
-    case "number":
-      if (!/^[-+]?(\d+(\.\d+)?|\.\d+)$/.test(v))
-        return { ok: false, error: `"${f.label}" expects a number, got "${v}"` };
-      return { ok: true, stored: v };
-    case "date": {
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(v))
-        return { ok: false, error: `"${f.label}" expects a date like 2026-10-01, got "${v}"` };
-      const [y, m, d] = v.split("-").map(Number);
-      const dt = new Date(Date.UTC(y, m - 1, d));
-      if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d)
-        return { ok: false, error: `"${v}" is not a real calendar date` };
-      return { ok: true, stored: v };
-    }
-    case "checkbox": {
-      const t = v.toLowerCase();
-      if (["1", "true", "yes", "y"].includes(t)) return { ok: true, stored: "1" };
-      if (["0", "false", "no", "n"].includes(t)) return { ok: true, stored: "0" };
-      return { ok: false, error: `"${f.label}" expects yes/no or true/false, got "${v}"` };
-    }
-    case "select": {
-      let opts: string[] = [];
-      try {
-        opts = JSON.parse(f.options || "[]");
-      } catch {}
-      if (!opts.includes(v))
-        return { ok: false, error: `"${v}" is not one of: ${opts.join(", ") || "—"}` };
-      return { ok: true, stored: v };
-    }
-    default:
-      return { ok: true, stored: v }; // text, textarea, url
-  }
 }
 function saveCustomValues(entity: string, recordId: number, custom: unknown, w: number) {
   if (!custom || typeof custom !== "object") return;
@@ -154,22 +95,11 @@ const ALL_EVENTS = [
   "campaign.deleted",
   "task.created",
   "task.completed",
-  "email_campaign.sent",
-  "sms_campaign.sent",
-  "call.logged",
 ];
 
 function logActivity(kind: string, text: string, w: number) {
   db.prepare("INSERT INTO activities (kind, text, workspace_id) VALUES (?, ?, ?)")
     .run(kind, text, w);
-}
-
-// Deal stage-transition history: one row per move, server-side, on every
-// stage-change path. from_stage is "" when the deal is created ("opened").
-function logStageChange(dealId: number, fromStage: string, toStage: string, w: number) {
-  db.prepare(
-    "INSERT INTO deal_stage_history (deal_id, workspace_id, from_stage, to_stage) VALUES (?, ?, ?, ?)"
-  ).run(dealId, w, fromStage || "", toStage);
 }
 
 // ---- outgoing webhook custom headers ------------------------------------------
@@ -285,45 +215,6 @@ function dealJson(id: number, w: number) {
     .get(id, w);
 }
 
-// ---- task dependencies ------------------------------------------------------
-// blocked_by: [{id, title, done}] predecessors; is_blocked: any predecessor not done.
-function taskDepsJson(taskId: number, w: number) {
-  const rows = db
-    .query(
-      `SELECT t.id, t.title, t.done FROM task_dependencies td
-       JOIN tasks t ON t.id = td.depends_on_task_id
-       WHERE td.task_id = ? AND td.workspace_id = ? ORDER BY t.title`
-    )
-    .all(taskId, w) as any[];
-  return {
-    blocked_by: rows,
-    is_blocked: rows.some((r) => !r.done),
-  };
-}
-function attachTaskDeps(tasks: any[], w: number) {
-  for (const t of tasks) Object.assign(t, taskDepsJson(t.id, w));
-  return tasks;
-}
-// Would adding task -> dep edges create a cycle? DFS from each dep following
-// depends_on links; reaching `task` means task already (transitively) depends
-// on dep, so dep depending back on task closes a loop.
-function depWouldCycle(task: number, deps: number[], w: number): boolean {
-  const childrenOf = (id: number) =>
-    (db.query("SELECT depends_on_task_id AS d FROM task_dependencies WHERE task_id = ? AND workspace_id = ?")
-      .all(id, w) as any[]).map((r) => r.d);
-  for (const dep of deps) {
-    const seen = new Set<number>([dep]);
-    const stack = [dep];
-    while (stack.length) {
-      const cur = stack.pop()!;
-      if (cur === task) return true;
-      for (const nxt of childrenOf(cur)) {
-        if (!seen.has(nxt)) { seen.add(nxt); stack.push(nxt); }
-      }
-    }
-  }
-  return false;
-}
 // ---------------------------------------------------------------- helpers
 // Validate an incoming campaign_id against the active workspace.
 // Returns null for empty/missing, the numeric id for a workspace-owned
@@ -349,329 +240,6 @@ async function readBody(req: Request): Promise<any> {
   } catch {
     return {};
   }
-}
-
-// ---------------------------------------------------------------- milton widgets
-const MILTON_WIDGET_KINDS = ["stat", "table", "bars", "list"];
-const isStr = (v: any) => typeof v === "string";
-const isNum = (v: any) => typeof v === "number" && Number.isFinite(v);
-// Validate a widget payload for its kind; returns an error string or null.
-function miltonWidgetPayloadErr(kind: string, payload: any): string | null {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-    return "payload must be an object";
-  }
-  if (kind === "stat") {
-    if (!isStr(payload.value) || !payload.value.trim()) return "stat payload needs value (string)";
-    if (!isStr(payload.label) || !payload.label.trim()) return "stat payload needs label (string)";
-    if (payload.delta !== undefined && !isStr(payload.delta)) return "stat delta must be a string";
-    return null;
-  }
-  if (kind === "table") {
-    if (!Array.isArray(payload.headers) || payload.headers.length < 1 || payload.headers.length > 6 ||
-        !payload.headers.every(isStr)) return "table payload needs headers: string[1..6]";
-    if (!Array.isArray(payload.rows) || payload.rows.length > 12) return "table payload needs rows: array (max 12)";
-    for (const r of payload.rows) {
-      if (!Array.isArray(r) || r.length !== payload.headers.length || !r.every(isStr)) {
-        return "table rows must be string arrays matching the headers length";
-      }
-    }
-    return null;
-  }
-  if (kind === "bars") {
-    if (!Array.isArray(payload.items) || payload.items.length < 1 || payload.items.length > 10) {
-      return "bars payload needs items: [{label, value}][1..10]";
-    }
-    for (const it of payload.items) {
-      if (!it || typeof it !== "object" || !isStr(it.label) || !isNum(it.value)) {
-        return "bars items need {label: string, value: number}";
-      }
-    }
-    if (payload.format !== undefined && !["currency", "number", "percent"].includes(payload.format)) {
-      return "bars format must be currency, number, or percent";
-    }
-    return null;
-  }
-  // list
-  if (!Array.isArray(payload.items) || payload.items.length < 1 || payload.items.length > 15) {
-    return "list payload needs items: [{text, sub?}][1..15]";
-  }
-  for (const it of payload.items) {
-    if (!it || typeof it !== "object" || !isStr(it.text) || !it.text.trim()) {
-      return "list items need {text: string, sub?: string}";
-    }
-    if (it.sub !== undefined && !isStr(it.sub)) return "list item sub must be a string";
-  }
-  return null;
-}
-function miltonWidgetOut(r: any) {
-  let payload: any = null;
-  try { payload = JSON.parse(r.payload); } catch { payload = null; }
-  return { id: r.id, kind: r.kind, title: r.title, payload, source: r.source, created_at: r.created_at };
-}
-
-// ---------------------------------------------------------------- dashboard + daily feed
-const mwMoneyShort = (n: any) => {
-  n = Number(n) || 0;
-  if (Math.abs(n) >= 1e6) return "$" + (n / 1e6).toFixed(1) + "M";
-  if (Math.abs(n) >= 1e3) return "$" + Math.round(n / 1e3) + "k";
-  return "$" + Math.round(n);
-};
-const mwToday = () => {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-};
-function mwStageNames(w: number): Record<string, string> {
-  const names: Record<string, string> = {};
-  for (const s of db.query("SELECT slug, name FROM stages WHERE workspace_id = ?").all(w) as any[])
-    names[s.slug] = s.name;
-  return names;
-}
-function mwOpenDeals(w: number) {
-  return db
-    .query(
-      `SELECT d.*, c.name AS company_name, ct.name AS contact_name FROM deals d
-       LEFT JOIN companies c ON c.id = d.company_id
-       LEFT JOIN contacts ct ON ct.id = d.contact_id
-       WHERE d.workspace_id = ? AND d.stage NOT IN ('closed_won', 'closed_lost')
-       ORDER BY d.value DESC`
-    )
-    .all(w) as any[];
-}
-// Default dashboard widget set, computed from workspace data in Milton's
-// Widgetable shape ({kind, title, payload}) so the frontend renders defaults
-// and pinned widgets with the same card builder. Always available — no
-// Milton round-trip required.
-function defaultDashboardWidgets(w: number) {
-  const names = mwStageNames(w);
-  const deals = mwOpenDeals(w);
-  const now = Date.now();
-  const byStage: Record<string, { n: number; v: number; wv: number }> = {};
-  for (const d of deals) {
-    const s = byStage[d.stage] || (byStage[d.stage] = { n: 0, v: 0, wv: 0 });
-    s.n++;
-    s.v += Number(d.value) || 0;
-    s.wv += (Number(d.value) || 0) * (Number(d.probability) || 0) / 100;
-  }
-  const stageOrder = (db.query("SELECT slug FROM stages WHERE workspace_id = ? ORDER BY position, id").all(w) as any[])
-    .map((s: any) => s.slug)
-    .filter((s: string) => s !== "closed_won" && s !== "closed_lost");
-  const stages = [...stageOrder, ...Object.keys(byStage).filter((s) => !stageOrder.includes(s))];
-  const weightedTotal = stages.reduce((a, s) => a + (byStage[s]?.wv || 0), 0);
-
-  const forecast = {
-    kind: "bars", title: "Forecast", source: "exec-crm:defaults", created_at: now,
-    payload: {
-      format: "currency",
-      summary: mwMoneyShort(Math.round(weightedTotal)),
-      summary_label: "probability-weighted open pipeline",
-      summary_sub: `${deals.length} open deal${deals.length === 1 ? "" : "s"}`,
-      items: stages.map((s) => ({ label: names[s] || s, value: Math.round(byStage[s]?.wv || 0) })),
-    },
-  };
-  const analysis = {
-    kind: "table", title: "Pipeline analysis", source: "exec-crm:defaults", created_at: now,
-    payload: {
-      headers: ["Stage", "Deals", "Value", "Weighted"],
-      rows: stages.map((s) => {
-        const r = byStage[s] || { n: 0, v: 0, wv: 0 };
-        return [names[s] || s, String(r.n), mwMoneyShort(r.v), mwMoneyShort(Math.round(r.wv))];
-      }),
-    },
-  };
-  const today = mwToday();
-  const staleDays = (iso: string) => {
-    const m = (iso || "").slice(0, 10).match(/^(\d{4})-(\d{2})-(\d{2})$/);
-    if (!m) return null;
-    return Math.round((Date.now() - new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime()) / 86400000);
-  };
-  const staleList = deals
-    .map((d) => ({ d, days: staleDays(d.updated_at) }))
-    .filter((x) => x.days !== null && (x.days as number) >= 30)
-    .sort((a, b) => (b.days as number) - (a.days as number));
-  const noClose = deals.filter((d) => !d.expected_close);
-  const noValue = deals.filter((d) => !(Number(d.value) > 0));
-  const overdueTasks = (db.query(
-    "SELECT COUNT(*) AS n FROM tasks WHERE workspace_id = ? AND done = 0 AND due_date <> '' AND due_date < ?"
-  ).get(w, today) as any).n;
-  const hygieneItems: { text: string; sub?: string }[] = [];
-  if (staleList.length)
-    hygieneItems.push({
-      text: `🕸️ ${staleList.length} stale deal${staleList.length === 1 ? "" : "s"} untouched 30+ days`,
-      sub: staleList.slice(0, 3).map((x) => x.d.title).join("; "),
-    });
-  if (noClose.length)
-    hygieneItems.push({
-      text: `📅 ${noClose.length} deal${noClose.length === 1 ? "" : "s"} with no expected close date`,
-      sub: noClose.slice(0, 3).map((d) => d.title).join("; "),
-    });
-  if (noValue.length)
-    hygieneItems.push({ text: `💰 ${noValue.length} deal${noValue.length === 1 ? "" : "s"} with no value set` });
-  if (overdueTasks)
-    hygieneItems.push({ text: `⏰ ${overdueTasks} overdue task${overdueTasks === 1 ? "" : "s"}` });
-  const hygiene = {
-    kind: "list", title: "Hygiene summary", source: "exec-crm:defaults", created_at: now,
-    payload: {
-      items: hygieneItems.length
-        ? hygieneItems.slice(0, 8)
-        : [{ text: "✅ Pipeline is clean — every open deal has a close date, a value, and recent activity." }],
-    },
-  };
-  const top = {
-    kind: "table", title: "Top deals", source: "exec-crm:defaults", created_at: now,
-    payload: {
-      headers: ["Deal", "Company", "Stage", "Value"],
-      rows: deals.slice(0, 5).map((d) => [
-        d.title, d.company_name || "—", names[d.stage] || d.stage, mwMoneyShort(d.value),
-      ]),
-    },
-  };
-  return [forecast, analysis, hygiene, top];
-}
-
-// Talk to Milton's existing chat API (session workspace pinned first so the
-// reply is scoped to this exec-crm workspace). One overall timeout; null when
-// Milton is unreachable — callers degrade, never 500.
-const MILTON_URL = process.env.MILTON_URL || "http://localhost:3009";
-async function miltonChat(session: string, message: string, w: number, timeoutMs = 7000): Promise<any | null> {
-  const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), timeoutMs);
-  try {
-    await fetch(`${MILTON_URL}/api/session/workspace`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session, workspace_id: w }), signal: ctl.signal,
-    });
-    const r = await fetch(`${MILTON_URL}/api/chat`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session, message }), signal: ctl.signal,
-    });
-    if (!r.ok) return null;
-    return await r.json();
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-// Daily feed payload: one chronological stream of CRM-derived suggestions
-// (blocked, due, prep, hygiene) plus Milton's "morning brief" take when
-// reachable. Dated items sort first, ascending; undated nudges follow.
-// A task that is both blocked and due appears once, as Blocked.
-async function dailyFeed(w: number) {
-  const today = mwToday();
-  const plus7 = (() => {
-    const d = new Date(); d.setDate(d.getDate() + 7);
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-  })();
-  const names = mwStageNames(w);
-  const taskRows = attachTaskDeps(
-    attachCustom(
-      "task",
-      db.query(
-        `SELECT t.*, d.title AS deal_title FROM tasks t
-         LEFT JOIN deals d ON d.id = t.deal_id
-         WHERE t.workspace_id = ? ORDER BY t.done, t.due_date`
-      ).all(w) as any[]
-    ),
-    w
-  );
-  const deals = mwOpenDeals(w);
-  const open = taskRows.filter((t: any) => !t.done);
-  const plan = open.filter((t: any) => t.due_date && t.due_date <= today);
-  const blocked = open.filter((t: any) => t.is_blocked);
-  const closingSoon = deals.filter((d) => d.expected_close && d.expected_close >= today && d.expected_close <= plus7);
-  const staleDays = (iso: string) => {
-    const m = (iso || "").slice(0, 10).match(/^(\d{4})-(\d{2})-(\d{2})$/);
-    if (!m) return null;
-    return Math.round((Date.now() - new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime()) / 86400000);
-  };
-  const hygieneDeals = [
-    ...deals
-      .map((d) => ({ d, days: staleDays(d.updated_at) }))
-      .filter((x) => x.days !== null && (x.days as number) >= 30)
-      .sort((a, b) => (b.days as number) - (a.days as number))
-      .slice(0, 5)
-      .map((x) => ({ ...dealOut(x.d, names), note: `untouched ${Math.round(x.days as number)} days` })),
-    ...deals.filter((d) => !d.expected_close).slice(0, 5)
-      .map((d) => ({ ...dealOut(d, names), note: "no expected close date" })),
-  ];
-  // Meeting prep: distinct contacts/companies behind today's tasks and this
-  // week's closing deals.
-  const prepDeals = new Map<number, any>();
-  for (const t of plan) {
-    const d = deals.find((x) => x.id === t.deal_id);
-    if (d) prepDeals.set(d.id, { deal: d, reason: `task due ${t.due_date}: ${t.title}`, date: t.due_date });
-  }
-  for (const d of closingSoon)
-    if (!prepDeals.has(d.id)) prepDeals.set(d.id, { deal: d, reason: `closes ${d.expected_close}`, date: d.expected_close });
-  const seen = new Set<string>();
-  const prep: any[] = [];
-  for (const { deal: d, reason, date } of prepDeals.values()) {
-    const contact = d.contact_id
-      ? (db.query("SELECT id, name, title, email, phone FROM contacts WHERE id = ? AND workspace_id = ?").get(d.contact_id, w) as any)
-      : null;
-    const company = d.company_id
-      ? (db.query("SELECT id, name, industry, website FROM companies WHERE id = ? AND workspace_id = ?").get(d.company_id, w) as any)
-      : null;
-    if (contact && !seen.has(`c${contact.id}`)) {
-      seen.add(`c${contact.id}`);
-      prep.push({ kind: "contact", id: contact.id, name: contact.name, date,
-        sub: [contact.title, contact.email].filter(Boolean).join(" · ") || "—",
-        reason: `${d.title} — ${reason}` });
-    }
-    if (company && !seen.has(`o${company.id}`)) {
-      seen.add(`o${company.id}`);
-      prep.push({ kind: "company", id: company.id, name: company.name, date,
-        sub: company.industry || company.website || "—",
-        reason: `${d.title} — ${reason}` });
-    }
-  }
-  const brief = await miltonChat("exec-crm-feed", "morning brief", w);
-  // One chronological stream: blocked > due > prep > hygiene rank breaks
-  // date ties; tasks that are both blocked and due appear once as Blocked.
-  const rank: Record<string, number> = { Blocked: 0, Plan: 1, Prep: 2, Hygiene: 3 };
-  const items: any[] = [];
-  const blockedIds = new Set(blocked.map((t: any) => t.id));
-  for (const t of blocked) items.push({
-    type: "task", label: "Blocked", date: t.due_date || null, task: taskOut(t),
-    blocked_by: (t.blocked_by || []).filter((b: any) => !b.done).map((b: any) => ({ id: b.id, title: b.title })),
-  });
-  for (const t of plan.filter((t: any) => !blockedIds.has(t.id))) items.push({
-    type: "task", label: "Plan", date: t.due_date || null, task: taskOut(t),
-  });
-  for (const p of prep) items.push({ type: "prep", label: "Prep", date: p.date || null, prep: p });
-  for (const d of hygieneDeals) items.push({
-    type: "deal", label: "Hygiene", date: d.expected_close || null, note: d.note, deal: d,
-  });
-  items.sort((a, b) => {
-    const da = a.date || "", db = b.date || "";
-    if (da && db && da !== db) return da < db ? -1 : 1;
-    if (!!da !== !!db) return da ? -1 : 1;
-    return (rank[a.label] ?? 9) - (rank[b.label] ?? 9);
-  });
-  return {
-    generated_at: new Date().toISOString(),
-    milton: { available: !!brief, take: brief?.text || null },
-    due_count: plan.length,
-    items,
-  };
-}
-// Deal/task shapes the feed frontend can hand straight to the edit modals.
-function dealOut(d: any, names: Record<string, string>) {
-  return {
-    id: d.id, title: d.title, value: d.value, stage: d.stage,
-    stage_name: names[d.stage] || d.stage, probability: d.probability,
-    expected_close: d.expected_close, owner: d.owner, source: d.source,
-    company_id: d.company_id, contact_id: d.contact_id, campaign_id: d.campaign_id,
-    company_name: d.company_name, contact_name: d.contact_name,
-  };
-}
-function taskOut(t: any) {
-  return {
-    id: t.id, title: t.title, done: !!t.done, due_date: t.due_date, owner: t.owner,
-    deal_id: t.deal_id, deal_title: t.deal_title, is_blocked: !!t.is_blocked,
-    blocked_by: t.blocked_by || [],
-  };
 }
 
 // ---------------------------------------------------------------- workspaces
@@ -717,149 +285,6 @@ function parseCsv(text: string): string[][] {
   }
   if (field !== "" || row.length) { row.push(field); rows.push(row); }
   return rows.filter((r) => r.some((f) => f.trim() !== ""));
-}
-
-// ---- zero-dependency vCard parser (VCF 2.1 / 3.0 / 4.0) ----------------------
-// Deliberately written without TypeScript annotations so tests can eval the
-// extracted source directly. Returns one staged-row-shaped object per vCard:
-// { name, title, email, phone, company, notes, extraFlags }. Malformed input
-// never throws — bad cards produce rows flagged "malformed".
-function sbDecodeQP(s) {
-  // quoted-printable: strip soft line breaks, then decode =XX hex bytes.
-  // Bytes are re-assembled as UTF-8 (falling back to Latin-1) so
-  // =C3=BC decodes to ü rather than mojibake.
-  var bytes = [];
-  String(s || "").replace(/=\r?\n/g, "").replace(/=([0-9A-Fa-f]{2})|[\s\S]/g, function (m, h) {
-    bytes.push(h ? parseInt(h, 16) : m.charCodeAt(0) & 0xff);
-    return "";
-  });
-  var u8 = new Uint8Array(bytes);
-  try { return new TextDecoder("utf-8", { fatal: true }).decode(u8); }
-  catch (e) {
-    var out = "";
-    for (var i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
-    return out;
-  }
-}
-function sbB64decode(s) {
-  try { return atob(String(s || "").replace(/\s+/g, "")); }
-  catch (e) { return String(s || ""); }
-}
-function parseVcf(text) {
-  var norm = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  // Line unfolding: a line starting with a space or tab continues the
-  // previous line (RFC 2426 §5.8.1).
-  var lines = [];
-  var raw = norm.split("\n");
-  for (var li = 0; li < raw.length; li++) {
-    var rl = raw[li];
-    if (/^[ \t]/.test(rl) && lines.length) lines[lines.length - 1] += rl.slice(1);
-    else lines.push(rl);
-  }
-  // Split into cards. A BEGIN without a matching END (or a new BEGIN before
-  // the previous END) is parsed anyway and flagged malformed below — cards
-  // are never silently dropped.
-  var cards = [];
-  var cur = null;
-  for (var i = 0; i < lines.length; i++) {
-    var ln = lines[i];
-    if (/^BEGIN:VCARD/i.test(ln)) {
-      if (cur && cur.lines.length) { cur.bad = true; cards.push(cur); }
-      cur = { lines: [], bad: false };
-      continue;
-    }
-    if (/^END:VCARD/i.test(ln)) { if (cur) { cards.push(cur); cur = null; } continue; }
-    if (cur) cur.lines.push(ln);
-  }
-  if (cur && cur.lines.length) { cur.bad = true; cards.push(cur); }
-  var out = [];
-  for (var ci = 0; ci < cards.length; ci++) {
-    var props = cards[ci].lines;
-    var cardBad = cards[ci].bad;
-    var fn = "", n = "", org = "", title = "", noteParts = [];
-    var emails = [], phones = [];
-    var extraFlags = [];
-    for (var pi = 0; pi < props.length; pi++) {
-      var line = props[pi];
-      var cidx = line.indexOf(":");
-      if (cidx < 0) continue; // not a property line
-      var head = line.slice(0, cidx);
-      var val = line.slice(cidx + 1);
-      var parts = head.split(";");
-      var prop = parts[0].toUpperCase();
-      var params = {};
-      for (var qi = 1; qi < parts.length; qi++) {
-        var p = parts[qi];
-        var eq = p.indexOf("=");
-        if (eq < 0) {
-          // vCard 2.1 bare type, e.g. TEL;HOME;VOICE:555
-          params.TYPE = (params.TYPE ? params.TYPE + "," : "") + p.toUpperCase();
-        } else {
-          var k = p.slice(0, eq).toUpperCase();
-          var v = p.slice(eq + 1).toUpperCase();
-          params[k] = params[k] ? params[k] + "," + v : v;
-        }
-      }
-      if (prop === "PHOTO" || prop === "LOGO" || prop === "SOUND" || prop === "KEY") {
-        continue; // payloads are never stored
-      }
-      var enc = params.ENCODING || "";
-      if (enc === "QUOTED-PRINTABLE" || enc === "Q") val = sbDecodeQP(val);
-      else if (enc === "B" || enc === "BASE64") val = sbB64decode(val);
-      val = val.replace(/\\n/gi, "\n").replace(/\\,/g, ",").replace(/\\;/g, ";").replace(/\\\\/g, "\\");
-      if (prop === "FN") { if (!fn) fn = val.trim(); }
-      else if (prop === "N") { if (!n) n = val; }
-      else if (prop === "ORG") { if (!org) org = val.split(";")[0].trim(); }
-      else if (prop === "TITLE") { if (!title) title = val.trim(); }
-      else if (prop === "NOTE") { if (val.trim()) noteParts.push(val.trim()); }
-      else if (prop === "URL") { if (val.trim()) noteParts.push("Website: " + val.trim()); }
-      else if (prop === "ADR") {
-        var ac = val.split(";").map(function (x) { return x.trim(); }).filter(Boolean);
-        if (ac.length) noteParts.push("Address: " + ac.join(", "));
-      }
-      else if (prop === "EMAIL" && val.trim()) { emails.push({ value: val.trim(), type: params.TYPE || "" }); }
-      else if ((prop === "TEL" || prop === "X-ABPHONE") && val.trim()) { phones.push({ value: val.trim(), type: params.TYPE || "" }); }
-    }
-    var name = fn;
-    if (!name && n) {
-      var np = n.split(";");
-      name = [np[3] || "", np[1] || "", np[2] || "", np[0] || "", np[4] || ""]
-        .map(function (x) { return x.trim(); }).filter(Boolean).join(" ");
-    }
-    function pickPref(list, prefTypes) {
-      for (var t = 0; t < prefTypes.length; t++) {
-        for (var j = 0; j < list.length; j++) {
-          if (list[j].type.indexOf(prefTypes[t]) >= 0) return list[j];
-        }
-      }
-      return list[0] || null;
-    }
-    var emailPick = pickPref(emails, ["WORK", "INTERNET", "PREF"]);
-    var phonePick = pickPref(phones, ["CELL", "MOBILE", "WORK", "PREF", "VOICE"]);
-    var email = emailPick ? emailPick.value : "";
-    var phone = phonePick ? phonePick.value : "";
-    var notes = noteParts.join("\n");
-    if (emails.length > 1) {
-      var others = emails.filter(function (e) { return e !== emailPick; })
-        .map(function (e) { return e.value + (e.type ? " (" + e.type.toLowerCase() + ")" : ""); });
-      if (others.length) notes = (notes ? notes + "\n" : "") + "Other emails: " + others.join(", ");
-      extraFlags.push({ code: "multi-email", reason: "vCard has " + emails.length + " emails — kept " + email + ", noted the rest." });
-    }
-    if (phones.length > 1) {
-      var ophones = phones.filter(function (e) { return e !== phonePick; })
-        .map(function (e) { return e.value + (e.type ? " (" + e.type.toLowerCase() + ")" : ""); });
-      if (ophones.length) notes = (notes ? notes + "\n" : "") + "Other phones: " + ophones.join(", ");
-      extraFlags.push({ code: "multi-phone", reason: "vCard has " + phones.length + " phones — kept " + phone + ", noted the rest." });
-    }
-    if (cardBad) {
-      extraFlags.push({ code: "malformed", reason: "vCard is missing its END:VCARD line — parsed what could be read." });
-    }
-    if (!name && !email) {
-      extraFlags.push({ code: "unusable", reason: "No usable name or email — nothing to import from this card." });
-    }
-    out.push({ name: name, title: title, email: email, phone: phone, company: org, notes: notes, extraFlags: extraFlags });
-  }
-  return out;
 }
 
 // ---------------------------------------------------------------- server
@@ -958,8 +383,7 @@ const server = Bun.serve({
         return json({ error: "cannot delete the last workspace" }, 400);
       }
       const counts: Record<string, number> = {};
-      for (const t of ["companies", "contacts", "deals", "tasks", "campaigns", "activities", "captures", "custom_fields", "webhooks", "incoming_hooks", "stages", "sandbox_batches", "sandbox_rows",
-        "email_templates", "email_campaigns", "email_sends", "sms_templates", "sms_campaigns", "sms_sends", "calls", "workspace_settings"]) {
+      for (const t of ["companies", "contacts", "deals", "tasks", "campaigns", "activities", "captures", "custom_fields", "webhooks", "incoming_hooks", "stages", "outreach"]) {
         counts[t] = (db.query(`SELECT COUNT(*) n FROM ${t} WHERE workspace_id = ?`).get(ws.id) as any).n;
       }
       const records = Object.values(counts).reduce((a, b) => a + b, 0);
@@ -987,8 +411,7 @@ const server = Bun.serve({
       for (const f of capFiles) {
         try { await Bun.$`rm -f ${UPLOAD_DIR}/${f.filename}`.quiet(); } catch {}
       }
-      for (const t of ["email_sends", "sms_sends", "deal_stage_history", "task_dependencies", "activities", "captures", "tasks", "deals", "contacts", "campaigns", "companies", "stages", "milton_widgets", "saved_views", "sandbox_rows", "sandbox_batches",
-        "email_campaigns", "sms_campaigns", "email_templates", "sms_templates", "calls", "workspace_settings"]) {
+      for (const t of ["outreach", "activities", "captures", "tasks", "deals", "contacts", "campaigns", "companies", "stages"]) {
         db.prepare(`DELETE FROM ${t} WHERE workspace_id = ?`).run(ws.id);
       }
       db.prepare("DELETE FROM workspaces WHERE id = ?").run(ws.id);
@@ -1070,11 +493,7 @@ const server = Bun.serve({
         if (moveTo) {
           if (moveTo === slug) return json({ error: "move_to must be a different stage" }, 400);
           if (!stageRow(w, moveTo)) return json({ error: `unknown stage "${moveTo}"` }, 400);
-          const movedIds = db
-            .query("SELECT id FROM deals WHERE workspace_id = ? AND stage = ?")
-            .all(w, slug) as any[];
           db.prepare("UPDATE deals SET stage = ? WHERE workspace_id = ? AND stage = ?").run(moveTo, w, slug);
-          for (const m of movedIds) logStageChange(m.id, slug, moveTo, w);
         }
         db.prepare("DELETE FROM stages WHERE workspace_id = ? AND slug = ?").run(w, slug);
         renumberStages(db, w);
@@ -1161,32 +580,16 @@ const server = Bun.serve({
       const w = needWs(req, url);
       if (w instanceof Response) return w;
       const campId = url.searchParams.get("campaign_id");
-      const fOwner = (url.searchParams.get("owner") || "").trim();
-      const fStage = (url.searchParams.get("stage") || "").trim();
-      const fSource = (url.searchParams.get("source") || "").trim();
-      const fMin = Number(url.searchParams.get("min_value") || "");
-      const fSearch = (url.searchParams.get("search") || url.searchParams.get("q") || "").trim();
-      const conds: string[] = [];
-      const params: unknown[] = [w];
-      if (campId) { conds.push("d.campaign_id = ?"); params.push(Number(campId)); }
-      if (fOwner) { conds.push("d.owner = ?"); params.push(fOwner); }
-      if (fStage) { conds.push("d.stage = ?"); params.push(fStage); }
-      if (fSource) { conds.push("d.source = ?"); params.push(fSource); }
-      if (fMin) { conds.push("d.value >= ?"); params.push(fMin); }
-      if (fSearch) {
-        conds.push("(d.title LIKE ? OR c.name LIKE ?)");
-        params.push(`%${fSearch}%`, `%${fSearch}%`);
-      }
       const rows = db
         .query(
           `SELECT d.*, c.name AS company_name, ct.name AS contact_name
            FROM deals d
            LEFT JOIN companies c ON c.id = d.company_id
            LEFT JOIN contacts ct ON ct.id = d.contact_id
-           WHERE d.workspace_id = ?${conds.length ? " AND " + conds.join(" AND ") : ""}
+           WHERE d.workspace_id = ?${campId ? " AND d.campaign_id = ?" : ""}
            ORDER BY d.updated_at DESC`
         )
-        .all(...params);
+        .all(w, ...(campId ? [Number(campId)] : []));
       const wsStages = workspaceStages(db, w);
       const labels: Record<string, string> = {};
       for (const s of wsStages) labels[s.slug] = s.name;
@@ -1201,8 +604,8 @@ const server = Bun.serve({
       const r = db
         .prepare(
           `INSERT INTO deals (title, company_id, contact_id, value, stage,
-           probability, expected_close, owner, source, campaign_id, workspace_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           probability, expected_close, owner, campaign_id, workspace_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           b.title || "Untitled deal",
@@ -1213,12 +616,10 @@ const server = Bun.serve({
           Number(b.probability ?? 10),
           b.expected_close || "",
           b.owner || "",
-          String(b.source || "").trim(),
           campaignId,
           w
         );
       const deal = dealJson(Number(r.lastInsertRowid), w);
-      logStageChange(Number(r.lastInsertRowid), "", (deal as any).stage, w); // "opened"
       logActivity("deal", `${(deal as any).title} created`, w);
       fireWebhooks("deal.created", deal as any, w);
       return json({ deal }, 201);
@@ -1235,7 +636,7 @@ const server = Bun.serve({
       }
       const sets: string[] = [];
       const vals: unknown[] = [];
-      for (const k of ["title", "value", "stage", "probability", "expected_close", "owner", "source", "company_id", "contact_id"]) {
+      for (const k of ["title", "value", "stage", "probability", "expected_close", "owner", "company_id", "contact_id"]) {
         if (b[k] !== undefined) {
           sets.push(`${k} = ?`);
           vals.push(b[k]);
@@ -1254,7 +655,6 @@ const server = Bun.serve({
       const after = dealJson(Number(dealId[1]), w) as any;
       if (before.stage !== after.stage) {
         const stageName = (db.query("SELECT name FROM stages WHERE workspace_id = ? AND slug = ?").get(w, after.stage) as any)?.name || after.stage;
-        logStageChange(Number(dealId[1]), before.stage, after.stage, w);
         logActivity("deal", `${after.title} moved to ${stageName}`, w);
         fireWebhooks("deal.stage_changed", {
           ...after,
@@ -1272,52 +672,8 @@ const server = Bun.serve({
         .query("SELECT id FROM deals WHERE id = ? AND workspace_id = ?")
         .get(Number(dealId[1]), w);
       if (!exists) return json({ error: "not found" }, 404);
-      db.prepare("DELETE FROM deal_stage_history WHERE deal_id = ?").run(Number(dealId[1]));
-      // calls referring to this deal are deleted entirely
-      db.prepare("DELETE FROM calls WHERE deal_id = ? AND workspace_id = ?").run(Number(dealId[1]), w);
       db.prepare("DELETE FROM deals WHERE id = ?").run(Number(dealId[1]));
       return json({ ok: true });
-    }
-
-    // ---- deal stage history: GET /api/deals/:id/history (chronological)
-    const dealHistory = path.match(/^\/api\/deals\/(\d+)\/history$/);
-    if (dealHistory && method === "GET") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const exists = db
-        .query("SELECT id FROM deals WHERE id = ? AND workspace_id = ?")
-        .get(Number(dealHistory[1]), w);
-      if (!exists) return json({ error: "not found" }, 404);
-      const rows = db
-        .query(
-          `SELECT id, from_stage, to_stage, created_at FROM deal_stage_history
-           WHERE deal_id = ? AND workspace_id = ? ORDER BY id`
-        )
-        .all(Number(dealHistory[1]), w) as any[];
-      const names: Record<string, string> = {};
-      for (const s of db.query("SELECT slug, name FROM stages WHERE workspace_id = ?").all(w) as any[])
-        names[s.slug] = s.name;
-      return json({
-        history: rows.map((r) => ({
-          ...r,
-          from_name: r.from_stage ? (names[r.from_stage] || r.from_stage) : null,
-          to_name: names[r.to_stage] || r.to_stage,
-        })),
-      });
-    }
-
-    // ---- deal sources: distinct non-null sources in the workspace (datalist suggestions)
-    if (path === "/api/deal-sources" && method === "GET") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const rows = db
-        .query(
-          `SELECT DISTINCT source FROM deals
-           WHERE workspace_id = ? AND source IS NOT NULL AND TRIM(source) <> ''
-           ORDER BY source`
-        )
-        .all(w) as any[];
-      return json({ sources: rows.map((r) => r.source) });
     }
 
     // ---- contacts
@@ -1348,13 +704,9 @@ const server = Bun.serve({
       if (campaignId === false) return json({ error: "unknown campaign_id" }, 400);
       const r = db
         .prepare(
-          "INSERT INTO contacts (company_id, name, title, email, phone, sms_gateway, email_opt_out, sms_opt_out, campaign_id, workspace_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          "INSERT INTO contacts (company_id, name, title, email, phone, campaign_id, workspace_id) VALUES (?, ?, ?, ?, ?, ?, ?)"
         )
-        .run(
-          b.company_id || null, b.name || "Unnamed", b.title || "", b.email || "",
-          b.phone || "", b.sms_gateway || "", b.email_opt_out ? 1 : 0,
-          b.sms_opt_out ? 1 : 0, campaignId, w
-        );
+        .run(b.company_id || null, b.name || "Unnamed", b.title || "", b.email || "", b.phone || "", campaignId, w);
       const id = Number(r.lastInsertRowid);
       saveCustomValues("contact", id, b.custom, w);
       const contact = attachCustom("contact", [
@@ -1375,16 +727,10 @@ const server = Bun.serve({
       if (!contactExists) return json({ error: "not found" }, 404);
       const sets: string[] = [];
       const vals: unknown[] = [];
-      for (const k of ["company_id", "name", "title", "email", "phone", "sms_gateway"]) {
+      for (const k of ["company_id", "name", "title", "email", "phone"]) {
         if (b[k] !== undefined) {
           sets.push(`${k} = ?`);
           vals.push(k === "company_id" && b[k] === "" ? null : b[k]);
-        }
-      }
-      for (const k of ["email_opt_out", "sms_opt_out"]) {
-        if (b[k] !== undefined) {
-          sets.push(`${k} = ?`);
-          vals.push(b[k] ? 1 : 0);
         }
       }
       if (b.campaign_id !== undefined) {
@@ -1402,44 +748,6 @@ const server = Bun.serve({
         db.query("SELECT * FROM contacts WHERE id = ?").get(Number(contactId[1])) as any,
       ])[0];
       return json({ contact: updatedContact });
-    }
-    if (contactId && method === "DELETE") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const b = await readBody(req);
-      const cid = Number(contactId[1]);
-      const co = db
-        .query("SELECT id, name FROM contacts WHERE id = ? AND workspace_id = ?")
-        .get(cid, w) as any;
-      if (!co) return json({ error: "not found" }, 404);
-      const confirm = b.confirm === true || url.searchParams.get("confirm") === "true";
-      const deals = Number(
-        (db.query("SELECT COUNT(*) AS n FROM deals WHERE contact_id = ? AND workspace_id = ?").get(cid, w) as any).n
-      );
-      const captures = Number(
-        (db.query("SELECT COUNT(*) AS n FROM captures WHERE contact_id = ?").get(cid) as any).n
-      );
-      const linked = deals + captures;
-      if (linked > 0 && !confirm) {
-        return json(
-          {
-            error: `contact "${co.name}" has ${linked} linked record(s) — pass confirm:true to orphan and delete`,
-            deals,
-            captures,
-            hint: "pass confirm:true to orphan and delete",
-          },
-          409
-        );
-      }
-      // Orphan linked records; calls referring to this contact are deleted entirely.
-      db.prepare("UPDATE deals SET contact_id = NULL WHERE contact_id = ? AND workspace_id = ?").run(cid, w);
-      db.prepare("UPDATE captures SET contact_id = NULL WHERE contact_id = ?").run(cid);
-      db.prepare("DELETE FROM calls WHERE contact_id = ? AND workspace_id = ?").run(cid, w);
-      db.prepare("DELETE FROM custom_values WHERE entity = 'contact' AND record_id = ?").run(cid);
-      db.prepare("DELETE FROM contacts WHERE id = ? AND workspace_id = ?").run(cid, w);
-      logActivity("contact", `Deleted: ${co.name}${linked ? ` (${linked} linked record(s) orphaned)` : ""}`, w);
-      fireWebhooks("contact.deleted", { id: cid, name: co.name, workspace_id: w }, w);
-      return json({ ok: true, orphaned: { deals, captures } });
     }
 
     // ---- CSV import: POST { csv: "..." } with header row
@@ -1527,321 +835,6 @@ const server = Bun.serve({
       );
     }
 
-    // ---- data sandbox: staged mass contact imports ---------------------------------
-    // Nothing here touches the live contacts table until a batch is committed.
-    // Every row is deduplicated (vs existing contacts + within the batch) and
-    // flagged for obviously problematic data points before review.
-    const sbNormEmail = (e: string) => String(e || "").trim().toLowerCase();
-    const sbNormName = (n: string) =>
-      String(n || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
-    function sbLevenshtein(a: string, b: string): number {
-      if (a === b) return 0;
-      const m = a.length, n = b.length;
-      if (!m) return n; if (!n) return m;
-      let prev = Array.from({ length: n + 1 }, (_, i) => i);
-      for (let i = 1; i <= m; i++) {
-        const cur = [i];
-        for (let j = 1; j <= n; j++) {
-          cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
-        }
-        prev = cur;
-      }
-      return prev[n];
-    }
-    // Two names match when they are identical after normalization, share the
-    // same first + last token (middle names/initials ignored), or differ by a
-    // small typo (edit distance <= 2).
-    function sbNamesMatch(a: string, b: string): boolean {
-      const na = sbNormName(a), nb = sbNormName(b);
-      if (!na || !nb) return false;
-      if (na === nb) return true;
-      const ta = na.split(" "), tb = nb.split(" ");
-      if (ta.length > 1 && tb.length > 1 && ta[0] === tb[0] && ta[ta.length - 1] === tb[tb.length - 1]) return true;
-      if (Math.abs(na.length - nb.length) <= 2 && sbLevenshtein(na, nb) <= 2) return true;
-      return false;
-    }
-    type SbFlag = { code: string; reason: string };
-    function sbFlagRow(r: { name: string; title: string; email: string; phone: string; company: string; notes: string }): SbFlag[] {
-      const flags: SbFlag[] = [];
-      const name = String(r.name || "").trim();
-      const email = String(r.email || "").trim();
-      const phone = String(r.phone || "").trim();
-      if (!name) flags.push({ code: "missing-name", reason: "No name — this row needs a name before it can be imported." });
-      if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
-        flags.push({ code: "bad-email", reason: `"${email}" is not a valid email address.` });
-      }
-      if (phone) {
-        const digits = phone.replace(/\D/g, "");
-        if (/[a-zA-Z]/.test(phone) || digits.length < 7) {
-          flags.push({ code: "bad-phone", reason: `"${phone}" is not a valid phone number.` });
-        }
-      }
-      const junkRe = /^(test|tests|testing|asdf+|qwerty+|xxx+|lorem|ipsum|foo|bar|baz|n\/a|na|none|null|undefined|tbd|todo|sample|example|demo)$/i;
-      const repeatedRe = /^(.)\1{3,}$/;
-      for (const [label, v] of [["name", name], ["title", r.title], ["company", r.company]] as [string, string][]) {
-        const t = String(v || "").trim();
-        const compact = t.toLowerCase().replace(/[^a-z0-9]/g, "");
-        if (t && (junkRe.test(t) || (compact.length >= 4 && repeatedRe.test(compact)))) {
-          flags.push({ code: "junk", reason: `${label} "${t}" looks like junk data.` });
-        }
-      }
-      if (name.length > 3 && /[A-Z]/.test(name) && name === name.toUpperCase()) {
-        flags.push({ code: "all-caps", reason: "Name is ALL CAPS — probably a formatting glitch." });
-      }
-      if (name.length > 3 && /[a-z]/.test(name) && !/[A-Z]/.test(name)) {
-        flags.push({ code: "no-caps", reason: "Name has no capital letters — may need cleanup." });
-      }
-      for (const [label, v, max] of [["name", name, 120], ["title", r.title, 120], ["email", email, 200], ["phone", phone, 60], ["company", r.company, 160], ["notes", r.notes, 2000]] as [string, string, number][]) {
-        const t = String(v || "").trim();
-        if (t.length > max) flags.push({ code: "too-long", reason: `${label} is unusually long (${t.length} characters).` });
-      }
-      return flags;
-    }
-    // Recompute status / dup links / flags for every row of a batch.
-    function sbAnalyzeBatch(batchId: number, w: number): void {
-      const rows = db
-        .query("SELECT * FROM sandbox_rows WHERE batch_id = ? AND workspace_id = ? ORDER BY row_num, id")
-        .all(batchId, w) as any[];
-      const existing = db
-        .query("SELECT id, name, email FROM contacts WHERE workspace_id = ?")
-        .all(w) as any[];
-      const upd = db.prepare(
-        "UPDATE sandbox_rows SET status = ?, dup_of_contact_id = ?, dup_of_row_id = ?, flags = ? WHERE id = ?"
-      );
-      const seen: any[] = [];
-      for (const r of rows) {
-        const email = sbNormEmail(r.email);
-        let dupContact: any = null;
-        let dupRow: any = null;
-        if (email) {
-          dupContact = existing.find((c: any) => sbNormEmail(c.email) === email) || null;
-          if (!dupContact) dupRow = seen.find((s: any) => sbNormEmail(s.email) === email) || null;
-        }
-        if (!dupContact && !dupRow) {
-          dupContact = existing.find((c: any) => sbNamesMatch(c.name, r.name)) || null;
-          if (!dupContact) dupRow = seen.find((s: any) => sbNamesMatch(s.name, r.name)) || null;
-        }
-        const flags = sbFlagRow(r).concat(JSON.parse(r.extra_flags || "[]"));
-        const status = dupContact || dupRow ? "duplicate" : flags.length ? "flagged" : "clean";
-        upd.run(status, dupContact ? dupContact.id : 0, dupRow ? dupRow.id : 0, JSON.stringify(flags), r.id);
-        seen.push(r);
-      }
-      const n = (db.query("SELECT COUNT(*) n FROM sandbox_rows WHERE batch_id = ?").get(batchId) as any).n;
-      db.prepare("UPDATE sandbox_batches SET row_count = ? WHERE id = ?").run(n, batchId);
-    }
-    function sbBatchOr404(id: number, w: number): any {
-      return (db.query("SELECT * FROM sandbox_batches WHERE id = ? AND workspace_id = ?").get(id, w) as any) || null;
-    }
-    function sbSummary(batchId: number): Record<string, number> {
-      const rows = db.query("SELECT status, decision FROM sandbox_rows WHERE batch_id = ?").all(batchId) as any[];
-      const s: Record<string, number> = { total: rows.length, clean: 0, duplicates: 0, flagged: 0, approved: 0, rejected: 0, pending: 0 };
-      for (const r of rows) {
-        if (r.status === "clean") s.clean++;
-        else if (r.status === "duplicate") s.duplicates++;
-        else if (r.status === "flagged") s.flagged++;
-        if (r.decision === "approved") s.approved++;
-        else if (r.decision === "rejected") s.rejected++;
-        else s.pending++;
-      }
-      return s;
-    }
-    // POST /api/sandbox/batches { name?, filename?, csv } — stage a CSV import
-    // or { name?, filename?, vcf } — stage a vCard (.vcf) import. The filename
-    // may also carry the .vcf extension with the payload in `csv` (robustness).
-    if (path === "/api/sandbox/batches" && method === "POST") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const b = await readBody(req);
-      const rawCsv = String(b.csv || "");
-      const rawVcf = String(b.vcf || "");
-      const fname = String(b.filename || "");
-      const wantVcf = rawVcf.length > 0 || (/\.vcf$/i.test(fname) && /^\s*BEGIN:VCARD/mi.test(rawCsv));
-      const raw = wantVcf ? (rawVcf || rawCsv) : rawCsv;
-      if (!raw) return json({ error: "empty upload" }, 400);
-      if (raw.length > 5 * 1024 * 1024) return json({ error: `${wantVcf ? "VCF" : "CSV"} is too large (5 MB max)` }, 400);
-      const warnings: string[] = [];
-      if (raw.includes("�")) warnings.push("Some characters could not be decoded — check the file encoding (UTF-8 works best).");
-      let staged: { name: string; title: string; email: string; phone: string; company: string; notes: string; extraFlags: SbFlag[] }[];
-      if (wantVcf) {
-        staged = parseVcf(raw);
-        if (!staged.length) return json({ error: "no vCards found in this file" }, 400);
-        if (staged.length > 5000) return json({ error: "too many vCards (5,000 max per batch)" }, 400);
-      } else {
-        const firstLine = raw.split(/\r?\n/, 1)[0] || "";
-        if (firstLine && !firstLine.includes(",") && (firstLine.includes(";") || firstLine.includes("\t"))) {
-          return json({ error: "This looks like a semicolon/tab-delimited file — please export it as comma-separated CSV and try again." }, 400);
-        }
-        const rows = parseCsv(raw);
-        if (!rows.length) return json({ error: "empty CSV" }, 400);
-        if (rows.length - 1 > 5000) return json({ error: "too many rows (5,000 max per batch)" }, 400);
-        const header = rows[0].map((h) => h.trim().toLowerCase());
-        const col = (...names: string[]) => {
-          for (const n of names) { const i = header.indexOf(n); if (i >= 0) return i; }
-          return -1;
-        };
-        const iName = col("name", "full name", "contact", "contact name", "fullname");
-        const iTitle = col("title", "job title", "role", "position");
-        const iCompany = col("company", "company name", "organization", "organisation");
-        const iEmail = col("email", "e-mail", "email address");
-        const iPhone = col("phone", "phone number", "tel", "mobile", "cell");
-        const iNotes = col("notes", "note", "comments", "comment", "memo");
-        const cell = (r: string[], i: number) => (i >= 0 ? (r[i] || "").trim() : "");
-        staged = rows.slice(1).map((r) => ({
-          name: cell(r, iName), title: cell(r, iTitle), email: cell(r, iEmail),
-          phone: cell(r, iPhone), company: cell(r, iCompany), notes: cell(r, iNotes),
-          extraFlags: [] as SbFlag[],
-        }));
-      }
-      const name = String(b.name || "").trim() || `Import ${new Date().toISOString().slice(0, 10)}`;
-      const batchId = Number(
-        db.prepare("INSERT INTO sandbox_batches (workspace_id, name, filename, source) VALUES (?, ?, ?, ?)")
-          .run(w, name, fname.slice(0, 200), wantVcf ? "vcf" : "csv").lastInsertRowid
-      );
-      const ins = db.prepare(
-        "INSERT INTO sandbox_rows (batch_id, workspace_id, row_num, name, title, email, phone, company, notes, extra_flags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-      );
-      staged.forEach((s, n) => {
-        ins.run(batchId, w, n + 1, s.name, s.title, s.email, s.phone, s.company, s.notes, JSON.stringify(s.extraFlags || []));
-      });
-      sbAnalyzeBatch(batchId, w);
-      const batch = db.query("SELECT * FROM sandbox_batches WHERE id = ?").get(batchId);
-      return json({ batch, summary: sbSummary(batchId), warnings }, 201);
-    }
-    // GET /api/sandbox/batches — list batches with summaries
-    if (path === "/api/sandbox/batches" && method === "GET") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const batches = db
-        .query("SELECT * FROM sandbox_batches WHERE workspace_id = ? ORDER BY id DESC")
-        .all(w) as any[];
-      return json({ batches: batches.map((x: any) => ({ ...x, summary: sbSummary(x.id) })) });
-    }
-    const sbBatchId = path.match(/^\/api\/sandbox\/batches\/(\d+)$/);
-    // GET /api/sandbox/batches/:id — batch + rows (dup links resolved)
-    if (sbBatchId && method === "GET") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const batch = sbBatchOr404(Number(sbBatchId[1]), w);
-      if (!batch) return json({ error: "not found" }, 404);
-      const rows = db
-        .query("SELECT * FROM sandbox_rows WHERE batch_id = ? AND workspace_id = ? ORDER BY row_num, id")
-        .all(batch.id, w) as any[];
-      const contactIds = rows.map((r: any) => r.dup_of_contact_id).filter((x: number) => x > 0);
-      const rowIds = rows.map((r: any) => r.dup_of_row_id).filter((x: number) => x > 0);
-      const cById = new Map<number, any>();
-      if (contactIds.length) {
-        for (const c of db.query(`SELECT id, name, email FROM contacts WHERE id IN (${contactIds.map(() => "?").join(",")})`).all(...contactIds) as any[]) cById.set(c.id, c);
-      }
-      const rById = new Map<number, any>();
-      if (rowIds.length) {
-        for (const r of db.query(`SELECT id, row_num, name, email FROM sandbox_rows WHERE id IN (${rowIds.map(() => "?").join(",")})`).all(...rowIds) as any[]) rById.set(r.id, r);
-      }
-      return json({
-        batch: { ...batch, summary: sbSummary(batch.id) },
-        rows: rows.map((r: any) => ({
-          ...r,
-          flags: JSON.parse(r.flags || "[]"),
-          dup_contact: r.dup_of_contact_id ? cById.get(r.dup_of_contact_id) || null : null,
-          dup_row: r.dup_of_row_id ? rById.get(r.dup_of_row_id) || null : null,
-        })),
-      });
-    }
-    // DELETE /api/sandbox/batches/:id — delete staged rows + batch; never live contacts
-    if (sbBatchId && method === "DELETE") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const batch = sbBatchOr404(Number(sbBatchId[1]), w);
-      if (!batch) return json({ error: "not found" }, 404);
-      const n = (db.query("SELECT COUNT(*) n FROM sandbox_rows WHERE batch_id = ?").get(batch.id) as any).n;
-      db.prepare("DELETE FROM sandbox_rows WHERE batch_id = ?").run(batch.id);
-      db.prepare("DELETE FROM sandbox_batches WHERE id = ?").run(batch.id);
-      return json({ ok: true, deleted_rows: n });
-    }
-    // POST /api/sandbox/batches/:id/decision { action } — bulk approve-clean / reject-duplicates
-    const sbDecision = path.match(/^\/api\/sandbox\/batches\/(\d+)\/decision$/);
-    if (sbDecision && method === "POST") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const batch = sbBatchOr404(Number(sbDecision[1]), w);
-      if (!batch) return json({ error: "not found" }, 404);
-      if (batch.status !== "open") return json({ error: "batch is already complete" }, 400);
-      const b = await readBody(req);
-      let changed = 0;
-      if (b.action === "approve-clean") {
-        changed = Number(db.prepare("UPDATE sandbox_rows SET decision = 'approved' WHERE batch_id = ? AND workspace_id = ? AND status = 'clean' AND decision = 'pending'").run(batch.id, w).changes);
-      } else if (b.action === "reject-duplicates") {
-        // Also rejects vCard rows flagged unusable (no name and no email) —
-        // there is nothing worth importing in them.
-        changed = Number(db.prepare(
-          "UPDATE sandbox_rows SET decision = 'rejected' WHERE batch_id = ? AND workspace_id = ? AND decision = 'pending' AND (status = 'duplicate' OR flags LIKE '%\"code\":\"unusable\"%')"
-        ).run(batch.id, w).changes);
-      } else {
-        return json({ error: 'unknown action (use "approve-clean" or "reject-duplicates")' }, 400);
-      }
-      return json({ ok: true, changed, summary: sbSummary(batch.id) });
-    }
-    // POST /api/sandbox/batches/:id/commit — import approved, non-duplicate rows
-    const sbCommit = path.match(/^\/api\/sandbox\/batches\/(\d+)\/commit$/);
-    if (sbCommit && method === "POST") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const batch = sbBatchOr404(Number(sbCommit[1]), w);
-      if (!batch) return json({ error: "not found" }, 404);
-      if (batch.status !== "open") return json({ error: "batch is already complete" }, 400);
-      const rows = db
-        .query("SELECT * FROM sandbox_rows WHERE batch_id = ? AND workspace_id = ? AND decision = 'approved' ORDER BY row_num, id")
-        .all(batch.id, w) as any[];
-      const companyCache = new Map<string, number>();
-      const companyIdFor = (nm: string): number | null => {
-        const key = nm.trim().toLowerCase();
-        if (!key) return null;
-        const hit = companyCache.get(key);
-        if (hit !== undefined) return hit;
-        const existing = db.query("SELECT id FROM companies WHERE lower(name) = ? AND workspace_id = ?").get(key, w) as any;
-        const id = existing ? existing.id : Number(db.prepare("INSERT INTO companies (name, workspace_id) VALUES (?, ?)").run(nm.trim(), w).lastInsertRowid);
-        companyCache.set(key, id);
-        return id;
-      };
-      let imported = 0, skipped = 0;
-      const ins = db.prepare("INSERT INTO contacts (company_id, name, title, email, phone, workspace_id) VALUES (?, ?, ?, ?, ?, ?)");
-      for (const r of rows) {
-        if (r.status === "duplicate") { skipped++; continue; }
-        ins.run(companyIdFor(r.company || ""), r.name || "Unnamed", r.title || "", r.email || "", r.phone || "", w);
-        imported++;
-      }
-      db.prepare("UPDATE sandbox_batches SET status = 'complete', completed_at = datetime('now') WHERE id = ?").run(batch.id);
-      // bulk commits intentionally don't fire outgoing webhooks
-      logActivity("contact", `Sandbox import "${batch.name}": ${imported} contact${imported === 1 ? "" : "s"} imported, ${skipped} duplicate${skipped === 1 ? "" : "s"} skipped`, w);
-      return json({ ok: true, imported, skipped, summary: sbSummary(batch.id) });
-    }
-    // PATCH /api/sandbox/rows/:id — edit fields (re-analyzes the batch) or set decision
-    const sbRowId = path.match(/^\/api\/sandbox\/rows\/(\d+)$/);
-    if (sbRowId && method === "PATCH") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const row = db.query("SELECT * FROM sandbox_rows WHERE id = ? AND workspace_id = ?").get(Number(sbRowId[1]), w) as any;
-      if (!row) return json({ error: "not found" }, 404);
-      const batch = sbBatchOr404(row.batch_id, w);
-      if (!batch) return json({ error: "batch not found" }, 404);
-      if (batch.status !== "open") return json({ error: "batch is already complete" }, 400);
-      const b = await readBody(req);
-      if (b.decision !== undefined) {
-        if (!["pending", "approved", "rejected"].includes(b.decision)) return json({ error: "bad decision" }, 400);
-        db.prepare("UPDATE sandbox_rows SET decision = ? WHERE id = ?").run(b.decision, row.id);
-      }
-      const sets: string[] = [];
-      const vals: unknown[] = [];
-      for (const k of ["name", "title", "email", "phone", "company", "notes"]) {
-        if (b[k] !== undefined) { sets.push(`${k} = ?`); vals.push(String(b[k]).trim()); }
-      }
-      if (sets.length) {
-        db.prepare(`UPDATE sandbox_rows SET ${sets.join(", ")} WHERE id = ?`).run(...vals, row.id);
-        sbAnalyzeBatch(row.batch_id, w);
-      }
-      const updated = db.query("SELECT * FROM sandbox_rows WHERE id = ?").get(row.id);
-      return json({ row: updated, summary: sbSummary(row.batch_id) });
-    }
-
     // ---- companies
     if (path === "/api/companies" && method === "GET") {
       const w = needWs(req, url);
@@ -1911,50 +904,6 @@ const server = Bun.serve({
       ])[0];
       return json({ company: updatedCompany });
     }
-    if (companyId && method === "DELETE") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const b = await readBody(req);
-      const cid = Number(companyId[1]);
-      const co = db
-        .query("SELECT id, name FROM companies WHERE id = ? AND workspace_id = ?")
-        .get(cid, w) as any;
-      if (!co) return json({ error: "not found" }, 404);
-      const confirm = b.confirm === true || url.searchParams.get("confirm") === "true";
-      const contacts = Number(
-        (db.query("SELECT COUNT(*) AS n FROM contacts WHERE company_id = ? AND workspace_id = ?").get(cid, w) as any).n
-      );
-      const deals = Number(
-        (db.query("SELECT COUNT(*) AS n FROM deals WHERE company_id = ? AND workspace_id = ?").get(cid, w) as any).n
-      );
-      const campaigns = Number(
-        (db.query("SELECT COUNT(*) AS n FROM campaigns WHERE company_id = ? AND workspace_id = ?").get(cid, w) as any).n
-      );
-      const linked = contacts + deals + campaigns;
-      if (linked > 0 && !confirm) {
-        return json(
-          {
-            error: `company "${co.name}" has ${linked} linked record(s) — pass confirm:true to orphan and delete`,
-            contacts,
-            deals,
-            campaigns,
-            hint: "pass confirm:true to orphan and delete",
-          },
-          409
-        );
-      }
-      // Orphan linked records; never cascade-delete them.
-      db.prepare("UPDATE contacts SET company_id = NULL WHERE company_id = ? AND workspace_id = ?").run(cid, w);
-      // calls referring to this company are deleted entirely
-      db.prepare("DELETE FROM calls WHERE company_id = ? AND workspace_id = ?").run(cid, w);
-      db.prepare("UPDATE deals SET company_id = NULL WHERE company_id = ? AND workspace_id = ?").run(cid, w);
-      db.prepare("UPDATE campaigns SET company_id = NULL WHERE company_id = ? AND workspace_id = ?").run(cid, w);
-      db.prepare("DELETE FROM custom_values WHERE entity = 'company' AND record_id = ?").run(cid);
-      db.prepare("DELETE FROM companies WHERE id = ? AND workspace_id = ?").run(cid, w);
-      logActivity("company", `Deleted: ${co.name}${linked ? ` (${linked} linked record(s) orphaned)` : ""}`, w);
-      fireWebhooks("company.deleted", { id: cid, name: co.name, workspace_id: w }, w);
-      return json({ ok: true, orphaned: { contacts, deals, campaigns } });
-    }
 
     // ---- tasks
     if (path === "/api/tasks" && method === "GET") {
@@ -1967,10 +916,7 @@ const server = Bun.serve({
       q += cid ? ` WHERE t.workspace_id = ? AND t.campaign_id = ?` : ` WHERE t.workspace_id = ?`;
       if (cid) params.push(Number(cid));
       q += ` ORDER BY t.done, t.due_date`;
-      const rows = attachTaskDeps(
-        attachCustom("task", db.query(q).all(...params) as any[]),
-        w
-      );
+      const rows = attachCustom("task", db.query(q).all(...params) as any[]);
       return json({ tasks: rows });
     }
     if (path === "/api/tasks" && method === "POST") {
@@ -2023,60 +969,21 @@ const server = Bun.serve({
         .get(Number(taskId[1]), w) as any;
       if (t) {
         db.prepare("DELETE FROM custom_values WHERE entity = 'task' AND record_id = ?").run(t.id);
-        db.prepare("DELETE FROM task_dependencies WHERE task_id = ? OR depends_on_task_id = ?").run(t.id, t.id);
         db.prepare("DELETE FROM tasks WHERE id = ?").run(t.id);
         fireWebhooks("task.deleted", { id: t.id, title: t.title, workspace_id: w }, w);
       } else {
+        return json({ error: "not found" }, 404);
       }
       return json({ ok: true });
-    }
-
-    // ---- task dependencies: POST /api/tasks/:id/dependencies {depends_on:[ids]}
-    // replace semantics — the list is the full new predecessor set.
-    const taskDeps = path.match(/^\/api\/tasks\/(\d+)\/dependencies$/);
-    if (taskDeps && method === "POST") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const tid = Number(taskDeps[1]);
-      const exists = db
-        .query("SELECT id FROM tasks WHERE id = ? AND workspace_id = ?")
-        .get(tid, w);
-      if (!exists) return json({ error: "not found" }, 404);
-      const b = await readBody(req);
-      const ids = Array.isArray(b.depends_on) ? [...new Set(b.depends_on.map(Number).filter((n) => n > 0))] : [];
-      if (ids.includes(tid)) return json({ error: "a task cannot depend on itself" }, 400);
-      for (const id of ids) {
-        const hit = db
-          .query("SELECT id FROM tasks WHERE id = ? AND workspace_id = ?")
-          .get(id, w);
-        if (!hit) return json({ error: `task ${id} not found in this workspace` }, 400);
-      }
-      if (depWouldCycle(tid, ids, w)) {
-        return json({ error: "adding these dependencies would create a cycle" }, 400);
-      }
-      const ins = db.prepare(
-        "INSERT OR IGNORE INTO task_dependencies (task_id, depends_on_task_id, workspace_id) VALUES (?, ?, ?)"
-      );
-      db.prepare("DELETE FROM task_dependencies WHERE task_id = ? AND workspace_id = ?").run(tid, w);
-      for (const id of ids) ins.run(tid, id, w);
-      return json({ task_id: tid, ...taskDepsJson(tid, w) });
     }
     const taskToggle = path.match(/^\/api\/tasks\/(\d+)\/toggle$/);
     if (taskToggle && method === "POST") {
       const w = needWs(req, url);
       if (w instanceof Response) return w;
-      const b = await readBody(req);
       const t = db
         .query("SELECT * FROM tasks WHERE id = ? AND workspace_id = ?")
         .get(Number(taskToggle[1]), w) as any;
       if (!t) return json({ error: "not found" }, 404);
-      if (!t.done) {
-        // Completing a task with unfinished predecessors needs an explicit override.
-        const open = (taskDepsJson(t.id, w).blocked_by as any[]).filter((p) => !p.done);
-        if (open.length && b.confirm !== true) {
-          return json({ error: "blocked", blocked_by: open.map((p) => ({ id: p.id, title: p.title })) }, 409);
-        }
-      }
       db.prepare("UPDATE tasks SET done = ? WHERE id = ?").run(t.done ? 0 : 1, t.id);
       const updated = db.query("SELECT * FROM tasks WHERE id = ?").get(t.id);
       if (!t.done) {
@@ -2285,127 +1192,6 @@ const server = Bun.serve({
       return json({ ok: true });
     }
 
-    // ---- custom fields: Milton-friendly aliases + value upsert ------------------
-    const ENTITY_TABLES: Record<string, string> = {
-      contact: "contacts",
-      company: "companies",
-      campaign: "campaigns",
-      task: "tasks",
-    };
-    const CF_ALIAS_TYPES = ["text", "number", "date", "checkbox"];
-    const needEntityType = (raw: string | null) => {
-      const entity = raw || "";
-      if (!CUSTOM_ENTITIES.includes(entity))
-        return { error: `entity_type must be one of: ${CUSTOM_ENTITIES.join(", ")}` };
-      return { entity };
-    };
-    if (path === "/api/custom-fields" && method === "GET") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const { entity, error } = needEntityType(url.searchParams.get("entity_type"));
-      if (error) return json({ error }, 400);
-      return json({ fields: getCustomFields(entity!, w) });
-    }
-    if (path === "/api/custom-fields" && method === "POST") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const b = await readBody(req);
-      const { entity, error } = needEntityType(String(b.entity_type || "") || null);
-      if (error) return json({ error }, 400);
-      const name = String(b.name || "").trim();
-      const ftype = String(b.field_type || "text");
-      if (!name) return json({ error: "name is required" }, 400);
-      if (!CF_ALIAS_TYPES.includes(ftype))
-        return json({ error: `field_type must be one of: ${CF_ALIAS_TYPES.join(", ")}` }, 400);
-      const slug = slugify(name);
-      if (CORE_COLUMNS[entity!].includes(slug)) return json({ error: `"${name}" is a built-in field` }, 400);
-      const dupe = db
-        .query("SELECT id FROM custom_fields WHERE entity = ? AND workspace_id = ? AND name = ?")
-        .get(entity, w, slug);
-      if (dupe) return json({ error: `custom field "${name}" already exists for ${entity}s` }, 400);
-      const pos = (
-        db
-          .query("SELECT COALESCE(MAX(position), -1) + 1 AS p FROM custom_fields WHERE entity = ? AND workspace_id = ?")
-          .get(entity, w) as any
-      ).p;
-      const r = db
-        .prepare(
-          "INSERT INTO custom_fields (entity, name, label, type, options, required, position, workspace_id) VALUES (?, ?, ?, ?, '[]', 0, ?, ?)"
-        )
-        .run(entity, slug, name, ftype, pos, w);
-      const field = db.query("SELECT * FROM custom_fields WHERE id = ?").get(Number(r.lastInsertRowid));
-      logActivity("note", `Added custom field "${name}" to ${entity}s`, w);
-      return json({ field }, 201);
-    }
-    const cfAliasId = path.match(/^\/api\/custom-fields\/(\d+)$/);
-    if (cfAliasId && method === "DELETE") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const f = db
-        .query("SELECT * FROM custom_fields WHERE id = ? AND workspace_id = ?")
-        .get(Number(cfAliasId[1]), w) as any;
-      if (!f) return json({ error: "not found" }, 404);
-      db.prepare("DELETE FROM custom_values WHERE field_id = ?").run(f.id);
-      db.prepare("DELETE FROM custom_fields WHERE id = ?").run(f.id);
-      logActivity("note", `Removed custom field "${f.label}" from ${f.entity}s`, w);
-      return json({ ok: true });
-    }
-    if (path === "/api/custom-fields/values" && method === "GET") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const { entity, error } = needEntityType(url.searchParams.get("entity_type"));
-      if (error) return json({ error }, 400);
-      const entityId = Number(url.searchParams.get("entity_id") || "");
-      if (!entityId) return json({ error: "entity_id is required" }, 400);
-      const rec = db
-        .query(`SELECT id FROM ${ENTITY_TABLES[entity!]} WHERE id = ? AND workspace_id = ?`)
-        .get(entityId, w);
-      if (!rec) return json({ error: `${entity} not found` }, 404);
-      const defs = getCustomFields(entity!, w);
-      const vals = db
-        .query("SELECT field_id, value FROM custom_values WHERE entity = ? AND record_id = ?")
-        .all(entity, entityId) as any[];
-      const byField = new Map(vals.map((v) => [v.field_id, v.value]));
-      return json({
-        values: defs.map((f: any) => ({
-          field_id: f.id,
-          name: f.label,
-          field_type: f.type,
-          value: byField.get(f.id) ?? "",
-        })),
-      });
-    }
-    if (path === "/api/custom-fields/values" && method === "PUT") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const b = await readBody(req);
-      const f = db
-        .query("SELECT * FROM custom_fields WHERE id = ? AND workspace_id = ?")
-        .get(Number(b.field_id), w) as any;
-      if (!f) return json({ error: "custom field not found" }, 404);
-      const entityId = Number(b.entity_id);
-      if (!entityId) return json({ error: "entity_id is required" }, 400);
-      const rec = db
-        .query(`SELECT id FROM ${ENTITY_TABLES[f.entity]} WHERE id = ? AND workspace_id = ?`)
-        .get(entityId, w);
-      if (!rec) return json({ error: `${f.entity} not found` }, 404);
-      const check = validateCustomValue(f, b.value);
-      if (!check.ok) return json({ error: check.error }, 400);
-      if (check.stored === "") {
-        db.prepare("DELETE FROM custom_values WHERE entity = ? AND record_id = ? AND field_id = ?").run(
-          f.entity,
-          entityId,
-          f.id
-        );
-        return json({ field_id: f.id, entity_id: entityId, value: "", cleared: true });
-      }
-      db.prepare(
-        `INSERT INTO custom_values (entity, record_id, field_id, value) VALUES (?, ?, ?, ?)
-         ON CONFLICT(entity, record_id, field_id) DO UPDATE SET value = excluded.value`
-      ).run(f.entity, entityId, f.id, check.stored);
-      return json({ field_id: f.id, entity_id: entityId, value: check.stored });
-    }
-
     // ---- campaigns
     if (path === "/api/campaigns" && method === "GET") {
       const w = needWs(req, url);
@@ -2417,85 +1203,6 @@ const server = Bun.serve({
          ORDER BY c.created_at DESC`
       ).all(w) as any[]);
       return json({ campaigns: rows });
-    }
-    // ---- calendar: read-only dated items for the month-grid views ---------------
-    // GET /api/calendar?scope=global|campaign|deal&id=<n>&from=YYYY-MM-DD&to=YYYY-MM-DD
-    // Returns { items } where each item is { type: "deal"|"task", id, title, date,
-    // ...full row fields } so the frontend can open the entity modals directly.
-    // Dates are ISO YYYY-MM-DD strings; range compares are lexicographic.
-    if (path === "/api/calendar" && method === "GET") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const scope = url.searchParams.get("scope") || "global";
-      const id = Number(url.searchParams.get("id") || 0);
-      const from = url.searchParams.get("from") || "0000-00-00";
-      const to = url.searchParams.get("to") || "9999-99-99";
-      const inRange = (d: string) => !!d && d >= from && d <= to;
-      const dealRows = (where: string, params: unknown[]) =>
-        db.query(
-          `SELECT d.*, c.name AS company_name FROM deals d
-           LEFT JOIN companies c ON c.id = d.company_id
-           WHERE d.workspace_id = ? ${where} ORDER BY d.expected_close`
-        ).all(w, ...params) as any[];
-      const taskRows = (where: string, params: unknown[]) =>
-        db.query(
-          `SELECT t.*, d.title AS deal_title FROM tasks t
-           LEFT JOIN deals d ON d.id = t.deal_id
-           WHERE t.workspace_id = ? ${where} ORDER BY t.due_date`
-        ).all(w, ...params) as any[];
-      const items: any[] = [];
-      const stageNames: Record<string, string> = {};
-      for (const s of db.query("SELECT slug, name FROM stages WHERE workspace_id = ?").all(w) as any[])
-        stageNames[s.slug] = s.name;
-      const pushDeals = (rows: any[]) => {
-        for (const d of rows) if (inRange(d.expected_close))
-          items.push({ type: "deal", date: d.expected_close, stage_name: stageNames[d.stage] || d.stage, ...d });
-      };
-      const pushTasks = (rows: any[]) => {
-        for (const t of rows) if (inRange(t.due_date))
-          items.push({ type: "task", date: t.due_date, ...t });
-      };
-      // Campaigns surface as start/end markers so one global calendar shows
-      // everything: task due dates, deal close dates, campaign start/end.
-      const pushCampaigns = () => {
-        const rows = db
-          .query(
-            `SELECT c.id, c.name AS title, c.status, c.start_date, c.end_date, co.name AS company_name
-             FROM campaigns c LEFT JOIN companies co ON co.id = c.company_id
-             WHERE c.workspace_id = ? AND (c.start_date <> '' OR c.end_date <> '')`
-          )
-          .all(w) as any[];
-        for (const c of rows) {
-          if (c.start_date && inRange(c.start_date))
-            items.push({ type: "campaign", date: c.start_date, edge: "starts", ...c });
-          if (c.end_date && inRange(c.end_date) && c.end_date !== c.start_date)
-            items.push({ type: "campaign", date: c.end_date, edge: "ends", ...c });
-        }
-      };
-      if (scope === "global") {
-        pushDeals(dealRows("AND d.expected_close <> ''", []));
-        pushTasks(taskRows("AND t.due_date <> ''", []));
-        pushCampaigns();
-      } else if (scope === "campaign") {
-        if (!id) return json({ error: "campaign id is required" }, 400);
-        const camp = db.query("SELECT id, name FROM campaigns WHERE id = ? AND workspace_id = ?").get(id, w);
-        if (!camp) return json({ error: "unknown campaign" }, 400);
-        pushDeals(dealRows("AND d.campaign_id = ? AND d.expected_close <> ''", [id]));
-        // tasks linked to the campaign directly, or via one of its deals
-        pushTasks(taskRows(
-          `AND t.due_date <> '' AND (t.campaign_id = ? OR t.deal_id IN
-            (SELECT id FROM deals WHERE campaign_id = ? AND workspace_id = ?))`, [id, id, w]));
-      } else if (scope === "deal") {
-        if (!id) return json({ error: "deal id is required" }, 400);
-        const deal = dealRows("AND d.id = ?", [id])[0];
-        if (!deal) return json({ error: "unknown deal" }, 400);
-        pushDeals([deal]);
-        pushTasks(taskRows("AND t.deal_id = ? AND t.due_date <> ''", [id]));
-      } else {
-        return json({ error: `unknown scope "${scope}"` }, 400);
-      }
-      items.sort((a, b) => a.date.localeCompare(b.date) || a.type.localeCompare(b.type) || a.id - b.id);
-      return json({ items });
     }
     if (path === "/api/campaigns" && method === "POST") {
       const w = needWs(req, url);
@@ -2598,287 +1305,6 @@ const server = Bun.serve({
       return json({ ok: true });
     }
 
-    // ---- email / SMS template campaigns + call logging ----------------------
-    // All tables are workspace-scoped. Secrets (smtp_pass, twilio_token) are
-    // write-only: GET /api/msg-settings only reports whether they're set.
-    const msgTemplateTables = {
-      email: { t: "email_templates", c: "email_campaigns", s: "email_sends", hasSubject: true },
-      sms: { t: "sms_templates", c: "sms_campaigns", s: "sms_sends", hasSubject: false },
-    } as const;
-    const msgKind = (path.match(/^\/(api)\/(email|sms)-/) || [])[2] as "email" | "sms" | undefined;
-    if (msgKind) {
-      const T = msgTemplateTables[msgKind];
-      const subj = (b: any) => (T.hasSubject ? String(b.subject ?? "") : undefined);
-      if (path === `/api/${msgKind}-templates` && method === "GET") {
-        const w = needWs(req, url);
-        if (w instanceof Response) return w;
-        const cols = T.hasSubject ? "id, workspace_id, name, subject, body, created_at" : "id, workspace_id, name, body, created_at";
-        const rows = db.query(`SELECT ${cols} FROM ${T.t} WHERE workspace_id = ? ORDER BY name`).all(w);
-        return json({ templates: rows });
-      }
-      if (path === `/api/${msgKind}-templates` && method === "POST") {
-        const w = needWs(req, url);
-        if (w instanceof Response) return w;
-        const b = await readBody(req);
-        if (!String(b.name || "").trim()) return json({ error: "name is required" }, 400);
-        const cols = T.hasSubject ? "(name, subject, body, workspace_id)" : "(name, body, workspace_id)";
-        const vals = T.hasSubject ? [b.name.trim(), subj(b) || "", String(b.body ?? ""), w] : [b.name.trim(), String(b.body ?? ""), w];
-        const ph = vals.map(() => "?").join(", ");
-        const r = db.prepare(`INSERT INTO ${T.t} ${cols} VALUES (${ph})`).run(...vals);
-        const tpl = db.query(`SELECT * FROM ${T.t} WHERE id = ?`).get(Number(r.lastInsertRowid));
-        return json({ template: tpl }, 201);
-      }
-      const tplId = path.match(new RegExp(`^/api/${msgKind}-templates/(\\d+)$`));
-      if (tplId && (method === "PATCH" || method === "DELETE")) {
-        const w = needWs(req, url);
-        if (w instanceof Response) return w;
-        const id = Number(tplId[1]);
-        const exists = db.query(`SELECT id FROM ${T.t} WHERE id = ? AND workspace_id = ?`).get(id, w);
-        if (!exists) return json({ error: "not found" }, 404);
-        if (method === "DELETE") {
-          // campaigns keep their rendered audience; the template link is nulled
-          db.prepare(`UPDATE ${T.c} SET template_id = NULL WHERE template_id = ? AND workspace_id = ?`).run(id, w);
-          db.prepare(`DELETE FROM ${T.t} WHERE id = ?`).run(id);
-          return json({ ok: true });
-        }
-        const b = await readBody(req);
-        const sets: string[] = [];
-        const vals: unknown[] = [];
-        if (b.name !== undefined) { sets.push("name = ?"); vals.push(String(b.name)); }
-        if (T.hasSubject && b.subject !== undefined) { sets.push("subject = ?"); vals.push(String(b.subject)); }
-        if (b.body !== undefined) { sets.push("body = ?"); vals.push(String(b.body)); }
-        if (sets.length) db.prepare(`UPDATE ${T.t} SET ${sets.join(", ")} WHERE id = ?`).run(...vals, id);
-        return json({ template: db.query(`SELECT * FROM ${T.t} WHERE id = ?`).get(id) });
-      }
-      const campList = path === `/api/${msgKind}-campaigns` && method === "GET";
-      const campPost = path === `/api/${msgKind}-campaigns` && method === "POST";
-      if (campList || campPost) {
-        const w = needWs(req, url);
-        if (w instanceof Response) return w;
-        if (campPost) {
-          const b = await readBody(req);
-          const tpl = b.template_id
-            ? (db.query(`SELECT id FROM ${T.t} WHERE id = ? AND workspace_id = ?`).get(Number(b.template_id), w) as any)
-            : null;
-          if (!tpl) return json({ error: "a valid template_id is required" }, 400);
-          const r = db
-            .prepare(`INSERT INTO ${T.c} (workspace_id, template_id, name, status, audience_json) VALUES (?, ?, ?, 'draft', ?)`)
-            .run(w, tpl.id, String(b.name || "Untitled campaign").trim() || "Untitled campaign",
-              JSON.stringify(parseAudience(b.audience)));
-          const id = Number(r.lastInsertRowid);
-          logActivity("note", `Created ${msgKind} campaign "${b.name || "Untitled campaign"}"`, w);
-          return json({ campaign: db.query(`SELECT * FROM ${T.c} WHERE id = ?`).get(id) }, 201);
-        }
-        const rows = db.query(
-          `SELECT c.*, t.name AS template_name,
-             (SELECT COUNT(*) FROM ${T.s} s WHERE s.campaign_id = c.id AND s.status = 'sent') AS sent_count,
-             (SELECT COUNT(*) FROM ${T.s} s WHERE s.campaign_id = c.id AND s.status = 'failed') AS failed_count
-           FROM ${T.c} c LEFT JOIN ${T.t} t ON t.id = c.template_id
-           WHERE c.workspace_id = ? ORDER BY c.created_at DESC`
-        ).all(w);
-        return json({ campaigns: rows });
-      }
-      const campId = path.match(new RegExp(`^/api/${msgKind}-campaigns/(\\d+)$`));
-      const campSend = path.match(new RegExp(`^/api/${msgKind}-campaigns/(\\d+)/send$`));
-      if ((campId && (method === "GET" || method === "DELETE")) || (campSend && method === "POST")) {
-        const w = needWs(req, url);
-        if (w instanceof Response) return w;
-        const id = Number((campId || campSend)![1]);
-        const camp = db.query(`SELECT * FROM ${T.c} WHERE id = ? AND workspace_id = ?`).get(id, w) as any;
-        if (!camp) return json({ error: "not found" }, 404);
-        const sendCol = "campaign_id";
-        if (campId && method === "DELETE") {
-          db.prepare(`DELETE FROM ${T.s} WHERE ${sendCol} = ? AND workspace_id = ?`).run(id, w);
-          db.prepare(`DELETE FROM ${T.c} WHERE id = ?`).run(id);
-          return json({ ok: true });
-        }
-        if (campId && method === "GET") {
-          const tpl = camp.template_id
-            ? db.query(`SELECT * FROM ${T.t} WHERE id = ?`).get(camp.template_id)
-            : null;
-          const destCol = msgKind === "email" ? "to_email" : "to_phone";
-          const sends = db.query(
-            `SELECT s.id, s.${destCol} AS dest, s.status, s.error, s.sent_at, c.id AS contact_id, c.name AS contact_name
-             FROM ${T.s} s LEFT JOIN contacts c ON c.id = s.contact_id
-             WHERE s.${sendCol} = ? AND s.workspace_id = ? ORDER BY s.id`
-          ).all(id, w);
-          return json({ campaign: camp, template: tpl, sends });
-        }
-        // POST .../send — synchronous send-now (small B2B lists; no scheduler).
-        if (camp.status !== "draft") return json({ error: "campaign already sent" }, 400);
-        const s = getMsgSettings(db, w);
-        const tpl = camp.template_id
-          ? (db.query(`SELECT * FROM ${T.t} WHERE id = ? AND workspace_id = ?`).get(camp.template_id, w) as any)
-          : null;
-        if (!tpl) return json({ error: "template not found" }, 400);
-        let audience;
-        try { audience = parseAudience(JSON.parse(camp.audience_json || "{}")); }
-        catch { audience = { mode: "all" as const }; }
-        const smtpCfg = {
-          host: s.smtp_host || "", port: Number(s.smtp_port) || 587,
-          secure: (["ssl", "starttls", "none"].includes(s.smtp_secure) ? s.smtp_secure : "starttls") as "ssl" | "starttls" | "none",
-          user: s.smtp_user || "", pass: s.smtp_pass || "",
-          from: s.smtp_from_email || "", fromName: s.smtp_from_name || "",
-        };
-        db.prepare(`UPDATE ${T.c} SET status = 'sending' WHERE id = ?`).run(id);
-        const ins = db.prepare(
-          `INSERT INTO ${T.s} (workspace_id, ${sendCol}, contact_id, ${msgKind === "email" ? "to_email" : "to_phone"}, status, error) VALUES (?, ?, ?, ?, ?, ?)`
-        );
-        let sent = 0, failed = 0;
-        if (msgKind === "email") {
-          if (!smtpConfigured(s)) {
-            db.prepare(`UPDATE ${T.c} SET status = 'draft' WHERE id = ?`).run(id);
-            return json({ error: "SMTP is not configured — add it in Messaging settings" }, 400);
-          }
-          for (const r of resolveEmailAudience(db, w, audience)) {
-            try {
-              await sendMail(smtpCfg, {
-                to: [r.email],
-                subject: renderMerge(tpl.subject, r),
-                text: renderMerge(tpl.body, r),
-              });
-              ins.run(w, id, r.id, r.email, "sent", ""); sent++;
-            } catch (e) { ins.run(w, id, r.id, r.email, "failed", sendError(e)); failed++; }
-          }
-        } else {
-          const provider = s.sms_provider === "gateway" ? "gateway" : "twilio";
-          if (provider === "twilio" && !twilioConfigured(s)) {
-            db.prepare(`UPDATE ${T.c} SET status = 'draft' WHERE id = ?`).run(id);
-            return json({ error: "Twilio is not configured — add it in Messaging settings" }, 400);
-          }
-          if (provider === "gateway" && !smtpConfigured(s)) {
-            db.prepare(`UPDATE ${T.c} SET status = 'draft' WHERE id = ?`).run(id);
-            return json({ error: "SMTP is not configured — the email-to-SMS gateway needs it" }, 400);
-          }
-          for (const r of resolveSmsAudience(db, w, audience, provider)) {
-            const body = renderMerge(tpl.body, r);
-            const dest = provider === "twilio" ? r.phone : r.sms_gateway;
-            try {
-              if (provider === "twilio") {
-                await sendTwilio({ sid: s.twilio_sid, token: s.twilio_token, from: s.twilio_from, to: r.phone, body });
-              } else {
-                await sendMail(smtpCfg, { to: [r.sms_gateway], subject: "", text: body });
-              }
-              ins.run(w, id, r.id, dest, "sent", ""); sent++;
-            } catch (e) { ins.run(w, id, r.id, dest, "failed", sendError(e)); failed++; }
-          }
-        }
-        db.prepare(`UPDATE ${T.c} SET status = 'sent' WHERE id = ?`).run(id);
-        logActivity("note", `Sent ${msgKind} campaign "${camp.name}" — ${sent} sent, ${failed} failed`, w);
-        fireWebhooks(`${msgKind}_campaign.sent`, { id, name: camp.name, sent, failed, workspace_id: w }, w);
-        return json({ ok: true, sent, failed, total: sent + failed });
-      }
-    } // end msgKind (email/sms template + campaign routes)
-
-    // ---- messaging settings (SMTP + SMS provider, per workspace) ------------
-    if (path === "/api/msg-settings" && (method === "GET" || method === "PATCH")) {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      if (method === "GET") return json(maskedMsgSettings(db, w));
-      const b = await readBody(req);
-      if (b.smtp_secure !== undefined && !["ssl", "starttls", "none"].includes(String(b.smtp_secure))) {
-        return json({ error: "smtp_secure must be ssl, starttls or none" }, 400);
-      }
-      if (b.sms_provider !== undefined && !["twilio", "gateway"].includes(String(b.sms_provider))) {
-        return json({ error: "sms_provider must be twilio or gateway" }, 400);
-      }
-      saveMsgSettings(db, w, b);
-      return json(maskedMsgSettings(db, w));
-    }
-
-    // ---- call logging -------------------------------------------------------
-    const CALL_OUTCOMES = ["connected", "voicemail", "no answer", "busy", "wrong number", "follow-up"];
-    const callLinks = (w: number, b: any) => {
-      const out: Record<string, number | null> = {};
-      for (const [key, table] of [["contact_id", "contacts"], ["company_id", "companies"], ["deal_id", "deals"]] as const) {
-        const v = b[key] === "" || b[key] == null ? null : Number(b[key]);
-        if (v) {
-          const hit = db.query(`SELECT id FROM ${table} WHERE id = ? AND workspace_id = ?`).get(v, w);
-          if (!hit) return { error: `unknown ${key}` };
-          out[key] = v;
-        } else out[key] = null;
-      }
-      if (!out.contact_id && !out.company_id && !out.deal_id) return { error: "a call needs a contact, company or deal" };
-      return out;
-    };
-    if (path === "/api/calls" && method === "GET") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const conds: string[] = [];
-      const params: unknown[] = [w];
-      for (const [qp, col] of [["contact_id", "contact_id"], ["company_id", "company_id"], ["deal_id", "deal_id"], ["outcome", "outcome"], ["direction", "direction"]] as const) {
-        const v = url.searchParams.get(qp);
-        if (v) { conds.push(`cl.${col} = ?`); params.push(v); }
-      }
-      const q = (url.searchParams.get("q") || "").trim();
-      if (q) {
-        conds.push("(c.name LIKE ? OR co.name LIKE ? OR d.title LIKE ? OR cl.notes LIKE ?)");
-        params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
-      }
-      const rows = db.query(
-        `SELECT cl.*, c.name AS contact_name, co.name AS company_name, d.title AS deal_title
-         FROM calls cl
-         LEFT JOIN contacts c ON c.id = cl.contact_id
-         LEFT JOIN companies co ON co.id = cl.company_id
-         LEFT JOIN deals d ON d.id = cl.deal_id
-         WHERE cl.workspace_id = ?${conds.length ? " AND " + conds.join(" AND ") : ""}
-         ORDER BY cl.called_at DESC, cl.id DESC LIMIT 500`
-      ).all(...params);
-      return json({ calls: rows, outcomes: CALL_OUTCOMES });
-    }
-    if (path === "/api/calls" && method === "POST") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const b = await readBody(req);
-      const links = callLinks(w, b);
-      if ("error" in links) return json({ error: links.error }, 400);
-      const direction = b.direction === "in" ? "in" : "out";
-      const outcome = String(b.outcome || "");
-      if (outcome && !CALL_OUTCOMES.includes(outcome)) return json({ error: "unknown outcome" }, 400);
-      let calledAt = String(b.called_at || "").trim();
-      if (/^\d{4}-\d{2}-\d{2}$/.test(calledAt)) calledAt += " 12:00";
-      else if (!calledAt) calledAt = new Date().toISOString().slice(0, 19).replace("T", " ");
-      const r = db.prepare(
-        `INSERT INTO calls (workspace_id, contact_id, company_id, deal_id, direction, duration_sec, outcome, notes, called_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(w, links.contact_id, links.company_id, links.deal_id, direction,
-        Math.max(0, Number(b.duration_sec) || 0), outcome, String(b.notes || ""), calledAt);
-      const id = Number(r.lastInsertRowid);
-      const cname = links.contact_id
-        ? (db.query("SELECT name FROM contacts WHERE id = ?").get(links.contact_id) as any)?.name : "";
-      logActivity("call", `Logged ${direction === "in" ? "inbound" : "outbound"} call${cname ? ` with ${cname}` : ""}${outcome ? ` — ${outcome}` : ""}`, w);
-      fireWebhooks("call.logged", { id, ...links, direction, outcome, workspace_id: w }, w);
-      return json({ call: db.query("SELECT * FROM calls WHERE id = ?").get(id) }, 201);
-    }
-    const callId = path.match(/^\/api\/calls\/(\d+)$/);
-    if (callId && (method === "GET" || method === "PATCH" || method === "DELETE")) {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const id = Number(callId[1]);
-      const exists = db.query("SELECT id FROM calls WHERE id = ? AND workspace_id = ?").get(id, w);
-      if (!exists) return json({ error: "not found" }, 404);
-      if (method === "GET") {
-        return json({ call: db.query("SELECT * FROM calls WHERE id = ?").get(id) });
-      }
-      if (method === "DELETE") {
-        db.prepare("DELETE FROM calls WHERE id = ?").run(id);
-        return json({ ok: true });
-      }
-      const b = await readBody(req);
-      const sets: string[] = [];
-      const vals: unknown[] = [];
-      if (b.direction !== undefined) { sets.push("direction = ?"); vals.push(b.direction === "in" ? "in" : "out"); }
-      if (b.outcome !== undefined) {
-        if (b.outcome && !CALL_OUTCOMES.includes(String(b.outcome))) return json({ error: "unknown outcome" }, 400);
-        sets.push("outcome = ?"); vals.push(String(b.outcome || ""));
-      }
-      if (b.duration_sec !== undefined) { sets.push("duration_sec = ?"); vals.push(Math.max(0, Number(b.duration_sec) || 0)); }
-      if (b.notes !== undefined) { sets.push("notes = ?"); vals.push(String(b.notes || "")); }
-      if (b.called_at !== undefined) { sets.push("called_at = ?"); vals.push(String(b.called_at || "")); }
-      if (sets.length) db.prepare(`UPDATE calls SET ${sets.join(", ")} WHERE id = ?`).run(...vals, id);
-      return json({ call: db.query("SELECT * FROM calls WHERE id = ?").get(id) });
-    }
-
     // ---- stage colors for the frontend (per-workspace schema)
     if (path === "/api/meta-colors" && method === "GET") {
       const w = needWs(req, url);
@@ -2897,6 +1323,200 @@ const server = Bun.serve({
         .query("SELECT * FROM activities WHERE workspace_id = ? ORDER BY id DESC LIMIT 30")
         .all(w);
       return json({ activities: rows });
+    }
+
+    // ---- outreach: the Action phase, logged in one place ------------------------
+    // Every communication channel (call, email, social message, video call,
+    // in person) logs its touches here, linked to deals and contacts. The
+    // optional outcome field is the Outcome phase of the
+    // Review → Action → Outcome cycle.
+    const outreachRow = (id: number, w: number) =>
+      db.query(`SELECT o.*, d.title AS deal_title, c.name AS contact_name
+                FROM outreach o
+                LEFT JOIN deals d ON d.id = o.deal_id
+                LEFT JOIN contacts c ON c.id = o.contact_id
+                WHERE o.id = ? AND o.workspace_id = ?`).get(id, w) as any;
+    if (path === "/api/outreach" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const channel = (url.searchParams.get("channel") || "").trim();
+      const rows = db.query(`SELECT o.*, d.title AS deal_title, c.name AS contact_name
+                FROM outreach o
+                LEFT JOIN deals d ON d.id = o.deal_id
+                LEFT JOIN contacts c ON c.id = o.contact_id
+                WHERE o.workspace_id = ? ${channel ? "AND o.channel = ?" : ""}
+                ORDER BY COALESCE(NULLIF(o.happened_at, ''), o.created_at) DESC, o.id DESC
+                LIMIT 200`)
+        .all(...(channel ? [w, channel] : [w]));
+      return json({ outreach: rows, channels: OUTREACH_CHANNELS.map((c) => ({ value: c, label: OUTREACH_CHANNEL_LABELS[c] })) });
+    }
+    if (path === "/api/outreach" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const b = await readBody(req);
+      const channel = String(b.channel || "").trim();
+      if (!(OUTREACH_CHANNELS as readonly string[]).includes(channel)) {
+        return json({ error: `channel must be one of: ${OUTREACH_CHANNELS.join(", ")}` }, 400);
+      }
+      const dealId = b.deal_id == null || b.deal_id === "" ? null : Number(b.deal_id);
+      const contactId = b.contact_id == null || b.contact_id === "" ? null : Number(b.contact_id);
+      if (dealId != null) {
+        const d = db.query("SELECT id, title FROM deals WHERE id = ? AND workspace_id = ?").get(dealId, w) as any;
+        if (!d) return json({ error: "deal not found in this workspace" }, 400);
+      }
+      if (contactId != null) {
+        const c = db.query("SELECT id, name FROM contacts WHERE id = ? AND workspace_id = ?").get(contactId, w) as any;
+        if (!c) return json({ error: "contact not found in this workspace" }, 400);
+      }
+      const note = String(b.note || "").slice(0, 4000);
+      const outcome = String(b.outcome || "").slice(0, 1000);
+      const happenedAt = String(b.happened_at || "").slice(0, 16);
+      const id = (db.query(
+        "INSERT INTO outreach (workspace_id, channel, deal_id, contact_id, note, outcome, happened_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id"
+      ).get(w, channel, dealId, contactId, note, outcome, happenedAt) as any).id;
+      const row = outreachRow(id, w);
+      logActivity("outreach",
+        `${OUTREACH_CHANNEL_LABELS[channel]} logged${row.deal_title ? ` — ${row.deal_title}` : ""}${outcome ? ` → ${outcome}` : ""}`, w);
+      return json({ ok: true, outreach: row });
+    }
+    const outreachRec = path.match(/^\/api\/outreach\/(\d+)$/);
+    if (outreachRec && (method === "PATCH" || method === "DELETE")) {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const id = Number(outreachRec[1]);
+      const existing = outreachRow(id, w);
+      if (!existing) return json({ error: "not found" }, 404);
+      if (method === "DELETE") {
+        db.prepare("DELETE FROM outreach WHERE id = ? AND workspace_id = ?").run(id, w);
+        return json({ ok: true });
+      }
+      const b = await readBody(req);
+      const sets: string[] = [];
+      const vals: any[] = [];
+      if (b.channel !== undefined) {
+        const channel = String(b.channel).trim();
+        if (!(OUTREACH_CHANNELS as readonly string[]).includes(channel)) {
+          return json({ error: `channel must be one of: ${OUTREACH_CHANNELS.join(", ")}` }, 400);
+        }
+        sets.push("channel = ?"); vals.push(channel);
+      }
+      for (const key of ["note", "outcome", "happened_at"] as const) {
+        if (b[key] !== undefined) { sets.push(`${key} = ?`); vals.push(String(b[key]).slice(0, key === "note" ? 4000 : 1000)); }
+      }
+      if (b.deal_id !== undefined) {
+        const dealId = b.deal_id == null || b.deal_id === "" ? null : Number(b.deal_id);
+        if (dealId != null && !db.query("SELECT id FROM deals WHERE id = ? AND workspace_id = ?").get(dealId, w)) {
+          return json({ error: "deal not found in this workspace" }, 400);
+        }
+        sets.push("deal_id = ?"); vals.push(dealId);
+      }
+      if (b.contact_id !== undefined) {
+        const contactId = b.contact_id == null || b.contact_id === "" ? null : Number(b.contact_id);
+        if (contactId != null && !db.query("SELECT id FROM contacts WHERE id = ? AND workspace_id = ?").get(contactId, w)) {
+          return json({ error: "contact not found in this workspace" }, 400);
+        }
+        sets.push("contact_id = ?"); vals.push(contactId);
+      }
+      if (!sets.length) return json({ error: "nothing to update" }, 400);
+      db.prepare(`UPDATE outreach SET ${sets.join(", ")} WHERE id = ? AND workspace_id = ?`).run(...vals, id, w);
+      return json({ ok: true, outreach: outreachRow(id, w) });
+    }
+
+    // ---- milton bridge: insights for the Dashboard, agent for the Milton page ---
+    // exec-crm never talks to Milton's DB — it proxies over HTTP so the
+    // browser stays same-origin and needs no CORS. MILTON_URL never leaves the
+    // server: the browser only ever sees /api/milton/* on this origin.
+    const miltonFetch = (p: string, ms: number, init?: RequestInit) =>
+      fetch(`${MILTON_URL}${p}`, { signal: AbortSignal.timeout(ms), ...init });
+    const miltonDown = () =>
+      json({ error: "milton isn't running — start it (default port 3009) and reload" }, 502);
+    if (path === "/api/milton/status" && method === "GET") {
+      try {
+        const r = await miltonFetch("/api/health", 5000);
+        return json({ ok: r.ok, reachable: r.ok });
+      } catch {
+        return json({ ok: false, reachable: false });
+      }
+    }
+    if (path === "/api/milton/hygiene" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      try {
+        const r = await miltonFetch(`/api/hygiene?workspace=${encodeURIComponent(String(w))}`, 10000);
+        if (!r.ok) return json({ error: `milton answered ${r.status}` }, 502);
+        const j = await r.json();
+        return json(j);
+      } catch {
+        return miltonDown();
+      }
+    }
+    // Chat with the embedded agent. One Milton session per exec-crm workspace,
+    // created bound to that workspace; a client-supplied session id is only
+    // honored when Milton confirms it belongs to this workspace.
+    const miltonSessionFor = async (w: number, sid: unknown): Promise<string | Response> => {
+      const id = typeof sid === "string" && /^s-[a-z0-9]+$/i.test(sid) ? sid : "";
+      if (id) {
+        let r: Response;
+        try {
+          r = await miltonFetch(`/api/session/workspace?session=${encodeURIComponent(id)}`, 5000);
+        } catch {
+          return miltonDown();
+        }
+        if (r.ok) {
+          const j = await r.json().catch(() => ({}));
+          if (Number(j.workspace_id) === w) return id;
+        }
+        return json({ error: "unknown milton session for this workspace" }, 400);
+      }
+      try {
+        // milton enforces unique session names: one per workspace + timestamp
+        const name = `exec-crm-w${w}-${Date.now().toString(36)}`;
+        const r = await miltonFetch("/api/chat-sessions", 10000, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name, workspace_id: w }),
+        });
+        if (!r.ok) return json({ error: `milton answered ${r.status}` }, 502);
+        const j = await r.json();
+        return String(j.session.id);
+      } catch {
+        return miltonDown();
+      }
+    };
+    if (path === "/api/milton/chat" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const b = await readBody(req);
+      const message = String(b.message || "").slice(0, 2000).trim();
+      if (!message) return json({ error: "message is required" }, 400);
+      const sid = await miltonSessionFor(w, b.session);
+      if (sid instanceof Response) return sid;
+      try {
+        const r = await miltonFetch("/api/chat", 60000, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session: sid, message }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) return json({ error: j.error || `milton answered ${r.status}` }, 502);
+        return json({ ...j, session: sid });
+      } catch {
+        return miltonDown();
+      }
+    }
+    if (path === "/api/milton/history" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const sid = await miltonSessionFor(w, url.searchParams.get("session"));
+      if (sid instanceof Response) return sid;
+      try {
+        const r = await miltonFetch(`/api/history?session=${encodeURIComponent(sid)}`, 10000);
+        if (!r.ok) return json({ error: `milton answered ${r.status}` }, 502);
+        const j = await r.json();
+        return json({ messages: j.messages || [], session: sid });
+      } catch {
+        return miltonDown();
+      }
     }
 
     // ---- outgoing webhooks (automation platforms)
@@ -3065,73 +1685,6 @@ const server = Bun.serve({
       if (!hit.changes) return json({ error: "not found" }, 404);
       return json({ ok: true });
     }
-
-    // ---- milton widgets (published by the Milton chat bot, rendered on the Milton tab)
-    if (path === "/api/milton/widgets" && method === "GET") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const rows = db
-        .query("SELECT * FROM milton_widgets WHERE workspace_id = ? ORDER BY created_at DESC, id DESC")
-        .all(w) as any[];
-      return json({ widgets: rows.map(miltonWidgetOut) });
-    }
-    if (path === "/api/milton/widgets" && method === "POST") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const b = await readBody(req);
-      const kind = String(b.kind || "");
-      const title = String(b.title || "").trim();
-      const source = b.source == null ? null : String(b.source).slice(0, 120);
-      if (!MILTON_WIDGET_KINDS.includes(kind)) {
-        return json({ error: `kind must be one of: ${MILTON_WIDGET_KINDS.join(", ")}` }, 400);
-      }
-      if (!title) return json({ error: "title is required" }, 400);
-      if (title.length > 80) return json({ error: "title must be at most 80 characters" }, 400);
-      const payloadErr = miltonWidgetPayloadErr(kind, b.payload);
-      if (payloadErr) return json({ error: payloadErr }, 400);
-      const now = Date.now();
-      const res = db
-        .prepare("INSERT INTO milton_widgets (workspace_id, kind, title, payload, source, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-        .run(w, kind, title, JSON.stringify(b.payload), source, now);
-      // bound growth: keep the 50 newest per workspace
-      db.prepare(`DELETE FROM milton_widgets WHERE workspace_id = ? AND id NOT IN (
-        SELECT id FROM milton_widgets WHERE workspace_id = ? ORDER BY created_at DESC, id DESC LIMIT 50
-      )`).run(w, w);
-      const row = db.query("SELECT * FROM milton_widgets WHERE id = ?").get(res.lastInsertRowid) as any;
-      return json({ widget: miltonWidgetOut(row) }, 201);
-    }
-    const mwDel = path.match(/^\/api\/milton\/widgets\/(\d+)$/);
-    if (mwDel && method === "DELETE") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const hit = db.prepare("DELETE FROM milton_widgets WHERE id = ? AND workspace_id = ?")
-        .run(Number(mwDel[1]), w);
-      if (!hit.changes) return json({ error: "widget not found" }, 404);
-      return json({ ok: true });
-    }
-
-    // ---- dashboard: default Milton-widget set + daily feed --------------------
-    // The default widget set (forecast, pipeline analysis, hygiene summary, top
-    // deals) is computed here from workspace data in the exact Widgetable shape
-    // Milton pins ({kind, title, payload}), so the frontend renders both with
-    // the same card builder. No Milton round-trip: the dashboard always renders.
-    if (path === "/api/dashboard/widgets" && method === "GET") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      // Pinned widgets first (deletable in the UI), then the defaults.
-      const pinned = (db.query("SELECT * FROM milton_widgets WHERE workspace_id = ? ORDER BY created_at DESC, id DESC").all(w) as any[])
-        .map(miltonWidgetOut);
-      return json({ widgets: [...pinned, ...defaultDashboardWidgets(w)] });
-    }
-    // Daily feed: structured suggestion sections computed from workspace data,
-    // plus Milton's "morning brief" take when reachable (existing /api/chat
-    // endpoint — no new Milton endpoint needed). Never 500s on Milton being
-    // down: the feed renders with milton.available=false instead.
-    if (path === "/api/daily-feed" && method === "GET") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      return json(await dailyFeed(w));
-    }
     const hookIn = path.match(/^\/api\/hooks\/in\/([A-Za-z0-9]+)$/);
     if (hookIn && method === "POST") {
       const hook = db.query("SELECT * FROM incoming_hooks WHERE key = ?").get(hookIn[1]) as any;
@@ -3165,7 +1718,6 @@ const server = Bun.serve({
           validStage(w, data.stage),
           Number(data.probability ?? 10), data.expected_close || "", data.owner || "automation", w);
         result = dealJson(Number(r.lastInsertRowid), w);
-        logStageChange(Number(r.lastInsertRowid), "", (result as any).stage, w); // "opened"
         logActivity("deal", `${(result as any).title} created via ${hook.name}`, w);
         fireWebhooks("deal.created", result as any, w);
       } else if (action === "create_contact") {
@@ -3185,270 +1737,6 @@ const server = Bun.serve({
       }
       return json({ ok: true, action, result }, 201);
     }
-
-        // ---- duplicate detection & merge (contacts + companies) ---------------------
-    // Deterministic, workspace-scoped. Contacts: same non-empty email
-    // (case-insensitive) OR normalized-name fuzzy match. Companies: normalized
-    // name fuzzy match OR same website host.
-    function normName(s: string): string {
-      return String(s || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
-    }
-    function levenshtein(a: string, b: string): number {
-      if (a === b) return 0;
-      if (!a.length) return b.length;
-      if (!b.length) return a.length;
-      let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
-      for (let i = 1; i <= a.length; i++) {
-        let cur = i;
-        for (let j = 1; j <= b.length; j++) {
-          const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-          const next = Math.min(prev[j] + 1, cur + 1, prev[j - 1] + cost);
-          prev[j - 1] = cur;
-          cur = next;
-        }
-        prev[b.length] = cur;
-      }
-      return prev[b.length];
-    }
-    function namesSimilar(a: string, b: string): boolean {
-      const na = normName(a), nb = normName(b);
-      if (!na || !nb) return false;
-      if (na === nb) return true;
-      if (levenshtein(na, nb) <= 2) return true;
-      if (Math.min(na.length, nb.length) >= 5 && (na.includes(nb) || nb.includes(na))) return true;
-      return false;
-    }
-    function hostOf(raw: string): string {
-      const s = String(raw || "").trim();
-      if (!s) return "";
-      try {
-        return new URL(s.includes("://") ? s : "https://" + s).hostname.toLowerCase().replace(/^www\./, "");
-      } catch { return ""; }
-    }
-    if (path === "/api/duplicates" && method === "GET") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const type = url.searchParams.get("type");
-      if (type !== "contact" && type !== "company") {
-        return json({ error: "type must be contact or company" }, 400);
-      }
-      const pairs: any[] = [];
-      if (type === "contact") {
-        const rows = db.query(
-          `SELECT ct.*, c.name AS company_name FROM contacts ct
-           LEFT JOIN companies c ON c.id = ct.company_id
-           WHERE ct.workspace_id = ? ORDER BY ct.id`
-        ).all(w) as any[];
-        for (let i = 0; i < rows.length && pairs.length < 100; i++) {
-          for (let j = i + 1; j < rows.length && pairs.length < 100; j++) {
-            const a = rows[i], b = rows[j];
-            let reason = "";
-            const ea = String(a.email || "").trim().toLowerCase();
-            const eb = String(b.email || "").trim().toLowerCase();
-            if (ea && ea === eb) reason = "same email";
-            else if (namesSimilar(a.name, b.name)) reason = "similar name";
-            if (reason) pairs.push({ a, b, reason });
-          }
-        }
-      } else {
-        const rows = db.query("SELECT * FROM companies WHERE workspace_id = ? ORDER BY id").all(w) as any[];
-        for (let i = 0; i < rows.length && pairs.length < 100; i++) {
-          for (let j = i + 1; j < rows.length && pairs.length < 100; j++) {
-            const a = rows[i], b = rows[j];
-            let reason = "";
-            const ha = hostOf(a.website), hb = hostOf(b.website);
-            if (ha && ha === hb) reason = "same website";
-            else if (namesSimilar(a.name, b.name)) reason = "similar name";
-            if (reason) pairs.push({ a, b, reason });
-          }
-        }
-      }
-      return json({ pairs });
-    }
-    if (path === "/api/duplicates/merge" && method === "POST") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const b = await readBody(req);
-      const type = b.type;
-      if (type !== "contact" && type !== "company") {
-        return json({ error: "type must be contact or company" }, 400);
-      }
-      if (b.confirm !== true) {
-        return json({ error: "merge is destructive — pass { confirm: true } to proceed" }, 400);
-      }
-      const winnerId = Number(b.winner_id), loserId = Number(b.loser_id);
-      if (!winnerId || !loserId || winnerId === loserId) {
-        return json({ error: "winner_id and loser_id must be two different ids" }, 400);
-      }
-      const table = type === "contact" ? "contacts" : "companies";
-      const winner = db.query(`SELECT * FROM ${table} WHERE id = ? AND workspace_id = ?`).get(winnerId, w) as any;
-      const loser = db.query(`SELECT * FROM ${table} WHERE id = ? AND workspace_id = ?`).get(loserId, w) as any;
-      if (!winner || !loser) return json({ error: "both records must exist in this workspace" }, 400);
-      const reassigned: Record<string, number> = {};
-      const move = (label: string, sql: string, ...args: unknown[]) => {
-        reassigned[label] = Number(db.prepare(sql).run(...args).changes);
-      };
-      db.exec("BEGIN");
-      try {
-        if (type === "contact") {
-          move("deals", "UPDATE deals SET contact_id = ? WHERE contact_id = ? AND workspace_id = ?", winnerId, loserId, w);
-          move("captures", "UPDATE captures SET contact_id = ? WHERE contact_id = ?", winnerId, loserId);
-          // custom values: winner wins on field conflicts, then reassign the rest
-          db.prepare(
-            `DELETE FROM custom_values WHERE entity = 'contact' AND record_id = ?
-             AND field_id IN (SELECT field_id FROM custom_values WHERE entity = 'contact' AND record_id = ?)`
-          ).run(loserId, winnerId);
-          move("custom field values", "UPDATE custom_values SET record_id = ? WHERE entity = 'contact' AND record_id = ?", winnerId, loserId);
-          move("activities", "UPDATE activities SET ref_id = ? WHERE ref_type = 'contact' AND ref_id = ? AND workspace_id = ?", winnerId, loserId, w);
-          move("calls", "UPDATE calls SET contact_id = ? WHERE contact_id = ? AND workspace_id = ?", winnerId, loserId, w);
-          db.prepare("DELETE FROM contacts WHERE id = ?").run(loserId);
-        } else {
-          move("deals", "UPDATE deals SET company_id = ? WHERE company_id = ? AND workspace_id = ?", winnerId, loserId, w);
-          move("contacts", "UPDATE contacts SET company_id = ? WHERE company_id = ? AND workspace_id = ?", winnerId, loserId, w);
-          move("campaigns", "UPDATE campaigns SET company_id = ? WHERE company_id = ? AND workspace_id = ?", winnerId, loserId, w);
-          db.prepare(
-            `DELETE FROM custom_values WHERE entity = 'company' AND record_id = ?
-             AND field_id IN (SELECT field_id FROM custom_values WHERE entity = 'company' AND record_id = ?)`
-          ).run(loserId, winnerId);
-          move("custom field values", "UPDATE custom_values SET record_id = ? WHERE entity = 'company' AND record_id = ?", winnerId, loserId);
-          move("activities", "UPDATE activities SET ref_id = ? WHERE ref_type = 'company' AND ref_id = ? AND workspace_id = ?", winnerId, loserId, w);
-          move("calls", "UPDATE calls SET company_id = ? WHERE company_id = ? AND workspace_id = ?", winnerId, loserId, w);
-          db.prepare("DELETE FROM companies WHERE id = ?").run(loserId);
-        }
-        db.exec("COMMIT");
-      } catch (e) {
-        db.exec("ROLLBACK");
-        throw e;
-      }
-      logActivity("note", `Merged duplicate ${type} "${loser.name}" into "${winner.name}"`, w);
-      return json({ ok: true, winner_id: winnerId, loser_id: loserId, reassigned });
-    }
-
-    // ---- saved pipeline views -------------------------------------------------
-    const VIEW_FILTER_KEYS = ["owner", "stage", "source", "min_value", "search"];
-    const cleanFilters = (raw: any): Record<string, string> => {
-      const out: Record<string, string> = {};
-      if (raw && typeof raw === "object") {
-        for (const k of VIEW_FILTER_KEYS) {
-          const v = String(raw[k] ?? "").trim();
-          if (v) out[k] = k === "min_value" ? String(Number(v) || "") : v;
-          if (k === "min_value" && !out[k]) delete out[k];
-        }
-      }
-      return out;
-    };
-    if (path === "/api/saved-views" && method === "GET") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const rows = db
-        .query("SELECT * FROM saved_views WHERE workspace_id = ? ORDER BY name")
-        .all(w) as any[];
-      return json({
-        views: rows.map((r) => ({ ...r, filters: JSON.parse(r.filters_json || "{}") })),
-      });
-    }
-    if (path === "/api/saved-views" && method === "POST") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const b = await readBody(req);
-      const name = String(b.name || "").trim();
-      if (!name) return json({ error: "name is required" }, 400);
-      const r = db
-        .prepare("INSERT INTO saved_views (workspace_id, name, filters_json) VALUES (?, ?, ?)")
-        .run(w, name, JSON.stringify(cleanFilters(b.filters)));
-      const row = db.query("SELECT * FROM saved_views WHERE id = ?").get(Number(r.lastInsertRowid)) as any;
-      return json({ view: { ...row, filters: JSON.parse(row.filters_json) } }, 201);
-    }
-    const savedViewId = path.match(/^\/api\/saved-views\/(\d+)$/);
-    if (savedViewId && method === "PATCH") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const b = await readBody(req);
-      const cur = db
-        .query("SELECT * FROM saved_views WHERE id = ? AND workspace_id = ?")
-        .get(Number(savedViewId[1]), w) as any;
-      if (!cur) return json({ error: "not found" }, 404);
-      const sets: string[] = [];
-      const vals: unknown[] = [];
-      if (b.name !== undefined && String(b.name).trim()) {
-        sets.push("name = ?");
-        vals.push(String(b.name).trim());
-      }
-      if (b.filters !== undefined) {
-        sets.push("filters_json = ?");
-        vals.push(JSON.stringify(cleanFilters(b.filters)));
-      }
-      if (sets.length) {
-        db.prepare(`UPDATE saved_views SET ${sets.join(", ")} WHERE id = ?`)
-          .run(...vals, Number(savedViewId[1]));
-      }
-      const row = db.query("SELECT * FROM saved_views WHERE id = ?").get(Number(savedViewId[1])) as any;
-      return json({ view: { ...row, filters: JSON.parse(row.filters_json) } });
-    }
-    if (savedViewId && method === "DELETE") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const hit = db.prepare("DELETE FROM saved_views WHERE id = ? AND workspace_id = ?")
-        .run(Number(savedViewId[1]), w);
-      if (!hit.changes) return json({ error: "not found" }, 404);
-      return json({ ok: true });
-    }
-
-    // ---- bulk deal actions ----------------------------------------------------
-    // POST /api/deals/bulk { ids: [...], action: "move_stage"|"set_owner"|"set_source"|"delete", value?, confirm? }
-    if (path === "/api/deals/bulk" && method === "POST") {
-      const w = needWs(req, url);
-      if (w instanceof Response) return w;
-      const b = await readBody(req);
-      const ids = Array.isArray(b.ids) ? [...new Set(b.ids.map(Number).filter((n) => n > 0))] : [];
-      if (!ids.length) return json({ error: "ids must be a non-empty array" }, 400);
-      const found = db
-        .query(`SELECT id, stage, title FROM deals WHERE id IN (${ids.map(() => "?").join(",")}) AND workspace_id = ?`)
-        .all(...ids, w) as any[];
-      if (found.length !== ids.length) {
-        return json({ error: "some deals were not found in this workspace" }, 400);
-      }
-      const action = b.action;
-      const byId = new Map(found.map((d) => [d.id, d]));
-      if (action === "move_stage") {
-        const to = validStage(w, b.value);
-        const upd = db.prepare("UPDATE deals SET stage = ?, updated_at = datetime('now') WHERE id = ?");
-        let moved = 0;
-        for (const id of ids) {
-          const d = byId.get(id);
-          if (d.stage !== to) {
-            upd.run(to, id);
-            logStageChange(id, d.stage, to, w);
-            moved++;
-          }
-        }
-        const stageName = (db.query("SELECT name FROM stages WHERE workspace_id = ? AND slug = ?").get(w, to) as any)?.name || to;
-        logActivity("deal", `Bulk-moved ${moved} deal(s) to ${stageName}`, w);
-        return json({ ok: true, affected: moved });
-      }
-      if (action === "set_owner") {
-        const n = db.prepare("UPDATE deals SET owner = ?, updated_at = datetime('now') WHERE id = ? AND workspace_id = ?");
-        ids.forEach((id) => n.run(String(b.value ?? ""), id, w));
-        return json({ ok: true, affected: ids.length });
-      }
-      if (action === "set_source") {
-        const n = db.prepare("UPDATE deals SET source = ?, updated_at = datetime('now') WHERE id = ? AND workspace_id = ?");
-        ids.forEach((id) => n.run(String(b.value ?? "").trim(), id, w));
-        return json({ ok: true, affected: ids.length });
-      }
-      if (action === "delete") {
-        if (b.confirm !== true) {
-          return json({ error: `bulk delete of ${ids.length} deal(s) is destructive — pass { confirm: true }` }, 400);
-        }
-        db.prepare(`DELETE FROM deal_stage_history WHERE deal_id IN (${ids.map(() => "?").join(",")})`).run(...ids);
-        const n = db.prepare(`DELETE FROM deals WHERE id IN (${ids.map(() => "?").join(",")}) AND workspace_id = ?`).run(...ids, w);
-        logActivity("deal", `Bulk-deleted ${n.changes} deal(s)`, w);
-        return json({ ok: true, affected: n.changes });
-      }
-      return json({ error: 'action must be one of: move_stage, set_owner, set_source, delete' }, 400);
-    }
-
-    return json({ error: "not found" }, 404);
 
     return json({ error: "not found" }, 404);
   },

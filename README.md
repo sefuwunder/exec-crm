@@ -36,22 +36,26 @@ The app is built around the **Review → Action → Outcome** cycle:
 - **Campaigns** — pipeline kanban board (drag cards between stages, fires
   webhooks), per-campaign detail, stage management.
 - **Contacts / Companies / Tasks** — search, create, complete.
-- **Schema editor** — add your own custom fields (text, long text, number,
-  date, dropdown, checkbox, URL) to contacts, companies, campaigns, and
-  tasks; fields show up on every form automatically.
+- **Data Workshop** — the back-office, in four tabs:
+  - **Captures** — snap or upload photos of business cards and client notes
+    (`capture="environment"` opens the camera on mobile); add a note and link
+    each photo to a contact.
+  - **Schema** — add your own custom fields (text, long text, number,
+    date, dropdown, checkbox, URL) to contacts, companies, campaigns, and
+    tasks; fields show up on every form automatically.
+  - **Automation** — manage both webhook directions, test endpoints, see a
+    delivery log.
+  - **Sandbox** — stage CSV/VCF contact imports safely: exact + fuzzy dedup
+    against existing contacts and within the file, junk/invalid data flags,
+    per-row approve/reject/edit, then import only the approved rows.
 - **Daily Feed** — overdue, today's, and upcoming todos plus deals closing
   this week, with quick-add.
-- **Captures** — snap or upload photos of business cards and client notes
-  (`capture="environment"` opens the camera on mobile); add a note and link
-  each photo to a contact.
-- **Automations** — manage both webhook directions, test endpoints, see a
-  delivery log.
 
 ## Automation platforms (Zapier / Make / n8n)
 
 **Outgoing** — the CRM POSTs JSON to your URLs on:
 `deal.created`, `deal.stage_changed`, `deal.updated`, `contact.created`,
-`task.created`, `task.completed`. Add them in the Automations view or:
+`task.created`, `task.completed`. Add them in Data Workshop → Automation or:
 
 ```sh
 curl -X POST localhost:3001/api/webhooks \
@@ -61,10 +65,10 @@ curl -X POST localhost:3001/api/webhooks \
 
 Payload shape: `{"event": "...", "sent_at": "...", "data": {...}}` with an
 `X-CRM-Event` header. Every delivery (ok / error / failed) is logged and
-visible in the Automations view; a **Test** button sends a sample payload.
+visible in Data Workshop → Automation; a **Test** button sends a sample payload.
 
 **Custom headers** — each outgoing webhook can send extra headers with every
-delivery (API keys, shared secrets). Add them in the Automations view's
+delivery (API keys, shared secrets). Add them in Data Workshop → Automation's
 webhook editor, or pass `"headers": {"X-Foo": "bar"}` to
 `POST /api/webhooks` (`PATCH /api/webhooks/:id` to change them later).
 Header values are secrets: the API and UI only ever reveal header *names*,
@@ -92,7 +96,7 @@ curl -X POST localhost:3001/api/hooks/in/YOUR_KEY \
 
 Actions: `create_deal`, `create_contact`, `create_task`. An explicit
 `?workspace=<id>` on the hook URL overrides the hook's workspace for one-off
-routing. Reassign a hook from the Automations view, or
+routing. Reassign a hook from Data Workshop → Automation, or
 `PATCH /api/hooks/:id {"workspace_id": 2}`. Inbound records also fan out to
 outgoing webhooks, so chains compose.
 

@@ -287,6 +287,143 @@ function parseCsv(text: string): string[][] {
   return rows.filter((r) => r.some((f) => f.trim() !== ""));
 }
 
+function sbDecodeQP(s) {
+  // quoted-printable: strip soft line breaks, then decode =XX hex bytes.
+  // Bytes are re-assembled as UTF-8 (falling back to Latin-1) so
+  // =C3=BC decodes to ü rather than mojibake.
+  var bytes = [];
+  String(s || "").replace(/=\r?\n/g, "").replace(/=([0-9A-Fa-f]{2})|[\s\S]/g, function (m, h) {
+    bytes.push(h ? parseInt(h, 16) : m.charCodeAt(0) & 0xff);
+    return "";
+  });
+  var u8 = new Uint8Array(bytes);
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(u8); }
+  catch (e) {
+    var out = "";
+    for (var i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+    return out;
+  }
+}
+function sbB64decode(s) {
+  try { return atob(String(s || "").replace(/\s+/g, "")); }
+  catch (e) { return String(s || ""); }
+}
+function parseVcf(text) {
+  var norm = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  // Line unfolding: a line starting with a space or tab continues the
+  // previous line (RFC 2426 §5.8.1).
+  var lines = [];
+  var raw = norm.split("\n");
+  for (var li = 0; li < raw.length; li++) {
+    var rl = raw[li];
+    if (/^[ \t]/.test(rl) && lines.length) lines[lines.length - 1] += rl.slice(1);
+    else lines.push(rl);
+  }
+  // Split into cards. A BEGIN without a matching END (or a new BEGIN before
+  // the previous END) is parsed anyway and flagged malformed below — cards
+  // are never silently dropped.
+  var cards = [];
+  var cur = null;
+  for (var i = 0; i < lines.length; i++) {
+    var ln = lines[i];
+    if (/^BEGIN:VCARD/i.test(ln)) {
+      if (cur && cur.lines.length) { cur.bad = true; cards.push(cur); }
+      cur = { lines: [], bad: false };
+      continue;
+    }
+    if (/^END:VCARD/i.test(ln)) { if (cur) { cards.push(cur); cur = null; } continue; }
+    if (cur) cur.lines.push(ln);
+  }
+  if (cur && cur.lines.length) { cur.bad = true; cards.push(cur); }
+  var out = [];
+  for (var ci = 0; ci < cards.length; ci++) {
+    var props = cards[ci].lines;
+    var cardBad = cards[ci].bad;
+    var fn = "", n = "", org = "", title = "", noteParts = [];
+    var emails = [], phones = [];
+    var extraFlags = [];
+    for (var pi = 0; pi < props.length; pi++) {
+      var line = props[pi];
+      var cidx = line.indexOf(":");
+      if (cidx < 0) continue; // not a property line
+      var head = line.slice(0, cidx);
+      var val = line.slice(cidx + 1);
+      var parts = head.split(";");
+      var prop = parts[0].toUpperCase();
+      var params = {};
+      for (var qi = 1; qi < parts.length; qi++) {
+        var p = parts[qi];
+        var eq = p.indexOf("=");
+        if (eq < 0) {
+          // vCard 2.1 bare type, e.g. TEL;HOME;VOICE:555
+          params.TYPE = (params.TYPE ? params.TYPE + "," : "") + p.toUpperCase();
+        } else {
+          var k = p.slice(0, eq).toUpperCase();
+          var v = p.slice(eq + 1).toUpperCase();
+          params[k] = params[k] ? params[k] + "," + v : v;
+        }
+      }
+      if (prop === "PHOTO" || prop === "LOGO" || prop === "SOUND" || prop === "KEY") {
+        continue; // payloads are never stored
+      }
+      var enc = params.ENCODING || "";
+      if (enc === "QUOTED-PRINTABLE" || enc === "Q") val = sbDecodeQP(val);
+      else if (enc === "B" || enc === "BASE64") val = sbB64decode(val);
+      val = val.replace(/\\n/gi, "\n").replace(/\\,/g, ",").replace(/\\;/g, ";").replace(/\\\\/g, "\\");
+      if (prop === "FN") { if (!fn) fn = val.trim(); }
+      else if (prop === "N") { if (!n) n = val; }
+      else if (prop === "ORG") { if (!org) org = val.split(";")[0].trim(); }
+      else if (prop === "TITLE") { if (!title) title = val.trim(); }
+      else if (prop === "NOTE") { if (val.trim()) noteParts.push(val.trim()); }
+      else if (prop === "URL") { if (val.trim()) noteParts.push("Website: " + val.trim()); }
+      else if (prop === "ADR") {
+        var ac = val.split(";").map(function (x) { return x.trim(); }).filter(Boolean);
+        if (ac.length) noteParts.push("Address: " + ac.join(", "));
+      }
+      else if (prop === "EMAIL" && val.trim()) { emails.push({ value: val.trim(), type: params.TYPE || "" }); }
+      else if ((prop === "TEL" || prop === "X-ABPHONE") && val.trim()) { phones.push({ value: val.trim(), type: params.TYPE || "" }); }
+    }
+    var name = fn;
+    if (!name && n) {
+      var np = n.split(";");
+      name = [np[3] || "", np[1] || "", np[2] || "", np[0] || "", np[4] || ""]
+        .map(function (x) { return x.trim(); }).filter(Boolean).join(" ");
+    }
+    function pickPref(list, prefTypes) {
+      for (var t = 0; t < prefTypes.length; t++) {
+        for (var j = 0; j < list.length; j++) {
+          if (list[j].type.indexOf(prefTypes[t]) >= 0) return list[j];
+        }
+      }
+      return list[0] || null;
+    }
+    var emailPick = pickPref(emails, ["WORK", "INTERNET", "PREF"]);
+    var phonePick = pickPref(phones, ["CELL", "MOBILE", "WORK", "PREF", "VOICE"]);
+    var email = emailPick ? emailPick.value : "";
+    var phone = phonePick ? phonePick.value : "";
+    var notes = noteParts.join("\n");
+    if (emails.length > 1) {
+      var others = emails.filter(function (e) { return e !== emailPick; })
+        .map(function (e) { return e.value + (e.type ? " (" + e.type.toLowerCase() + ")" : ""); });
+      if (others.length) notes = (notes ? notes + "\n" : "") + "Other emails: " + others.join(", ");
+      extraFlags.push({ code: "multi-email", reason: "vCard has " + emails.length + " emails — kept " + email + ", noted the rest." });
+    }
+    if (phones.length > 1) {
+      var ophones = phones.filter(function (e) { return e !== phonePick; })
+        .map(function (e) { return e.value + (e.type ? " (" + e.type.toLowerCase() + ")" : ""); });
+      if (ophones.length) notes = (notes ? notes + "\n" : "") + "Other phones: " + ophones.join(", ");
+      extraFlags.push({ code: "multi-phone", reason: "vCard has " + phones.length + " phones — kept " + phone + ", noted the rest." });
+    }
+    if (cardBad) {
+      extraFlags.push({ code: "malformed", reason: "vCard is missing its END:VCARD line — parsed what could be read." });
+    }
+    if (!name && !email) {
+      extraFlags.push({ code: "unusable", reason: "No usable name or email — nothing to import from this card." });
+    }
+    out.push({ name: name, title: title, email: email, phone: phone, company: org, notes: notes, extraFlags: extraFlags });
+  }
+  return out;
+}
 // ---------------------------------------------------------------- server
 const server = Bun.serve({
   port: PORT,
@@ -383,7 +520,7 @@ const server = Bun.serve({
         return json({ error: "cannot delete the last workspace" }, 400);
       }
       const counts: Record<string, number> = {};
-      for (const t of ["companies", "contacts", "deals", "tasks", "campaigns", "activities", "captures", "custom_fields", "webhooks", "incoming_hooks", "stages", "outreach"]) {
+      for (const t of ["companies", "contacts", "deals", "tasks", "campaigns", "activities", "captures", "custom_fields", "webhooks", "incoming_hooks", "stages", "outreach", "sandbox_batches", "sandbox_rows"]) {
         counts[t] = (db.query(`SELECT COUNT(*) n FROM ${t} WHERE workspace_id = ?`).get(ws.id) as any).n;
       }
       const records = Object.values(counts).reduce((a, b) => a + b, 0);
@@ -411,7 +548,7 @@ const server = Bun.serve({
       for (const f of capFiles) {
         try { await Bun.$`rm -f ${UPLOAD_DIR}/${f.filename}`.quiet(); } catch {}
       }
-      for (const t of ["outreach", "activities", "captures", "tasks", "deals", "contacts", "campaigns", "companies", "stages"]) {
+      for (const t of ["outreach", "activities", "captures", "tasks", "deals", "contacts", "campaigns", "companies", "stages", "sandbox_rows", "sandbox_batches"]) {
         db.prepare(`DELETE FROM ${t} WHERE workspace_id = ?`).run(ws.id);
       }
       db.prepare("DELETE FROM workspaces WHERE id = ?").run(ws.id);
@@ -833,6 +970,321 @@ const server = Bun.serve({
           },
         }
       );
+    }
+
+    // ---- data sandbox: staged mass contact imports ---------------------------------
+    // Nothing here touches the live contacts table until a batch is committed.
+    // Every row is deduplicated (vs existing contacts + within the batch) and
+    // flagged for obviously problematic data points before review.
+    const sbNormEmail = (e: string) => String(e || "").trim().toLowerCase();
+    const sbNormName = (n: string) =>
+      String(n || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+    function sbLevenshtein(a: string, b: string): number {
+      if (a === b) return 0;
+      const m = a.length, n = b.length;
+      if (!m) return n; if (!n) return m;
+      let prev = Array.from({ length: n + 1 }, (_, i) => i);
+      for (let i = 1; i <= m; i++) {
+        const cur = [i];
+        for (let j = 1; j <= n; j++) {
+          cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+        }
+        prev = cur;
+      }
+      return prev[n];
+    }
+    // Two names match when they are identical after normalization, share the
+    // same first + last token (middle names/initials ignored), or differ by a
+    // small typo (edit distance <= 2).
+    function sbNamesMatch(a: string, b: string): boolean {
+      const na = sbNormName(a), nb = sbNormName(b);
+      if (!na || !nb) return false;
+      if (na === nb) return true;
+      const ta = na.split(" "), tb = nb.split(" ");
+      if (ta.length > 1 && tb.length > 1 && ta[0] === tb[0] && ta[ta.length - 1] === tb[tb.length - 1]) return true;
+      if (Math.abs(na.length - nb.length) <= 2 && sbLevenshtein(na, nb) <= 2) return true;
+      return false;
+    }
+    type SbFlag = { code: string; reason: string };
+    function sbFlagRow(r: { name: string; title: string; email: string; phone: string; company: string; notes: string }): SbFlag[] {
+      const flags: SbFlag[] = [];
+      const name = String(r.name || "").trim();
+      const email = String(r.email || "").trim();
+      const phone = String(r.phone || "").trim();
+      if (!name) flags.push({ code: "missing-name", reason: "No name — this row needs a name before it can be imported." });
+      if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
+        flags.push({ code: "bad-email", reason: `"${email}" is not a valid email address.` });
+      }
+      if (phone) {
+        const digits = phone.replace(/\D/g, "");
+        if (/[a-zA-Z]/.test(phone) || digits.length < 7) {
+          flags.push({ code: "bad-phone", reason: `"${phone}" is not a valid phone number.` });
+        }
+      }
+      const junkRe = /^(test|tests|testing|asdf+|qwerty+|xxx+|lorem|ipsum|foo|bar|baz|n\/a|na|none|null|undefined|tbd|todo|sample|example|demo)$/i;
+      const repeatedRe = /^(.)\1{3,}$/;
+      for (const [label, v] of [["name", name], ["title", r.title], ["company", r.company]] as [string, string][]) {
+        const t = String(v || "").trim();
+        const compact = t.toLowerCase().replace(/[^a-z0-9]/g, "");
+        if (t && (junkRe.test(t) || (compact.length >= 4 && repeatedRe.test(compact)))) {
+          flags.push({ code: "junk", reason: `${label} "${t}" looks like junk data.` });
+        }
+      }
+      if (name.length > 3 && /[A-Z]/.test(name) && name === name.toUpperCase()) {
+        flags.push({ code: "all-caps", reason: "Name is ALL CAPS — probably a formatting glitch." });
+      }
+      if (name.length > 3 && /[a-z]/.test(name) && !/[A-Z]/.test(name)) {
+        flags.push({ code: "no-caps", reason: "Name has no capital letters — may need cleanup." });
+      }
+      for (const [label, v, max] of [["name", name, 120], ["title", r.title, 120], ["email", email, 200], ["phone", phone, 60], ["company", r.company, 160], ["notes", r.notes, 2000]] as [string, string, number][]) {
+        const t = String(v || "").trim();
+        if (t.length > max) flags.push({ code: "too-long", reason: `${label} is unusually long (${t.length} characters).` });
+      }
+      return flags;
+    }
+    // Recompute status / dup links / flags for every row of a batch.
+    function sbAnalyzeBatch(batchId: number, w: number): void {
+      const rows = db
+        .query("SELECT * FROM sandbox_rows WHERE batch_id = ? AND workspace_id = ? ORDER BY row_num, id")
+        .all(batchId, w) as any[];
+      const existing = db
+        .query("SELECT id, name, email FROM contacts WHERE workspace_id = ?")
+        .all(w) as any[];
+      const upd = db.prepare(
+        "UPDATE sandbox_rows SET status = ?, dup_of_contact_id = ?, dup_of_row_id = ?, flags = ? WHERE id = ?"
+      );
+      const seen: any[] = [];
+      for (const r of rows) {
+        const email = sbNormEmail(r.email);
+        let dupContact: any = null;
+        let dupRow: any = null;
+        if (email) {
+          dupContact = existing.find((c: any) => sbNormEmail(c.email) === email) || null;
+          if (!dupContact) dupRow = seen.find((s: any) => sbNormEmail(s.email) === email) || null;
+        }
+        if (!dupContact && !dupRow) {
+          dupContact = existing.find((c: any) => sbNamesMatch(c.name, r.name)) || null;
+          if (!dupContact) dupRow = seen.find((s: any) => sbNamesMatch(s.name, r.name)) || null;
+        }
+        const flags = sbFlagRow(r).concat(JSON.parse(r.extra_flags || "[]"));
+        const status = dupContact || dupRow ? "duplicate" : flags.length ? "flagged" : "clean";
+        upd.run(status, dupContact ? dupContact.id : 0, dupRow ? dupRow.id : 0, JSON.stringify(flags), r.id);
+        seen.push(r);
+      }
+      const n = (db.query("SELECT COUNT(*) n FROM sandbox_rows WHERE batch_id = ?").get(batchId) as any).n;
+      db.prepare("UPDATE sandbox_batches SET row_count = ? WHERE id = ?").run(n, batchId);
+    }
+    function sbBatchOr404(id: number, w: number): any {
+      return (db.query("SELECT * FROM sandbox_batches WHERE id = ? AND workspace_id = ?").get(id, w) as any) || null;
+    }
+    function sbSummary(batchId: number): Record<string, number> {
+      const rows = db.query("SELECT status, decision FROM sandbox_rows WHERE batch_id = ?").all(batchId) as any[];
+      const s: Record<string, number> = { total: rows.length, clean: 0, duplicates: 0, flagged: 0, approved: 0, rejected: 0, pending: 0 };
+      for (const r of rows) {
+        if (r.status === "clean") s.clean++;
+        else if (r.status === "duplicate") s.duplicates++;
+        else if (r.status === "flagged") s.flagged++;
+        if (r.decision === "approved") s.approved++;
+        else if (r.decision === "rejected") s.rejected++;
+        else s.pending++;
+      }
+      return s;
+    }
+    // POST /api/sandbox/batches { name?, filename?, csv } — stage a CSV import
+    // or { name?, filename?, vcf } — stage a vCard (.vcf) import. The filename
+    // may also carry the .vcf extension with the payload in `csv` (robustness).
+    if (path === "/api/sandbox/batches" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const b = await readBody(req);
+      const rawCsv = String(b.csv || "");
+      const rawVcf = String(b.vcf || "");
+      const fname = String(b.filename || "");
+      const wantVcf = rawVcf.length > 0 || (/\.vcf$/i.test(fname) && /^\s*BEGIN:VCARD/mi.test(rawCsv));
+      const raw = wantVcf ? (rawVcf || rawCsv) : rawCsv;
+      if (!raw) return json({ error: "empty upload" }, 400);
+      if (raw.length > 5 * 1024 * 1024) return json({ error: `${wantVcf ? "VCF" : "CSV"} is too large (5 MB max)` }, 400);
+      const warnings: string[] = [];
+      if (raw.includes("�")) warnings.push("Some characters could not be decoded — check the file encoding (UTF-8 works best).");
+      let staged: { name: string; title: string; email: string; phone: string; company: string; notes: string; extraFlags: SbFlag[] }[];
+      if (wantVcf) {
+        staged = parseVcf(raw);
+        if (!staged.length) return json({ error: "no vCards found in this file" }, 400);
+        if (staged.length > 5000) return json({ error: "too many vCards (5,000 max per batch)" }, 400);
+      } else {
+        const firstLine = raw.split(/\r?\n/, 1)[0] || "";
+        if (firstLine && !firstLine.includes(",") && (firstLine.includes(";") || firstLine.includes("\t"))) {
+          return json({ error: "This looks like a semicolon/tab-delimited file — please export it as comma-separated CSV and try again." }, 400);
+        }
+        const rows = parseCsv(raw);
+        if (!rows.length) return json({ error: "empty CSV" }, 400);
+        if (rows.length - 1 > 5000) return json({ error: "too many rows (5,000 max per batch)" }, 400);
+        const header = rows[0].map((h) => h.trim().toLowerCase());
+        const col = (...names: string[]) => {
+          for (const n of names) { const i = header.indexOf(n); if (i >= 0) return i; }
+          return -1;
+        };
+        const iName = col("name", "full name", "contact", "contact name", "fullname");
+        const iTitle = col("title", "job title", "role", "position");
+        const iCompany = col("company", "company name", "organization", "organisation");
+        const iEmail = col("email", "e-mail", "email address");
+        const iPhone = col("phone", "phone number", "tel", "mobile", "cell");
+        const iNotes = col("notes", "note", "comments", "comment", "memo");
+        const cell = (r: string[], i: number) => (i >= 0 ? (r[i] || "").trim() : "");
+        staged = rows.slice(1).map((r) => ({
+          name: cell(r, iName), title: cell(r, iTitle), email: cell(r, iEmail),
+          phone: cell(r, iPhone), company: cell(r, iCompany), notes: cell(r, iNotes),
+          extraFlags: [] as SbFlag[],
+        }));
+      }
+      const name = String(b.name || "").trim() || `Import ${new Date().toISOString().slice(0, 10)}`;
+      const batchId = Number(
+        db.prepare("INSERT INTO sandbox_batches (workspace_id, name, filename, source) VALUES (?, ?, ?, ?)")
+          .run(w, name, fname.slice(0, 200), wantVcf ? "vcf" : "csv").lastInsertRowid
+      );
+      const ins = db.prepare(
+        "INSERT INTO sandbox_rows (batch_id, workspace_id, row_num, name, title, email, phone, company, notes, extra_flags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      );
+      staged.forEach((s, n) => {
+        ins.run(batchId, w, n + 1, s.name, s.title, s.email, s.phone, s.company, s.notes, JSON.stringify(s.extraFlags || []));
+      });
+      sbAnalyzeBatch(batchId, w);
+      const batch = db.query("SELECT * FROM sandbox_batches WHERE id = ?").get(batchId);
+      return json({ batch, summary: sbSummary(batchId), warnings }, 201);
+    }
+    // GET /api/sandbox/batches — list batches with summaries
+    if (path === "/api/sandbox/batches" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const batches = db
+        .query("SELECT * FROM sandbox_batches WHERE workspace_id = ? ORDER BY id DESC")
+        .all(w) as any[];
+      return json({ batches: batches.map((x: any) => ({ ...x, summary: sbSummary(x.id) })) });
+    }
+    const sbBatchId = path.match(/^\/api\/sandbox\/batches\/(\d+)$/);
+    // GET /api/sandbox/batches/:id — batch + rows (dup links resolved)
+    if (sbBatchId && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const batch = sbBatchOr404(Number(sbBatchId[1]), w);
+      if (!batch) return json({ error: "not found" }, 404);
+      const rows = db
+        .query("SELECT * FROM sandbox_rows WHERE batch_id = ? AND workspace_id = ? ORDER BY row_num, id")
+        .all(batch.id, w) as any[];
+      const contactIds = rows.map((r: any) => r.dup_of_contact_id).filter((x: number) => x > 0);
+      const rowIds = rows.map((r: any) => r.dup_of_row_id).filter((x: number) => x > 0);
+      const cById = new Map<number, any>();
+      if (contactIds.length) {
+        for (const c of db.query(`SELECT id, name, email FROM contacts WHERE id IN (${contactIds.map(() => "?").join(",")})`).all(...contactIds) as any[]) cById.set(c.id, c);
+      }
+      const rById = new Map<number, any>();
+      if (rowIds.length) {
+        for (const r of db.query(`SELECT id, row_num, name, email FROM sandbox_rows WHERE id IN (${rowIds.map(() => "?").join(",")})`).all(...rowIds) as any[]) rById.set(r.id, r);
+      }
+      return json({
+        batch: { ...batch, summary: sbSummary(batch.id) },
+        rows: rows.map((r: any) => ({
+          ...r,
+          flags: JSON.parse(r.flags || "[]"),
+          dup_contact: r.dup_of_contact_id ? cById.get(r.dup_of_contact_id) || null : null,
+          dup_row: r.dup_of_row_id ? rById.get(r.dup_of_row_id) || null : null,
+        })),
+      });
+    }
+    // DELETE /api/sandbox/batches/:id — delete staged rows + batch; never live contacts
+    if (sbBatchId && method === "DELETE") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const batch = sbBatchOr404(Number(sbBatchId[1]), w);
+      if (!batch) return json({ error: "not found" }, 404);
+      const n = (db.query("SELECT COUNT(*) n FROM sandbox_rows WHERE batch_id = ?").get(batch.id) as any).n;
+      db.prepare("DELETE FROM sandbox_rows WHERE batch_id = ?").run(batch.id);
+      db.prepare("DELETE FROM sandbox_batches WHERE id = ?").run(batch.id);
+      return json({ ok: true, deleted_rows: n });
+    }
+    // POST /api/sandbox/batches/:id/decision { action } — bulk approve-clean / reject-duplicates
+    const sbDecision = path.match(/^\/api\/sandbox\/batches\/(\d+)\/decision$/);
+    if (sbDecision && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const batch = sbBatchOr404(Number(sbDecision[1]), w);
+      if (!batch) return json({ error: "not found" }, 404);
+      if (batch.status !== "open") return json({ error: "batch is already complete" }, 400);
+      const b = await readBody(req);
+      let changed = 0;
+      if (b.action === "approve-clean") {
+        changed = Number(db.prepare("UPDATE sandbox_rows SET decision = 'approved' WHERE batch_id = ? AND workspace_id = ? AND status = 'clean' AND decision = 'pending'").run(batch.id, w).changes);
+      } else if (b.action === "reject-duplicates") {
+        // Also rejects vCard rows flagged unusable (no name and no email) —
+        // there is nothing worth importing in them.
+        changed = Number(db.prepare(
+          "UPDATE sandbox_rows SET decision = 'rejected' WHERE batch_id = ? AND workspace_id = ? AND decision = 'pending' AND (status = 'duplicate' OR flags LIKE '%\"code\":\"unusable\"%')"
+        ).run(batch.id, w).changes);
+      } else {
+        return json({ error: 'unknown action (use "approve-clean" or "reject-duplicates")' }, 400);
+      }
+      return json({ ok: true, changed, summary: sbSummary(batch.id) });
+    }
+    // POST /api/sandbox/batches/:id/commit — import approved, non-duplicate rows
+    const sbCommit = path.match(/^\/api\/sandbox\/batches\/(\d+)\/commit$/);
+    if (sbCommit && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const batch = sbBatchOr404(Number(sbCommit[1]), w);
+      if (!batch) return json({ error: "not found" }, 404);
+      if (batch.status !== "open") return json({ error: "batch is already complete" }, 400);
+      const rows = db
+        .query("SELECT * FROM sandbox_rows WHERE batch_id = ? AND workspace_id = ? AND decision = 'approved' ORDER BY row_num, id")
+        .all(batch.id, w) as any[];
+      const companyCache = new Map<string, number>();
+      const companyIdFor = (nm: string): number | null => {
+        const key = nm.trim().toLowerCase();
+        if (!key) return null;
+        const hit = companyCache.get(key);
+        if (hit !== undefined) return hit;
+        const existing = db.query("SELECT id FROM companies WHERE lower(name) = ? AND workspace_id = ?").get(key, w) as any;
+        const id = existing ? existing.id : Number(db.prepare("INSERT INTO companies (name, workspace_id) VALUES (?, ?)").run(nm.trim(), w).lastInsertRowid);
+        companyCache.set(key, id);
+        return id;
+      };
+      let imported = 0, skipped = 0;
+      const ins = db.prepare("INSERT INTO contacts (company_id, name, title, email, phone, workspace_id) VALUES (?, ?, ?, ?, ?, ?)");
+      for (const r of rows) {
+        if (r.status === "duplicate") { skipped++; continue; }
+        ins.run(companyIdFor(r.company || ""), r.name || "Unnamed", r.title || "", r.email || "", r.phone || "", w);
+        imported++;
+      }
+      db.prepare("UPDATE sandbox_batches SET status = 'complete', completed_at = datetime('now') WHERE id = ?").run(batch.id);
+      // bulk commits intentionally don't fire outgoing webhooks
+      logActivity("contact", `Sandbox import "${batch.name}": ${imported} contact${imported === 1 ? "" : "s"} imported, ${skipped} duplicate${skipped === 1 ? "" : "s"} skipped`, w);
+      return json({ ok: true, imported, skipped, summary: sbSummary(batch.id) });
+    }
+    // PATCH /api/sandbox/rows/:id — edit fields (re-analyzes the batch) or set decision
+    const sbRowId = path.match(/^\/api\/sandbox\/rows\/(\d+)$/);
+    if (sbRowId && method === "PATCH") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const row = db.query("SELECT * FROM sandbox_rows WHERE id = ? AND workspace_id = ?").get(Number(sbRowId[1]), w) as any;
+      if (!row) return json({ error: "not found" }, 404);
+      const batch = sbBatchOr404(row.batch_id, w);
+      if (!batch) return json({ error: "batch not found" }, 404);
+      if (batch.status !== "open") return json({ error: "batch is already complete" }, 400);
+      const b = await readBody(req);
+      if (b.decision !== undefined) {
+        if (!["pending", "approved", "rejected"].includes(b.decision)) return json({ error: "bad decision" }, 400);
+        db.prepare("UPDATE sandbox_rows SET decision = ? WHERE id = ?").run(b.decision, row.id);
+      }
+      const sets: string[] = [];
+      const vals: unknown[] = [];
+      for (const k of ["name", "title", "email", "phone", "company", "notes"]) {
+        if (b[k] !== undefined) { sets.push(`${k} = ?`); vals.push(String(b[k]).trim()); }
+      }
+      if (sets.length) {
+        db.prepare(`UPDATE sandbox_rows SET ${sets.join(", ")} WHERE id = ?`).run(...vals, row.id);
+        sbAnalyzeBatch(row.batch_id, w);
+      }
+      const updated = db.query("SELECT * FROM sandbox_rows WHERE id = ?").get(row.id);
+      return json({ row: updated, summary: sbSummary(row.batch_id) });
     }
 
     // ---- companies

@@ -157,6 +157,36 @@ CREATE TABLE IF NOT EXISTS captures (
   contact_id INTEGER REFERENCES contacts(id),
   created_at TEXT DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS sandbox_batches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER REFERENCES workspaces(id),
+  name TEXT NOT NULL,
+  filename TEXT DEFAULT '',
+  source TEXT DEFAULT 'csv',
+  status TEXT DEFAULT 'open',
+  row_count INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now')),
+  completed_at TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS sandbox_rows (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id INTEGER REFERENCES sandbox_batches(id),
+  workspace_id INTEGER REFERENCES workspaces(id),
+  row_num INTEGER DEFAULT 0,
+  name TEXT DEFAULT '',
+  title TEXT DEFAULT '',
+  email TEXT DEFAULT '',
+  phone TEXT DEFAULT '',
+  company TEXT DEFAULT '',
+  notes TEXT DEFAULT '',
+  status TEXT DEFAULT 'clean',
+  decision TEXT DEFAULT 'pending',
+  dup_of_contact_id INTEGER DEFAULT 0,
+  dup_of_row_id INTEGER DEFAULT 0,
+  flags TEXT DEFAULT '[]',
+  extra_flags TEXT DEFAULT '[]',
+  created_at TEXT DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS campaigns (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
@@ -250,7 +280,7 @@ export function openDb(path: string): Database {
   const SCOPED = [
     "companies", "contacts", "deals", "tasks", "campaigns",
     "activities", "captures", "custom_fields", "webhooks", "incoming_hooks",
-    "outreach",
+    "outreach", "sandbox_batches", "sandbox_rows",
   ];
   for (const t of SCOPED) {
     const cols = db.query(`PRAGMA table_info(${t})`).all() as any[];
@@ -263,6 +293,20 @@ export function openDb(path: string): Database {
   db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_ws ON tasks(workspace_id)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_companies_ws ON companies(workspace_id)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_outreach_ws ON outreach(workspace_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_sandbox_rows_batch ON sandbox_rows(batch_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_sandbox_rows_ws ON sandbox_rows(workspace_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_sandbox_batches_ws ON sandbox_batches(workspace_id)");
+  // migration: sandbox batches gained a source type ('csv' or 'vcf'), and
+  // sandbox rows gained extra_flags (source-specific flags that survive
+  // re-analysis, e.g. vCard multi-email notes).
+  const sbBatchCols = db.query("PRAGMA table_info(sandbox_batches)").all() as any[];
+  if (!sbBatchCols.some((c) => c.name === "source")) {
+    addColumn("sandbox_batches", "source TEXT DEFAULT 'csv'");
+  }
+  const sbRowCols = db.query("PRAGMA table_info(sandbox_rows)").all() as any[];
+  if (!sbRowCols.some((c) => c.name === "extra_flags")) {
+    addColumn("sandbox_rows", "extra_flags TEXT DEFAULT '[]'");
+  }
   const mainId = ensureMainWorkspace(db);
   for (const t of SCOPED) {
     db.exec(`UPDATE ${t} SET workspace_id = ${mainId} WHERE workspace_id IS NULL`);

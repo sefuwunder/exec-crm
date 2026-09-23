@@ -51,8 +51,12 @@ describe("nav: pipeline is no longer top-level", () => {
   test("sidebar nav has no pipeline entry, keeps the rest", () => {
     const nav = indexSrc.match(/<nav class="nav" id="nav">[\s\S]*?<\/nav>/)![0];
     expect(nav).not.toContain('data-r="pipeline"');
-    for (const r of ["dashboard", "feed", "campaigns", "captures", "schema", "automations"]) {
+    for (const r of ["dashboard", "feed", "campaigns", "workshop"]) {
       expect(nav).toContain(`data-r="${r}"`);
+    }
+    // the three old top-level workshop sections are tabs now, not nav items
+    for (const r of ["captures", "schema", "automations"]) {
+      expect(nav).not.toContain(`data-r="${r}"`);
     }
   });
 
@@ -81,8 +85,11 @@ describe("nav: contacts/companies are no longer top-level", () => {
     const nav = indexSrc.match(/<nav class="nav" id="nav">[\s\S]*?<\/nav>/)![0];
     expect(nav).not.toContain('data-r="contacts"');
     expect(nav).not.toContain('data-r="companies"');
-    for (const r of ["dashboard", "feed", "campaigns", "captures", "schema", "automations"]) {
+    for (const r of ["dashboard", "feed", "campaigns", "workshop"]) {
       expect(nav).toContain(`data-r="${r}"`);
+    }
+    for (const r of ["captures", "schema", "automations"]) {
+      expect(nav).not.toContain(`data-r="${r}"`);
     }
   });
 

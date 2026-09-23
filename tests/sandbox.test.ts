@@ -250,6 +250,26 @@ describe("sandbox tab (DOM-stubbed)", () => {
   test("WORKSHOP_TABS has the sandbox tab and vWorkshop dispatches vSandbox", () => {
     expect(appSrc).toContain('["sandbox", "Sandbox"]');
     expect(appSrc).toContain('else if (tab === "sandbox") await vSandbox(root);');
+    // all four tabs present, in order
+    for (const t of ['["captures", "Captures"]', '["schema", "Schema"]', '["automation", "Automation"]', '["sandbox", "Sandbox"]']) {
+      expect(appSrc).toContain(t);
+    }
+  });
+  test("nav has one Data Workshop item; legacy top-level routes redirect into tabs", () => {
+    const indexSrc = readFileSync(join(new URL(".", import.meta.url).pathname, "..", "public", "index.html"), "utf8");
+    expect(indexSrc).toContain('data-r="workshop"');
+    expect(indexSrc).toContain("#/workshop");
+    expect(indexSrc).not.toContain('data-r="captures"');
+    expect(indexSrc).not.toContain('data-r="automations"');
+    expect(indexSrc).not.toContain('data-r="schema"');
+    // router: legacy routes rewrite to #/workshop/<tab>
+    expect(appSrc).toContain('captures: "captures", automations: "automation", schema: "schema"');
+    expect(appSrc).toContain("`#/workshop/${LEGACY_ROUTES[r]}`");
+    // router: workshop dispatches with the sub-path
+    expect(appSrc).toContain("await vWorkshop(parts[1])");
+    // palette offers Data Workshop, not the old separate entries
+    expect(appSrc).toContain('["Data Workshop", "#/workshop"]');
+    expect(appSrc).not.toContain('["Captures", "#/captures"]');
   });
   test("list view renders drop zone, batch cards with counts, and upload wiring", async () => {
     let html = "";

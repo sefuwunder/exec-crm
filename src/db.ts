@@ -284,8 +284,25 @@ CREATE TABLE IF NOT EXISTS widget_set_versions (
   members TEXT NOT NULL DEFAULT '[]',
   created_at TEXT DEFAULT (datetime('now'))
 );
+-- Widget PROPOSALS (phase 3): Milton proposes a widget or set, the user
+-- previews it and approves it in chat. A proposal carries the full bundle
+-- (widget: manifest + js + css; set: manifest + member bundles) plus
+-- Milton's rationale. status is pending | approved | declined. Approving
+-- installs through the normal registry/set paths — the user's tap is the
+-- permission grant. Workspace-scoped like the rest of the scaffold.
+CREATE TABLE IF NOT EXISTS widget_proposals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER REFERENCES workspaces(id),
+  kind TEXT NOT NULL DEFAULT 'widget',
+  title TEXT NOT NULL DEFAULT '',
+  rationale TEXT NOT NULL DEFAULT '',
+  payload TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'pending',
+  decided_at TEXT DEFAULT '',
+  created_at TEXT DEFAULT (datetime('now')),
+  UNIQUE(workspace_id, kind, title)
+);
 `;
-
 export function openDb(path: string): Database {
   const db = new Database(path, { create: true });
   // Wait on lock contention instead of failing fast: two processes may open

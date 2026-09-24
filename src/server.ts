@@ -494,6 +494,187 @@ function setPublic(row: any, w: number) {
   };
 }
 
+// Install (or update) a set from already-validated member bundles. Shared by
+// the manual POST /api/widget-sets route and proposal approval — approving a
+// set proposal installs exactly what a manual install would.
+function installWidgetSetFromValidated(w: number, setManifest: any, validated: { manifest: any; js: string; css: string }[]) {
+  for (const m of validated) widgetUpsert(w, m.manifest, m.js, m.css);
+  const snapshot = setMembersSnapshot(w, validated.map((m) => ({ name: m.manifest.name })));
+  const existing = db
+    .query("SELECT * FROM widget_sets WHERE workspace_id = ? AND name = ?")
+    .get(w, setManifest.name) as any;
+  const now = new Date().toISOString().slice(0, 19).replace("T", " ");
+  let set: any;
+  let installed = false;
+  if (existing) {
+    // pop semantics, like widget rollback: the prior set state goes into
+    // history first so a rollback can restore it.
+    snapshotSetVersion(existing);
+    db.prepare(
+      `UPDATE widget_sets SET title = ?, version = ?, description = ?, members = ?,
+       updated_at = ? WHERE id = ?`
+    ).run(setManifest.title, setManifest.version, setManifest.description,
+      JSON.stringify(snapshot), now, existing.id);
+    set = setRow(existing.id, w);
+  } else {
+    const r = db
+      .prepare(
+        `INSERT INTO widget_sets (workspace_id, name, title, version, description, members)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(w, setManifest.name, setManifest.title, setManifest.version,
+        setManifest.description, JSON.stringify(snapshot));
+    set = setRow(Number(r.lastInsertRowid), w);
+    installed = true;
+  }
+  return { set: setPublic(set, w), installed };
+}
+
+// ---- widget proposals (phase 3) ---------------------------------------------
+// Public view: everything the chat card and manager need, without the bundle
+// payloads (those travel via /preview and the approve path instead).
+function proposalRow(id: number, w: number) {
+  return db
+    .query("SELECT * FROM widget_proposals WHERE id = ? AND workspace_id = ?")
+    .get(id, w) as any;
+}
+function proposalPublic(row: any) {
+  let payload: any = {};
+  try { payload = JSON.parse(row.payload || "{}"); } catch {}
+  const perms = proposalPermissions(payload, row.kind);
+  return {
+    id: row.id, kind: row.kind, title: row.title, rationale: row.rationale || "",
+    status: row.status, decided_at: row.decided_at || "", created_at: row.created_at,
+    permissions: perms,
+    // enough for the review card without shipping the bundles
+    members: row.kind === "set"
+      ? (Array.isArray(payload.members) ? payload.members.map((m: any) => ({
+          name: m?.manifest?.name || "", title: m?.manifest?.title || "",
+          version: m?.manifest?.version || "",
+          permissions: Array.isArray(m?.manifest?.permissions) ? m.manifest.permissions : [],
+        })) : [])
+      : [],
+    manifest: row.kind === "widget" && payload.manifest
+      ? { name: payload.manifest.name || "", title: payload.manifest.title || "",
+          version: payload.manifest.version || "", mount: payload.manifest.mount || "" }
+      : undefined,
+  };
+}
+// Union of permissions across a proposal: the widget's own, or the set's
+// member union — the same grant the install review would show.
+function proposalPermissions(payload: any, kind: string): string[] {
+  const all = (arr: any[]) => (Array.isArray(arr) ? arr : []).filter((p) => typeof p === "string");
+  if (kind === "set") {
+    const seen = new Set<string>();
+    for (const m of Array.isArray(payload.members) ? payload.members : [])
+      for (const p of all(m?.manifest?.permissions)) seen.add(p);
+    return [...seen];
+  }
+  return all(payload?.manifest?.permissions);
+}
+// Validate a proposal body. Returns {kind, title, rationale, payload} or {error}.
+function validateProposal(b: any): { kind?: string; title?: string; rationale?: string; payload?: any; error?: string } {
+  const kind = String(b.kind || "widget");
+  if (kind !== "widget" && kind !== "set") return { error: 'kind must be "widget" or "set"' };
+  const title = String(b.title || "").trim();
+  if (!title) return { error: "title is required" };
+  if (title.length > 120) return { error: "title too long (max 120)" };
+  const rationale = String(b.rationale || "").slice(0, 2000);
+  if (kind === "widget") {
+    const v = validateWidgetManifest(b.manifest);
+    if (v.error) return { error: v.error };
+    const js = typeof b.js === "string" ? b.js : "";
+    const css = typeof b.css === "string" ? b.css : "";
+    if (!js.trim()) return { error: "widget js is required" };
+    if (Buffer.byteLength(js, "utf8") > WIDGET_MAX_JS)
+      return { error: `widget js too large (max ${WIDGET_MAX_JS / 1024}KB)` };
+    if (Buffer.byteLength(css, "utf8") > WIDGET_MAX_CSS)
+      return { error: `widget css too large (max ${WIDGET_MAX_CSS / 1024}KB)` };
+    return { kind, title, rationale, payload: { manifest: v.manifest, js, css } };
+  }
+  const sv = validateWidgetSetManifest(b.manifest);
+  if (sv.error) return { error: sv.error };
+  const members = b.members;
+  if (!Array.isArray(members) || !members.length || members.length > WIDGET_SET_MAX_MEMBERS)
+    return { error: `members must be a non-empty array (max ${WIDGET_SET_MAX_MEMBERS})` };
+  const seen = new Set<string>();
+  const validated: { manifest: any; js: string; css: string }[] = [];
+  for (const m of members) {
+    const v = validateWidgetManifest(m && m.manifest);
+    if (v.error) return { error: `member: ${v.error}` };
+    if (seen.has(v.manifest.name)) return { error: `duplicate member "${v.manifest.name}"` };
+    seen.add(v.manifest.name);
+    const js = typeof m.js === "string" ? m.js : "";
+    const css = typeof m.css === "string" ? m.css : "";
+    if (!js.trim()) return { error: `member "${v.manifest.name}": widget js is required` };
+    if (Buffer.byteLength(js, "utf8") > WIDGET_MAX_JS)
+      return { error: `member "${v.manifest.name}": widget js too large` };
+    if (Buffer.byteLength(css, "utf8") > WIDGET_MAX_CSS)
+      return { error: `member "${v.manifest.name}": widget css too large` };
+    validated.push({ manifest: v.manifest, js, css });
+  }
+  return { kind, title, rationale, payload: { manifest: sv.manifest, members: validated } };
+}
+
+// The sandboxed PREVIEW document for a proposed widget. Same strict CSP as
+// the installed bundle endpoint, but the execrm bridge is stubbed: API calls
+// reject with a clear "preview mode" error, context slots return demo
+// values, events are no-ops. The widget renders, but touches nothing real.
+function widgetPreviewHtml(manifest: any, js: string, css: string, label: string): string {
+  const ctx = JSON.stringify({
+    name: manifest.name || "", title: manifest.title || label || "",
+    version: manifest.version || "",
+    permissions: Array.isArray(manifest.permissions) ? manifest.permissions : [],
+    contextSlots: ["selectedDeal", "selectedContact", "selectedCompany"],
+    preview: true,
+  }).replace(/</g, "\\u003c");
+  const escScript = (s: string) => String(s || "").replace(/<\/script/gi, "<\\/script");
+  const escStyle = (s: string) => String(s || "").replace(/<\/style/gi, "<\\/style");
+  const demoVal = (slot: string) =>
+    slot === "selectedDeal" ? { id: 1, label: "Acme Corp — Q4 rollout (demo)" }
+    : slot === "selectedContact" ? { id: 1, label: "Ada Lovelace (demo)" }
+    : slot === "selectedCompany" ? { id: 1, label: "Acme Corp (demo)" } : null;
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<style>html,body{margin:0;padding:10px 12px;font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#141824;background:#fff;box-sizing:border-box}#wroot{min-height:40px}
+.preview-banner{position:sticky;top:0;margin:-10px -12px 10px;padding:6px 12px;background:#f5efe6;color:#8a6d3b;font-size:11px;letter-spacing:.06em;text-transform:uppercase;border-bottom:1px solid #e5d9c3}
+${escStyle(css || "")}</style>
+</head><body><div class="preview-banner">Preview — demo data only, nothing is installed</div><div id="wroot"></div>
+<script>window.__EXECRM_CTX__=${ctx};</script>
+<script>
+(function () {
+  var ctx = window.__EXECRM_CTX__ || {};
+  var demo = ${JSON.stringify({ selectedDeal: demoVal("selectedDeal"), selectedContact: demoVal("selectedContact"), selectedCompany: demoVal("selectedCompany") }).replace(/</g, "\\u003c")};
+  function previewErr() { return Promise.reject(new Error("preview mode: API calls are disabled")); }
+  function ok(v) { return Promise.resolve(v); }
+  window.execrm = {
+    widget: { id: 0, name: ctx.name, title: ctx.title, version: ctx.version },
+    workspace: { id: 0, name: "preview" },
+    permissions: (ctx.permissions || []).slice(),
+    api: { get: previewErr, post: previewErr, patch: previewErr, del: previewErr },
+    context: {
+      slots: (ctx.contextSlots || []).slice(),
+      get: function (slot) { return ok(demo[String(slot)] || null); },
+      set: function () { return ok(null); },
+      on: function () { return function () {}; }
+    },
+    events: {
+      publish: function () { return ok(null); },
+      subscribe: function () { return function () {}; }
+    },
+    notify: function () {},
+    resize: function () {}
+  };
+})();
+</script>
+<script>
+${escScript(js || "")}
+</script>
+</body></html>`;
+}
+
 // The sandboxed document a widget iframe loads. Bridge stub first (postMessage
 // to the parent only — no network: the CSP below blocks connect-src), then
 // the widget's own JS. </script> inside widget code is escaped so the bundle
@@ -2683,36 +2864,116 @@ const server = Bun.serve({
       }
       // install/update the member widgets first — they become ordinary
       // registry widgets, manageable on their own after the set install.
-      for (const m of validated) widgetUpsert(w, m.manifest, m.js, m.css);
-      const snapshot = setMembersSnapshot(w, validated.map((m) => ({ name: m.manifest.name })));
-      const existing = db
-        .query("SELECT * FROM widget_sets WHERE workspace_id = ? AND name = ?")
-        .get(w, sv.manifest.name) as any;
-      const now = new Date().toISOString().slice(0, 19).replace("T", " ");
-      let set: any;
-      let installed = false;
-      if (existing) {
-        // pop semantics, like widget rollback: the prior set state goes into
-        // history first so a rollback can restore it.
-        snapshotSetVersion(existing);
-        db.prepare(
-          `UPDATE widget_sets SET title = ?, version = ?, description = ?, members = ?,
-           updated_at = ? WHERE id = ?`
-        ).run(sv.manifest.title, sv.manifest.version, sv.manifest.description,
-          JSON.stringify(snapshot), now, existing.id);
-        set = setRow(existing.id, w);
-      } else {
+      const r = installWidgetSetFromValidated(w, sv.manifest, validated);
+      return json({ set: r.set, installed: r.installed }, r.installed ? 201 : 200);
+    }
+
+    // ---- widget proposals (phase 3): Milton proposes, the user previews and
+    // approves in chat. The approve tap IS the permission grant: the proposal
+    // card shows reads and writes separately (writes in terracotta) before
+    // the user confirms, and the server installs through the same paths as
+    // a manual install.
+    const proposalIdMatch = path.match(/^\/api\/widget-proposals\/(\d+)(\/[\w-]+)?$/);
+    if (path === "/api/widget-proposals" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const b = await readBody(req);
+      const v = validateProposal(b);
+      if (v.error) return json({ error: v.error }, 400);
+      try {
         const r = db
           .prepare(
-            `INSERT INTO widget_sets (workspace_id, name, title, version, description, members)
-             VALUES (?, ?, ?, ?, ?, ?)`
+            `INSERT INTO widget_proposals (workspace_id, kind, title, rationale, payload)
+             VALUES (?, ?, ?, ?, ?)`
           )
-          .run(w, sv.manifest.name, sv.manifest.title, sv.manifest.version,
-            sv.manifest.description, JSON.stringify(snapshot));
-        set = setRow(Number(r.lastInsertRowid), w);
-        installed = true;
+          .run(w, v.kind, v.title, v.rationale, JSON.stringify(v.payload));
+        const row = proposalRow(Number(r.lastInsertRowid), w);
+        return json({ proposal: proposalPublic(row) }, 201);
+      } catch (e: any) {
+        if (String(e?.message || "").includes("UNIQUE"))
+          return json({ error: "a proposal with this title already exists in this workspace" }, 409);
+        throw e;
       }
-      return json({ set: setPublic(set, w), installed }, installed ? 201 : 200);
+    }
+    if (path === "/api/widget-proposals" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const status = String(url.searchParams.get("status") || "").trim();
+      const rows = (status === "pending" || status === "approved" || status === "declined"
+        ? db.query("SELECT * FROM widget_proposals WHERE workspace_id = ? AND status = ? ORDER BY id DESC").all(w, status)
+        : db.query("SELECT * FROM widget_proposals WHERE workspace_id = ? ORDER BY id DESC").all(w)) as any[];
+      return json({ proposals: rows.map(proposalPublic) });
+    }
+    if (proposalIdMatch && !proposalIdMatch[2] && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const row = proposalRow(Number(proposalIdMatch[1]), w);
+      if (!row) return json({ error: "proposal not found" }, 404);
+      return json({ proposal: proposalPublic(row) });
+    }
+    // Sandboxed preview of a pending proposal. For a set, ?member=<name>
+    // picks which member to render (defaults to the first).
+    if (proposalIdMatch && proposalIdMatch[2] === "/preview" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const row = proposalRow(Number(proposalIdMatch[1]), w);
+      if (!row) return new Response("not found", { status: 404 });
+      if (row.status !== "pending") return new Response("proposal is no longer pending", { status: 409 });
+      let payload: any = {};
+      try { payload = JSON.parse(row.payload || "{}"); } catch {}
+      let manifest: any, js = "", css = "", label = row.title;
+      if (row.kind === "set") {
+        const members = Array.isArray(payload.members) ? payload.members : [];
+        const want = String(url.searchParams.get("member") || "");
+        const m = members.find((x: any) => x?.manifest?.name === want) || members[0];
+        if (!m) return new Response("no members", { status: 400 });
+        manifest = m.manifest; js = m.js || ""; css = m.css || "";
+        label = `${row.title} — ${manifest.title || manifest.name}`;
+      } else {
+        manifest = payload.manifest || {}; js = payload.js || ""; css = payload.css || "";
+      }
+      return new Response(widgetPreviewHtml(manifest, js, css, label), {
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "X-Content-Type-Options": "nosniff",
+          "Content-Security-Policy":
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
+            "img-src data:; font-src data:; connect-src 'none'; frame-src 'none'; " +
+            "object-src 'none'; base-uri 'none'; form-action 'none'",
+          "Cache-Control": "no-store",
+        },
+      });
+    }
+    if (proposalIdMatch && proposalIdMatch[2] === "/approve" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const row = proposalRow(Number(proposalIdMatch[1]), w);
+      if (!row) return json({ error: "proposal not found" }, 404);
+      if (row.status !== "pending") return json({ error: `proposal already ${row.status}` }, 409);
+      let payload: any = {};
+      try { payload = JSON.parse(row.payload || "{}"); } catch {}
+      const now = new Date().toISOString().slice(0, 19).replace("T", " ");
+      let installed: any;
+      if (row.kind === "set") {
+        const members = Array.isArray(payload.members) ? payload.members : [];
+        const r = installWidgetSetFromValidated(w, payload.manifest, members);
+        installed = { type: "set", set: r.set };
+      } else {
+        const r = widgetUpsert(w, payload.manifest, payload.js || "", payload.css || "");
+        installed = { type: "widget", widget: widgetPublic(r.widget), updated: r.updated };
+      }
+      db.prepare("UPDATE widget_proposals SET status = 'approved', decided_at = ? WHERE id = ?").run(now, row.id);
+      return json({ proposal: proposalPublic(proposalRow(row.id, w)), installed });
+    }
+    if (proposalIdMatch && proposalIdMatch[2] === "/decline" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const row = proposalRow(Number(proposalIdMatch[1]), w);
+      if (!row) return json({ error: "proposal not found" }, 404);
+      if (row.status !== "pending") return json({ error: `proposal already ${row.status}` }, 409);
+      const now = new Date().toISOString().slice(0, 19).replace("T", " ");
+      db.prepare("UPDATE widget_proposals SET status = 'declined', decided_at = ? WHERE id = ?").run(now, row.id);
+      return json({ proposal: proposalPublic(proposalRow(row.id, w)) });
     }
     if (widgetSetIdMatch && !widgetSetIdMatch[2] && method === "GET") {
       const w = needWs(req, url);

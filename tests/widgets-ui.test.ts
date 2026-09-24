@@ -76,7 +76,8 @@ function bootApp(canned: Record<string, any>, widgets = WIDGETS) {
   const factory = new Function("document", "fetch", "location", "localStorage", "confirm", "window",
     appSrc + `\nreturn { route, vDashboard, vWidgetManager, widgetCheckManifest, widgetPermChips,
       widgetReviewHtml, widgetSlotHtml, widgetCardHtml, widgetOnMessage, widgetIframes, widgetNotify,
-      widgetHostContext, widgetCheckSetDef, widgetSetReviewHtml, widgetSetCardHtml, widgetBridgeReset };`);
+      widgetHostContext, widgetCheckSetDef, widgetSetReviewHtml, widgetSetCardHtml, widgetBridgeReset,
+      widgetProposalCardHtml, proposalApprove, proposalUiState, proposalPermsSplit };`);
   const app = factory(documentStub, fetchStub, locationStub, localStorageStub, () => true, { addEventListener() {} });
   const view = () => documentStub.querySelector("#view").innerHTML as string;
   const waitFor = async (pred: (h: string) => boolean, label: string) => {
@@ -100,6 +101,7 @@ const BOOT_CANNED = {
   "/api/milton/status": { ok: false, reachable: false },
   "/api/widgets": WIDGETS,
   "/api/widget-sets": { sets: [] },
+  "/api/widget-proposals": { proposals: [] },
 };
 
 describe("widget dashboard slots (DOM-stubbed)", () => {
@@ -477,5 +479,78 @@ describe("phase 2: workspace isolation of bridge state", () => {
     app.widgetIframes.set(8, { contentWindow: cw, style: {} });
     app.widgetOnMessage({ source: cw, data: { type: "widget-context-set", reqId: "c2", slot: "selectedDeal", value: { id: 2 } } });
     expect(msgs.filter((m: any) => m.type === "widget-context-change")).toHaveLength(0);
+  });
+});
+
+const PROPOSAL = {
+  id: 5, kind: "widget", title: "Stalled Radar", rationale: "Six deals are stuck.",
+  status: "pending", created_at: "2026-09-24 11:00:00",
+  manifest: { name: "stalled-radar", title: "Stalled Radar", version: "1.0.0", description: "Keeps stalled deals visible." },
+  permissions: ["deals:read", "tasks:write"], members: null,
+};
+
+describe("phase 3: proposal cards (DOM-stubbed)", () => {
+  test("manager renders the proposals section with permission-split cards", async () => {
+    const canned = { ...BOOT_CANNED, "/api/widget-proposals": { proposals: [PROPOSAL] } };
+    const { app, view, waitFor } = bootApp(canned);
+    await app.vWidgetManager();
+    await waitFor((h) => h.includes("Proposals"), "proposals section");
+    const h = view();
+    expect(h).toContain("Proposals");
+    expect(h).toContain("Stalled Radar");
+    expect(h).toContain("Six deals are stuck.");
+    expect(h).toContain("Can read");
+    expect(h).toContain("Can write");
+    expect(h).toContain('class="perm write"'); // writes in terracotta
+    expect(h).toContain('data-prop-act="preview"');
+    expect(h).toContain('data-prop-act="approve"');
+    expect(h).toContain('data-prop-act="decline"');
+    expect(h).toContain('data-prop-id="5"');
+  });
+
+  test("proposalPermsSplit separates reads from writes", () => {
+    const { app } = bootApp(BOOT_CANNED);
+    const s = app.proposalPermsSplit(["deals:read", "tasks:write", "feed:write"]);
+    expect(s.reads).toEqual(["deals:read"]);
+    expect(s.writes).toEqual(["tasks:write", "feed:write"]);
+  });
+
+  function fakeBtn(writes: number) {
+    const card = { querySelectorAll: (sel: string) => sel === ".perm.write" ? Array(writes).fill({}) : [] };
+    return { dataset: {} as Record<string, string>, textContent: "Approve", disabled: false,
+      closest: (sel: string) => sel === ".mprop" ? card : null };
+  }
+
+  test("approve needs no second tap when the proposal is read-only", async () => {
+    const { app, fetched } = bootApp(BOOT_CANNED);
+    await app.proposalApprove(fakeBtn(0), 5);
+    expect(fetched.some((f) => f.startsWith("POST") && f.includes("/api/widget-proposals/5/approve"))).toBe(true);
+    expect(app.proposalUiState.armed).toBeNull();
+  });
+
+  test("approve with write permissions arms first, then installs on the second tap", async () => {
+    const { app, fetched } = bootApp(BOOT_CANNED);
+    const btn = fakeBtn(1);
+    await app.proposalApprove(btn, 5);
+    expect(fetched.some((f) => f.includes("/api/widget-proposals/5/approve"))).toBe(false);
+    expect(app.proposalUiState.armed).toBe("5");
+    expect(btn.textContent).toContain("Tap again");
+    await app.proposalApprove(btn, 5);
+    expect(fetched.some((f) => f.startsWith("POST") && f.includes("/api/widget-proposals/5/approve"))).toBe(true);
+    expect(app.proposalUiState.armed).toBeNull();
+  });
+
+  test("proposal card shows decided proposals in their final state", async () => {
+    // decided proposals get a compact summary row, never action buttons
+    const decided = { ...PROPOSAL, id: 8, title: "Decline me", status: "declined", decided_at: "2026-09-24 12:00:00" };
+    const canned = { ...BOOT_CANNED, "/api/widget-proposals": { proposals: [decided] } };
+    const { app, view, waitFor } = bootApp(canned);
+    await app.vWidgetManager();
+    await waitFor((h) => h.includes("Proposals"), "proposals section");
+    const h = view();
+    expect(h).toContain("No pending proposals");
+    expect(h).toContain("Decline me");
+    expect(h).toContain("declined");
+    expect(h).not.toContain('data-prop-act="approve"');
   });
 });

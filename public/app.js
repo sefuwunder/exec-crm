@@ -825,15 +825,17 @@ function widgetCardHtml(w) {
 }
 /* Widgets manager — reached from the Dashboard gear, not the nav (stays 4 items). */
 async function vWidgetManager() {
-  let widgets = [];
-  let sets = [];
+  let widgets = [], sets = [], proposals = [];
   try {
     widgets = (await GET("/api/widgets")).widgets || [];
     sets = (await GET("/api/widget-sets")).sets || [];
+    proposals = (await GET("/api/widget-proposals")).proposals || [];
   } catch (e) {
     view.innerHTML = `<div class="empty">Couldn't load widgets: ${esc(e.message)}</div>`;
     return;
   }
+  const pending = proposals.filter((p) => p.status === "pending");
+  const decided = proposals.filter((p) => p.status !== "pending").slice(0, 5);
   view.innerHTML = `
     <div class="wm-head">
       <button class="btn ghost sm" id="wm-back">← Dashboard</button>
@@ -842,6 +844,14 @@ async function vWidgetManager() {
       <span class="spacer"></span>
       <button class="btn ghost" id="wm-install-set">Install set</button>
       <button class="btn" id="wm-install">Install widget</button>
+    </div>
+    <div class="wm-sec"><div class="wm-sec-head"><h2>Proposals</h2>
+      <div class="muted">Widgets Milton proposed — preview them here or in the Milton chat, then approve to install.</div></div>
+      <div class="wm-list">${pending.map(widgetProposalCardHtml).join("") ||
+        `<div class="panel"><div class="empty">No pending proposals. When Milton proposes a widget, it lands here and in the chat.</div></div>`}
+        ${decided.map((p) => `<div class="mcard"><div class="mcard-title">${p.status === "approved" ? "✅" : "✕"} ${esc(p.title)}</div>
+          <div class="msub">${esc(p.kind === "set" ? "widget set" : "widget")} · ${esc(p.status)}${p.decided_at ? ` · ${esc(String(p.decided_at).slice(0, 16).replace("T", " "))}` : ""}</div></div>`).join("")}
+      </div>
     </div>
     <div class="wm-sec"><div class="wm-sec-head"><h2>Widget sets</h2>
       <div class="muted">Bundles of widgets that work together — one install, one permission grant, one rollback.</div></div>
@@ -1529,6 +1539,7 @@ function initMiltonDock() {
       paint();
       paintChips(rep.chips);
       setStatus(true);
+      refreshMiltonProposals();
     } catch (e) {
       thread[thread.length - 1] =
         { role: "milton", html: `<span class="merror">${esc(e.message || "send failed")}</span>` };
@@ -1572,6 +1583,7 @@ function initMiltonDock() {
     }
     if (!thread.length) thread = [greeting()];
     paint(); paintChips([]);
+    refreshMiltonProposals();
     // A suggestion click on the Outreach screen parks its prompt here so the
     // dock opens with the question ready — consumed once, then cleared.
     try {
@@ -1621,6 +1633,136 @@ function initMiltonDock() {
   setOpen(!!persisted);
   if (persisted) init();
 }
+
+/* ---------- widget proposals (phase 3): Milton proposes, the user previews
+   and approves in chat -----------------------------------------------
+   Pending proposals render as rich cards in the dock (refreshed on open and
+   after every reply) and in the widget manager. The card shows Milton's
+   rationale and the requested permissions — reads and writes listed
+   separately, writes in terracotta — before the user acts. Approving is the
+   permission grant; when writes are requested the approve button arms first
+   (two-step), otherwise it's a single tap. Declining just closes the
+   proposal; Milton can always propose again. */
+const proposalUiState = { armed: null };
+function proposalPermsSplit(perms) {
+  const list = perms || [];
+  return {
+    reads: list.filter((p) => String(p).endsWith(":read")),
+    writes: list.filter((p) => String(p).endsWith(":write")),
+  };
+}
+function widgetProposalCardHtml(p) {
+  const { reads, writes } = proposalPermsSplit(p.permissions);
+  const chip = (perm, write) =>
+    `<span class="perm${write ? " write" : ""}">${esc(String(perm).split(":")[0])} · ${write ? "write" : "read"}</span>`;
+  const kind = p.kind === "set" ? "widget set" : "widget";
+  const members = (p.members || []).map((m) =>
+    `<div class="mitem">• ${esc(m.title || m.name)} <span class="sub">v${esc(m.version || "?")}</span></div>`).join("");
+  const when = p.created_at ? String(p.created_at).slice(0, 16).replace("T", " ") : "";
+  return `<div class="mcard mprop" data-prop="${p.id}">
+    <div class="mcard-title">🤖 Proposal: ${esc(p.title)}</div>
+    <div class="msub">${esc(kind)} · proposed by Milton${when ? ` · ${esc(when)}` : ""}</div>
+    ${p.rationale ? `<div class="mprop-why">${esc(p.rationale)}</div>` : ""}
+    ${members}
+    <div class="wreview-perms">
+      <div class="wreview-sec"><div class="wreview-label">Can read</div>
+        <div>${reads.map((x) => chip(x, false)).join("") || `<span class="muted">nothing</span>`}</div></div>
+      <div class="wreview-sec"><div class="wreview-label">Can write${writes.length ? ` <span class="wreview-warn">— changes your CRM data</span>` : ""}</div>
+        <div>${writes.map((x) => chip(x, true)).join("") || `<span class="muted">nothing</span>`}</div></div>
+    </div>
+    <div class="mprop-note muted" data-prop-note></div>
+    <div class="mprop-actions">
+      <button class="btn ghost sm" data-prop-act="preview" data-prop-id="${p.id}">Preview</button>
+      <button class="btn ghost sm" data-prop-act="decline" data-prop-id="${p.id}">Decline</button>
+      <button class="btn sm" data-prop-act="approve" data-prop-id="${p.id}">Approve${writes.length ? ` (${writes.length} write${writes.length > 1 ? "s" : ""})` : ""}</button>
+    </div>
+  </div>`;
+}
+async function refreshMiltonProposals() {
+  const el = $("#milton-proposals");
+  if (!el) return;
+  let list = [];
+  try { list = (await GET("/api/widget-proposals?status=pending")).proposals || []; }
+  catch { /* offline: leave the strip as-is */ }
+  proposalUiState.armed = null;
+  el.innerHTML = list.map(widgetProposalCardHtml).join("");
+  el.hidden = !list.length;
+}
+function proposalNote(id, msg, isErr) {
+  const card = document.querySelector(`.mprop[data-prop="${id}"] [data-prop-note]`);
+  if (card) { card.textContent = msg; card.classList.toggle("merror", !!isErr); }
+}
+async function proposalPreview(id) {
+  let p;
+  try { p = (await GET(`/api/widget-proposals/${id}`)).proposal; }
+  catch (e) { proposalNote(id, `Couldn't load proposal: ${e.message}`, true); return; }
+  const members = p.members || [];
+  const frameUrl = (member) =>
+    wsParam(`/api/widget-proposals/${id}/preview${member ? `?member=${encodeURIComponent(member)}` : ""}`);
+  const root = $("#modal-root");
+  root.innerHTML = `
+    <div class="overlay" id="ovl"><div class="modal modal-wide">
+      <h2>Preview: ${esc(p.title)}</h2>
+      <div class="muted" style="margin:-12px 0 12px">Demo data only — nothing is installed and API calls are disabled in preview.</div>
+      ${members.length ? `<div style="margin-bottom:10px"><label class="muted">Member&nbsp;
+        <select id="pp-member">${members.map((m) => `<option value="${esc(m.name)}">${esc(m.title || m.name)}</option>`).join("")}</select>
+      </label></div>` : ""}
+      <iframe id="pp-frame" title="Widget preview" sandbox="allow-scripts"
+        src="${frameUrl(members[0] ? members[0].name : "")}"
+        style="width:100%;height:420px;border:1px solid var(--line);border-radius:10px;background:#fff"></iframe>
+      <div class="actions"><button class="btn ghost" id="m-cancel">Close</button></div>
+    </div></div>`;
+  const close = () => (root.innerHTML = "");
+  $("#m-cancel").onclick = close;
+  $("#ovl").addEventListener("mousedown", (e) => { if (e.target.id === "ovl") close(); });
+  const sel = $("#pp-member");
+  if (sel) sel.onchange = () => { $("#pp-frame").src = frameUrl(sel.value); };
+}
+async function proposalApprove(btn, id) {
+  const card = btn.closest(".mprop");
+  const writes = (card ? [...card.querySelectorAll(".perm.write")].length : 0);
+  if (writes && proposalUiState.armed !== String(id)) {
+    proposalUiState.armed = String(id);
+    btn.dataset.origLabel = btn.textContent;
+    btn.textContent = `Tap again to grant ${writes} write${writes > 1 ? "s" : ""}`;
+    proposalNote(id, "Approving installs the widget and grants the write permissions above, in this workspace only.");
+    return;
+  }
+  btn.disabled = true;
+  proposalNote(id, "Installing…");
+  try {
+    const r = await POST(`/api/widget-proposals/${id}/approve`);
+    proposalUiState.armed = null;
+    await refreshMiltonProposals();
+    if (String(location.hash).startsWith("#/dashboard/widgets")) vWidgetManager();
+    if (typeof vDashboard === "function" && String(location.hash).startsWith("#/dashboard")) vDashboard();
+  } catch (e) {
+    btn.disabled = false;
+    if (btn.dataset.origLabel) { btn.textContent = btn.dataset.origLabel; delete btn.dataset.origLabel; }
+    proposalUiState.armed = null;
+    proposalNote(id, `Couldn't install: ${e.message || e}`, true);
+  }
+}
+async function proposalDecline(btn, id) {
+  btn.disabled = true;
+  try {
+    await POST(`/api/widget-proposals/${id}/decline`);
+    proposalUiState.armed = null;
+    await refreshMiltonProposals();
+    if (String(location.hash).startsWith("#/dashboard/widgets")) vWidgetManager();
+  } catch (e) {
+    btn.disabled = false;
+    proposalNote(id, `Couldn't decline: ${e.message || e}`, true);
+  }
+}
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-prop-act]");
+  if (!b) return;
+  const id = b.dataset.propId, act = b.dataset.propAct;
+  if (act === "preview") proposalPreview(id);
+  else if (act === "approve") proposalApprove(b, id);
+  else if (act === "decline") proposalDecline(b, id);
+});
 
 /* Pipeline board markup — extracted verbatim from the old standalone vPipeline
    and rewired into the campaigns overview. Stage columns in workspace stage

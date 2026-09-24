@@ -703,6 +703,18 @@ td { transition: background 0.12s ease; }
 .mopt:hover { border-color: var(--accent, #2f6fed); }
 .mopt .sub, .mitem .sub { color: var(--muted); font-size: .8rem; }
 .mocr { white-space: pre-wrap; font-size: .82rem; margin: 4px 0 0; }
+/* widget proposals (phase 3): pending-proposal strip in the dock + cards */
+.milton-proposals { display: flex; flex-direction: column; gap: 8px; padding: 0 16px 8px; max-height: 46vh; overflow-y: auto; }
+.milton-proposals:empty, .milton-proposals[hidden] { display: none; }
+.mprop { border-color: #d8c9ae; background: rgba(214, 178, 106, .07); }
+.mprop .msub, .mcard .msub { color: var(--muted); font-size: .78rem; margin: -2px 0 6px; }
+.mprop-why { font-size: .86rem; margin: 2px 0 8px; font-style: italic; color: var(--text-2); }
+.mprop .wreview-perms { margin: 8px 0; }
+.mprop-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.mprop-note { font-size: .8rem; margin-top: 6px; min-height: 0; }
+.mprop-note.merror { color: #b3261e; }
+.modal-wide { width: min(880px, 94vw); }
+.modal-wide iframe { display: block; }
 .milton-chips { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 16px 8px; }
 .milton-chips:empty { display: none; }
 .chip {

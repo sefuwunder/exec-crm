@@ -9,9 +9,40 @@ seedIfEmpty(db);
 // with MILTON_URL when Milton runs elsewhere.
 const MILTON_URL = (process.env.MILTON_URL || "http://127.0.0.1:3009").replace(/\/+$/, "");
 
+// ---- widget scaffold constants (phase 1): declared up here because the
+// ./widgets dev-dir scan runs at boot, before the helper section below.
+const WIDGET_MOUNTS = ["dashboard"];
+const WIDGET_PERMISSIONS = [
+  "deals:read", "deals:write",
+  "contacts:read", "contacts:write",
+  "companies:read", "companies:write",
+  "tasks:read", "tasks:write",
+  "outreach:read", "outreach:write",
+  "feed:read",
+];
+const WIDGET_MAX_JS = 256 * 1024;
+const WIDGET_MAX_CSS = 64 * 1024;
+const WIDGET_MAX_MANIFEST = 8 * 1024;
+// (method, path) -> required permission. Only these exec-crm endpoints are
+// reachable from a widget; everything else (/api/widgets/*, /api/milton/*,
+// hooks, uploads…) is unreachable by design.
+const WIDGET_API_MAP: { re: RegExp; perms: Record<string, string> }[] = [
+  { re: /^\/api\/deals(\/\d+)?$/, perms: { GET: "deals:read", POST: "deals:write", PATCH: "deals:write", DELETE: "deals:write" } },
+  { re: /^\/api\/contacts(\/\d+)?$/, perms: { GET: "contacts:read", POST: "contacts:write", PATCH: "contacts:write" } },
+  { re: /^\/api\/companies(\/\d+)?$/, perms: { GET: "companies:read", POST: "companies:write", PATCH: "companies:write" } },
+  { re: /^\/api\/tasks(\/\d+)?$/, perms: { GET: "tasks:read", POST: "tasks:write", PATCH: "tasks:write", DELETE: "tasks:write" } },
+  { re: /^\/api\/outreach(\/\d+)?$/, perms: { GET: "outreach:read", POST: "outreach:write", PATCH: "outreach:write", DELETE: "outreach:write" } },
+  { re: /^\/api\/daily-feed$/, perms: { GET: "feed:read" } },
+];
+
 // ---- captured photos (business cards, client notes)
 const UPLOAD_DIR = process.env.CRM_UPLOADS || "./uploads";
 await Bun.$`mkdir -p ${UPLOAD_DIR}`.quiet();
+
+// ---- widget dev directory: gitignored ./widgets/, created and scanned on boot
+const WIDGET_DEV_DIR = process.env.CRM_WIDGETS || "./widgets";
+await Bun.$`mkdir -p ${WIDGET_DEV_DIR}`.quiet();
+await scanWidgetDevDir(WIDGET_DEV_DIR);
 
 const IMAGE_TYPES: Record<string, string> = {
   ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
@@ -239,6 +270,235 @@ async function readBody(req: Request): Promise<any> {
     return await req.json();
   } catch {
     return {};
+  }
+}
+
+// ---------------------------------------------------------------- widget scaffold (phase 1)
+// exec-crm is the interactive widget scaffold for the Milton business agent:
+// a widget is a small deployable bundle (manifest + JS + CSS) that mounts
+// into named Dashboard slots. Widgets are read/write from day 1 — the
+// manifest permission model covers writes and the user grants them at
+// install time. Proposals come only from Milton or the user; there is no
+// third-party or open registry, and nothing here is built for one.
+//
+// Security model:
+// - widget code runs in an iframe with sandbox="allow-scripts" and NO
+//   allow-same-origin (opaque origin), served from /api/widgets/:id/bundle
+//   with a strict CSP (connect-src 'none') so a widget cannot phone home —
+//   it can only talk to the parent frame via postMessage.
+// - the parent forwards widget API calls to POST /api/widgets/:id/invoke,
+//   which enforces the widget's granted permissions server-side against an
+//   allowlisted endpoint map. A widget can only call what its manifest
+//   declared and the user granted; the inner call is re-scoped to the
+//   widget's own workspace, so cross-workspace access is impossible.
+// - no secrets ever reach the iframe: MILTON_URL and session cookies stay
+//   server-side; the bridge carries only the widget's granted permissions
+//   and workspace context. (Constants live at the top of this file — the
+//   dev-dir scan runs at boot, before this section.)
+function validateWidgetManifest(input: unknown): { manifest?: any; error?: string } {
+  if (!input || typeof input !== "object" || Array.isArray(input))
+    return { error: "manifest must be an object" };
+  const m = input as Record<string, unknown>;
+  const name = String(m.name || "");
+  if (!/^[a-z0-9][a-z0-9_-]{1,47}$/.test(name))
+    return { error: "manifest.name must be a slug: lowercase letters, digits, - and _, 2-48 chars" };
+  const title = String(m.title || "").trim();
+  if (!title || title.length > 80)
+    return { error: "manifest.title is required (max 80 chars)" };
+  const version = String(m.version || "");
+  if (!/^\d+\.\d+\.\d+$/.test(version))
+    return { error: "manifest.version must be semver (e.g. 1.0.0)" };
+  const mount = String(m.mount || "");
+  if (!WIDGET_MOUNTS.includes(mount))
+    return { error: `manifest.mount must be one of: ${WIDGET_MOUNTS.join(", ")}` };
+  const perms = m.permissions;
+  if (!Array.isArray(perms) || !perms.length || perms.length > 12)
+    return { error: "manifest.permissions must be a non-empty array (max 12)" };
+  const seen = new Set<string>();
+  for (const p of perms) {
+    if (typeof p !== "string" || !WIDGET_PERMISSIONS.includes(p))
+      return { error: `unknown permission "${p}" — allowed: ${WIDGET_PERMISSIONS.join(", ")}` };
+    if (seen.has(p)) return { error: `duplicate permission "${p}"` };
+    seen.add(p);
+  }
+  const description = String(m.description || "");
+  if (description.length > 280) return { error: "manifest.description is too long (max 280 chars)" };
+  return {
+    manifest: { name, title, version, mount, permissions: [...seen], description },
+  };
+}
+
+function widgetPublic(row: any) {
+  let manifest: any = {};
+  try { manifest = JSON.parse(row.manifest || "{}"); } catch {}
+  return {
+    id: row.id, name: row.name, title: row.title, version: row.version,
+    manifest, enabled: row.enabled === 1,
+    versions: Number(row.version_count || 0),
+    created_at: row.created_at, updated_at: row.updated_at,
+  };
+}
+
+function widgetFull(row: any) {
+  return { ...widgetPublic(row), js: row.js || "", css: row.css || "" };
+}
+
+function widgetRow(id: number, w: number) {
+  return db
+    .query(
+      `SELECT widgets.*, (SELECT COUNT(*) FROM widget_versions WHERE widget_id = widgets.id) AS version_count
+       FROM widgets WHERE id = ? AND workspace_id = ?`
+    )
+    .get(id, w) as any;
+}
+
+function snapshotWidgetVersion(row: any) {
+  db.prepare(
+    "INSERT INTO widget_versions (widget_id, version, manifest, js, css) VALUES (?, ?, ?, ?, ?)"
+  ).run(row.id, row.version, row.manifest || "{}", row.js || "", row.css || "");
+  // keep history bounded: 25 versions per widget is plenty for rollback
+  db.exec(
+    `DELETE FROM widget_versions WHERE widget_id = ${Number(row.id)} AND id NOT IN
+     (SELECT id FROM widget_versions WHERE widget_id = ${Number(row.id)} ORDER BY id DESC LIMIT 25)`
+  );
+}
+
+// Install a new widget or update the existing one with the same name.
+// Every update snapshots the prior bundle into widget_versions first.
+function widgetUpsert(w: number, manifest: any, js: string, css: string) {
+  const existing = db
+    .query("SELECT * FROM widgets WHERE workspace_id = ? AND name = ?")
+    .get(w, manifest.name) as any;
+  const now = new Date().toISOString().slice(0, 19).replace("T", " ");
+  if (existing) {
+    snapshotWidgetVersion(existing);
+    db.prepare(
+      `UPDATE widgets SET title = ?, version = ?, manifest = ?, js = ?, css = ?,
+       updated_at = ? WHERE id = ?`
+    ).run(manifest.title, manifest.version, JSON.stringify(manifest), js, css, now, existing.id);
+    return { widget: widgetRow(existing.id, w), updated: true };
+  }
+  const r = db
+    .prepare(
+      `INSERT INTO widgets (workspace_id, name, title, version, manifest, js, css, enabled)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1)`
+    )
+    .run(w, manifest.name, manifest.title, manifest.version, JSON.stringify(manifest), js, css);
+  return { widget: widgetRow(Number(r.lastInsertRowid), w), updated: false };
+}
+
+// The sandboxed document a widget iframe loads. Bridge stub first (postMessage
+// to the parent only — no network: the CSP below blocks connect-src), then
+// the widget's own JS. </script> inside widget code is escaped so the bundle
+// can't break out of its script tag.
+function widgetBundleHtml(row: any, wsName: string): string {
+  let manifest: any = {};
+  try { manifest = JSON.parse(row.manifest || "{}"); } catch {}
+  const ctx = JSON.stringify({
+    widgetId: row.id,
+    name: row.name,
+    title: row.title,
+    version: row.version,
+    workspaceId: row.workspace_id,
+    workspaceName: wsName,
+    permissions: Array.isArray(manifest.permissions) ? manifest.permissions : [],
+  }).replace(/</g, "\\u003c");
+  const escScript = (s: string) => String(s || "").replace(/<\/script/gi, "<\\/script");
+  const escStyle = (s: string) => String(s || "").replace(/<\/style/gi, "<\\/style");
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<style>html,body{margin:0;padding:10px 12px;font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#141824;background:#fff;box-sizing:border-box}#wroot{min-height:40px}
+${escStyle(row.css || "")}</style>
+</head><body><div id="wroot"></div>
+<script>window.__EXECRM_CTX__=${ctx};</script>
+<script>
+(function () {
+  var ctx = window.__EXECRM_CTX__ || {};
+  var seq = 0, pending = {};
+  function send(type, payload) {
+    var msg = { type: type, widget: ctx.widgetId };
+    for (var k in payload) msg[k] = payload[k];
+    parent.postMessage(msg, "*");
+  }
+  window.addEventListener("message", function (e) {
+    var d = e.data || {};
+    if (d.type === "widget-api-result" && pending[d.reqId]) {
+      var cb = pending[d.reqId]; delete pending[d.reqId]; cb(d);
+    }
+  });
+  function call(method, path, body) {
+    return new Promise(function (resolve, reject) {
+      var reqId = "r" + (++seq) + "-" + Date.now().toString(36);
+      pending[reqId] = function (res) {
+        if (res.ok) resolve(res.data);
+        else reject(new Error(res.error || "widget api call failed"));
+      };
+      send("widget-api", { reqId: reqId, method: method, path: path, body: body });
+    });
+  }
+  // Host bridge: the only way a widget touches exec-crm. Reads AND writes
+  // are available from day 1, gated by the manifest permissions the user
+  // granted at install — the server re-checks every call.
+  window.execrm = {
+    widget: { id: ctx.widgetId, name: ctx.name, title: ctx.title, version: ctx.version },
+    workspace: { id: ctx.workspaceId, name: ctx.workspaceName },
+    permissions: (ctx.permissions || []).slice(),
+    api: {
+      get: function (p) { return call("GET", p); },
+      post: function (p, b) { return call("POST", p, b); },
+      patch: function (p, b) { return call("PATCH", p, b); },
+      del: function (p) { return call("DELETE", p); }
+    },
+    notify: function (msg) { send("widget-notify", { message: String(msg).slice(0, 200) }); },
+    resize: function (h) {
+      send("widget-resize", { height: Math.max(80, Math.min(1200, Number(h) || 220)) });
+    }
+  };
+})();
+</script>
+<script>
+${escScript(row.js || "")}
+</script>
+</body></html>`;
+}
+
+// Dev convenience: a gitignored ./widgets/ directory scanned on boot. Each
+// subdirectory with manifest.json + widget.js (+ optional widget.css) is
+// installed into the first workspace when its content changed — server
+// restart is the hot reload. Same sandbox, same permission model.
+async function scanWidgetDevDir(dir?: string) {
+  dir = dir || process.env.CRM_WIDGETS || "./widgets";
+  try {
+    await Bun.$`mkdir -p ${dir}`.quiet();
+  } catch { return; }
+  let entries: string[] = [];
+  try {
+    entries = (await Bun.$`ls -1 ${dir}`.quiet().text()).split("\n").map((s) => s.trim()).filter(Boolean);
+  } catch { return; }
+  const w = ensureMainWorkspace(db);
+  const wsName = (db.query("SELECT name FROM workspaces WHERE id = ?").get(w) as any)?.name || "Main";
+  for (const name of entries) {
+    const base = `${dir}/${name}`;
+    const mf = Bun.file(`${base}/manifest.json`);
+    const jsf = Bun.file(`${base}/widget.js`);
+    if (!(await mf.exists()) || !(await jsf.exists())) continue;
+    try {
+      const raw = await mf.json();
+      const v = validateWidgetManifest({ ...raw, name: raw.name || name });
+      if (v.error) { console.log(`widget dev: ${name}: ${v.error} — skipped`); continue; }
+      const js = await jsf.text();
+      const cssf = Bun.file(`${base}/widget.css`);
+      const css = (await cssf.exists()) ? await cssf.text() : "";
+      if (!js.trim()) { console.log(`widget dev: ${name}: empty widget.js — skipped`); continue; }
+      const existing = db.query("SELECT * FROM widgets WHERE workspace_id = ? AND name = ?").get(w, v.manifest.name) as any;
+      if (existing && existing.js === js && existing.css === css && existing.manifest === JSON.stringify(v.manifest)) continue;
+      const r = widgetUpsert(w, v.manifest, js, css);
+      console.log(`widget dev: ${existing ? "updated" : "installed"} "${v.manifest.name}" in workspace "${wsName}"`);
+    } catch (e: any) {
+      console.log(`widget dev: ${name}: ${e?.message || e} — skipped`);
+    }
   }
 }
 
@@ -714,6 +974,11 @@ const server = Bun.serve({
       for (const f of capFiles) {
         try { await Bun.$`rm -f ${UPLOAD_DIR}/${f.filename}`.quiet(); } catch {}
       }
+      const widgetIds = (db.query("SELECT id FROM widgets WHERE workspace_id = ?").all(ws.id) as any[]).map((x) => x.id);
+      if (widgetIds.length) {
+        db.query(`DELETE FROM widget_versions WHERE widget_id IN (${widgetIds.map(() => "?").join(",")})`).run(...widgetIds);
+      }
+      db.prepare("DELETE FROM widgets WHERE workspace_id = ?").run(ws.id);
       for (const t of ["outreach", "activities", "captures", "tasks", "deals", "contacts", "campaigns", "companies", "stages", "sandbox_rows", "sandbox_batches"]) {
         db.prepare(`DELETE FROM ${t} WHERE workspace_id = ?`).run(ws.id);
       }
@@ -2038,6 +2303,167 @@ const server = Bun.serve({
       if (!sets.length) return json({ error: "nothing to update" }, 400);
       db.prepare(`UPDATE outreach SET ${sets.join(", ")} WHERE id = ? AND workspace_id = ?`).run(...vals, id, w);
       return json({ ok: true, outreach: outreachRow(id, w) });
+    }
+
+    // ---- widget registry: deployable dashboard widgets (phase 1) ----
+    // Workspace-scoped like everything else. The bundle endpoint serves the
+    // sandboxed iframe document; /invoke is the permission-checked bridge.
+    const widgetIdMatch = path.match(/^\/api\/widgets\/(\d+)(\/[\w-]+)?$/);
+    if (path === "/api/widgets" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const rows = db
+        .query(
+          `SELECT widgets.*, (SELECT COUNT(*) FROM widget_versions WHERE widget_id = widgets.id) AS version_count
+           FROM widgets WHERE workspace_id = ? ORDER BY name`
+        )
+        .all(w) as any[];
+      return json({ widgets: rows.map(widgetPublic) });
+    }
+    if (path === "/api/widgets" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const b = await readBody(req);
+      if (JSON.stringify(b.manifest || {}).length > WIDGET_MAX_MANIFEST)
+        return json({ error: "manifest too large" }, 400);
+      const v = validateWidgetManifest(b.manifest);
+      if (v.error) return json({ error: v.error }, 400);
+      const js = typeof b.js === "string" ? b.js : "";
+      const css = typeof b.css === "string" ? b.css : "";
+      if (!js.trim()) return json({ error: "widget js is required" }, 400);
+      if (Buffer.byteLength(js, "utf8") > WIDGET_MAX_JS)
+        return json({ error: `widget js too large (max ${WIDGET_MAX_JS / 1024}KB)` }, 400);
+      if (Buffer.byteLength(css, "utf8") > WIDGET_MAX_CSS)
+        return json({ error: `widget css too large (max ${WIDGET_MAX_CSS / 1024}KB)` }, 400);
+      const r = widgetUpsert(w, v.manifest, js, css);
+      return json({ widget: widgetPublic(r.widget), updated: r.updated }, r.updated ? 200 : 201);
+    }
+    if (widgetIdMatch && !widgetIdMatch[2] && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const row = widgetRow(Number(widgetIdMatch[1]), w);
+      if (!row) return json({ error: "widget not found" }, 404);
+      return json({ widget: widgetFull(row) });
+    }
+    if (widgetIdMatch && !widgetIdMatch[2] && method === "PATCH") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const row = widgetRow(Number(widgetIdMatch[1]), w);
+      if (!row) return json({ error: "widget not found" }, 404);
+      const b = await readBody(req);
+      if (b.enabled === undefined) return json({ error: "enabled is required" }, 400);
+      const enabled = b.enabled ? 1 : 0;
+      db.prepare("UPDATE widgets SET enabled = ?, updated_at = datetime('now') WHERE id = ?").run(enabled, row.id);
+      return json({ widget: widgetPublic({ ...row, enabled }) });
+    }
+    if (widgetIdMatch && !widgetIdMatch[2] && method === "DELETE") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const row = widgetRow(Number(widgetIdMatch[1]), w);
+      if (!row) return json({ error: "widget not found" }, 404);
+      db.prepare("DELETE FROM widget_versions WHERE widget_id = ?").run(row.id);
+      db.prepare("DELETE FROM widgets WHERE id = ?").run(row.id);
+      return json({ ok: true });
+    }
+    if (widgetIdMatch && widgetIdMatch[2] === "/versions" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const row = widgetRow(Number(widgetIdMatch[1]), w);
+      if (!row) return json({ error: "widget not found" }, 404);
+      const vers = db
+        .query("SELECT id, version, created_at FROM widget_versions WHERE widget_id = ? ORDER BY id DESC")
+        .all(row.id);
+      return json({ versions: vers });
+    }
+    if (widgetIdMatch && widgetIdMatch[2] === "/rollback" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const row = widgetRow(Number(widgetIdMatch[1]), w);
+      if (!row) return json({ error: "widget not found" }, 404);
+      const prior = db
+        .query("SELECT * FROM widget_versions WHERE widget_id = ? ORDER BY id DESC LIMIT 1")
+        .get(row.id) as any;
+      if (!prior) return json({ error: "no prior version to roll back to" }, 400);
+      // pop semantics: the current bundle goes back into history, so a
+      // second rollback re-applies the newer one.
+      snapshotWidgetVersion(row);
+      db.prepare(
+        `UPDATE widgets SET title = ?, version = ?, manifest = ?, js = ?, css = ?,
+         updated_at = datetime('now') WHERE id = ?`
+      ).run(row.title, prior.version, prior.manifest, prior.js, prior.css, row.id);
+      db.prepare("DELETE FROM widget_versions WHERE id = ?").run(prior.id);
+      return json({ widget: widgetPublic(widgetRow(row.id, w)) });
+    }
+    // The sandboxed iframe document. Only serves enabled widgets from the
+    // requesting workspace — a disabled or foreign widget is a 404.
+    // Strict CSP: the widget cannot open any network connection; it talks
+    // to the parent frame only through the postMessage bridge.
+    if (widgetIdMatch && widgetIdMatch[2] === "/bundle" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const row = widgetRow(Number(widgetIdMatch[1]), w);
+      if (!row || row.enabled !== 1) return new Response("not found", { status: 404 });
+      const wsName = (db.query("SELECT name FROM workspaces WHERE id = ?").get(w) as any)?.name || "";
+      return new Response(widgetBundleHtml(row, wsName), {
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "X-Content-Type-Options": "nosniff",
+          "Content-Security-Policy":
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
+            "img-src data:; font-src data:; connect-src 'none'; frame-src 'none'; " +
+            "object-src 'none'; base-uri 'none'; form-action 'none'",
+          "Cache-Control": "no-store",
+        },
+      });
+    }
+    // The permission-checked bridge. The parent frame forwards widget API
+    // calls here; the server maps (method, path) to a required permission,
+    // checks it against the manifest permissions the user granted at
+    // install, then re-issues the call against this same server scoped to
+    // the widget's own workspace.
+    if (widgetIdMatch && widgetIdMatch[2] === "/invoke" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const row = widgetRow(Number(widgetIdMatch[1]), w);
+      if (!row) return json({ error: "widget not found" }, 404);
+      if (row.enabled !== 1) return json({ error: "widget is disabled" }, 403);
+      const b = await readBody(req);
+      const imethod = String(b.method || "").toUpperCase();
+      if (!["GET", "POST", "PATCH", "DELETE"].includes(imethod))
+        return json({ error: "method not allowed" }, 400);
+      let ipath = String(b.path || "");
+      let iquery = "";
+      try {
+        const u = new URL(ipath, "http://x");
+        ipath = u.pathname;
+        iquery = u.searchParams.toString();
+      } catch {
+        return json({ error: "bad path" }, 400);
+      }
+      if (!ipath.startsWith("/api/") || ipath.includes(".."))
+        return json({ error: "bad path" }, 400);
+      const mapping = WIDGET_API_MAP.find((m) => m.re.test(ipath));
+      if (!mapping || !mapping.perms[imethod])
+        return json({ error: "not an allowlisted widget API" }, 403);
+      const required = mapping.perms[imethod];
+      let granted: string[] = [];
+      try { granted = JSON.parse(row.manifest || "{}").permissions || []; } catch {}
+      if (!granted.includes(required))
+        return json({ error: `permission denied: "${required}" was not granted to this widget` }, 403);
+      // re-scope to the widget's own workspace — never trust a workspace
+      // param smuggled in by widget code.
+      const qs = new URLSearchParams(iquery);
+      qs.set("workspace", String(row.workspace_id));
+      const inner = await fetch(`http://127.0.0.1:${server.port}${ipath}?${qs.toString()}`, {
+        method: imethod,
+        headers: { "Content-Type": "application/json" },
+        body: imethod === "GET" ? undefined : JSON.stringify(b.body ?? {}),
+      });
+      const text = await inner.text();
+      return new Response(text, {
+        status: inner.status,
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
     // ---- milton bridge: insights + daily feed for the Dashboard, agent for the floating chat dock ---

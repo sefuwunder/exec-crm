@@ -26,7 +26,8 @@ The app is built around the **Review → Action → Outcome** cycle:
 
 - **Dashboard** — Milton insights only: Milton's pipeline-hygiene findings
   grouped Review → Action → Outcome, with a cycle strip showing the counts.
-  No KPIs, no pipeline summary — those live where the work happens.
+  No KPIs, no pipeline summary — those live where the work happens. Below the
+  feed, your **widgets** mount into Dashboard slots (see Widgets).
 - **Milton** — the Milton agent embedded in the CRM. Same-origin chat
   (no iframe): one Milton session per workspace, remembered in the browser,
   every call re-validated against the active workspace server-side.
@@ -114,3 +115,89 @@ outgoing webhooks, so chains compose.
 
 Captured photos land in `./uploads/` (created on boot; override with
 `CRM_UPLOADS`). Images only, 12 MB max each.
+
+## Widgets
+
+exec-crm is the widget scaffold for the Milton business agent: small
+**manifest + JavaScript + CSS** bundles that mount into Dashboard slots. A
+widget is proposed by Milton or by you — there is no third-party registry.
+
+**Bundle format** — one JSON manifest plus code:
+
+```json
+{
+  "name": "stalled-deals",
+  "title": "Stalled Deals",
+  "version": "1.0.0",
+  "mount": "dashboard",
+  "permissions": ["deals:read", "deals:write"],
+  "description": "Flags deals untouched for 30+ days."
+}
+```
+
+- `name`: lowercase slug (`a-z0-9-`), unique per workspace.
+- `version`: semver. Updating a widget snapshots the previous bundle, so you
+  can roll back (last 25 versions are kept).
+- `mount`: currently only `"dashboard"`.
+- `permissions`: non-empty, from the allowlist below. **Reads and writes are
+  available from day 1** — `deals:write` really can change your deals.
+
+Limits: JS 256 KB, CSS 64 KB, manifest 8 KB.
+
+**Permission model** — the manifest lists what the widget wants; **you grant
+it at install/update time**, reads and writes shown separately with writes
+called out plainly ("changes your CRM data"). The server re-checks every
+call: a widget can only reach the endpoints its granted permissions allow,
+in its own workspace. Nothing else is reachable — no widget APIs, no Milton
+proxy, no hooks.
+
+Permission allowlist:
+
+| reads | writes |
+|---|---|
+| `deals:read` | `deals:write` |
+| `contacts:read` | `contacts:write` |
+| `companies:read` | `companies:write` |
+| `tasks:read` | `tasks:write` |
+| `outreach:read` | `outreach:write` |
+| `feed:read` | — |
+
+Reachable endpoints per permission: the matching CRM collection and
+item routes (`GET` needs `:read`, `POST`/`PATCH`/`DELETE` need `:write`;
+`feed:read` covers `GET /api/daily-feed`).
+
+**Sandbox** — each widget runs in its own `<iframe sandbox="allow-scripts">`
+(no same-origin access) with a strict Content-Security-Policy: no network
+connections at all. The only way a widget touches exec-crm is the host
+bridge:
+
+```js
+// inside widget.js — window.execrm is injected by the host bundle
+const deals = await window.execrm.api.get("/api/deals");
+await window.execrm.api.post("/api/tasks", { title: "Follow up" });
+window.execrm.notify("Deal moved");   // toast in the CRM chrome
+window.execrm.resize(320);            // ask the host to resize the slot
+// window.execrm.widget / .workspace / .permissions describe the context
+```
+
+Calls outside the granted permissions fail with `permission denied`; calls
+outside the allowlist never leave the browser. Disabled widgets are
+unmounted and their bundle URL returns 404.
+
+**Manager** — the ⚙ Manage button on the Dashboard widget panel opens
+`#/dashboard/widgets` (kept out of the main nav on purpose). It lists every
+widget with its version, permission chips, and enable toggle; from there you
+can install/update (paste code or upload a `{manifest, js, css}` JSON
+bundle), roll back to the previous version, or uninstall.
+
+Widget API: `GET|POST /api/widgets` · `GET /api/widgets/:id` ·
+`PATCH /api/widgets/:id` (`{enabled}`) · `DELETE /api/widgets/:id` ·
+`GET /api/widgets/:id/versions` · `POST /api/widgets/:id/rollback` ·
+`GET /api/widgets/:id/bundle` · `POST /api/widgets/:id/invoke`
+(`{method, path, body}` → proxied CRM call, permission-checked).
+
+**Local development** — on boot the server scans `./widgets/` (created if
+missing; override with `CRM_WIDGETS`, gitignored): each subfolder with a
+`manifest.json` + `widget.js` (+ optional `widget.css`) is installed or
+updated into the first workspace automatically. Restart the server to pick
+up changes.

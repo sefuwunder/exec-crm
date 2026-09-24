@@ -562,6 +562,299 @@ function renderMiltonInsights(el, data, err) {
   render();
 }
 
+/* ---------- widget scaffold (phase 1): deployable dashboard widgets ----------
+   A widget is a manifest + JS + CSS bundle that mounts into Dashboard slots.
+   Widget code runs in an iframe with sandbox="allow-scripts" (no
+   allow-same-origin) served from /api/widgets/:id/bundle with a strict CSP,
+   so it can only reach exec-crm through the postMessage host bridge below.
+   The bridge forwards API calls to POST /api/widgets/:id/invoke, which
+   enforces the manifest permissions the user granted at install —
+   server-side, per call. Reads AND writes are available from day 1.
+   (Phase 2 will add inter-widget messages on this same bridge.) */
+const widgetIframes = new Map(); // widget id -> iframe element
+const WIDGET_PERMS_CLIENT = [
+  "deals:read", "deals:write",
+  "contacts:read", "contacts:write",
+  "companies:read", "companies:write",
+  "tasks:read", "tasks:write",
+  "outreach:read", "outreach:write",
+  "feed:read",
+];
+function widgetBundleUrl(id) {
+  return `/api/widgets/${id}/bundle?workspace=${encodeURIComponent(wsId)}`;
+}
+function widgetSlotHtml(w) {
+  return `<section class="widget-slot" data-widget="${w.id}">
+    <header class="widget-slot-head"><b>${esc(w.title)}</b><span class="wver">v${esc(w.version)}</span></header>
+    <iframe class="widget-frame" data-widget-frame="${w.id}" title="${esc(w.title)} widget"
+      sandbox="allow-scripts" src="${widgetBundleUrl(w.id)}"></iframe>
+  </section>`;
+}
+function widgetNotify(msg) {
+  try {
+    let t = document.querySelector("#widget-toast");
+    if (!t) {
+      t = document.createElement("div");
+      t.id = "widget-toast";
+      t.className = "widget-toast";
+      t.setAttribute("role", "status");
+      document.body.appendChild(t);
+    }
+    t.textContent = msg;
+    t.classList.add("show");
+    clearTimeout(widgetNotify._t);
+    widgetNotify._t = setTimeout(() => t.classList.remove("show"), 3500);
+  } catch { /* DOM unavailable (tests) — notification is best-effort */ }
+}
+// The host side of the bridge. Only events whose source is a known widget
+// frame are trusted; everything else is ignored.
+function widgetOnMessage(e) {
+  const d = e && e.data;
+  if (!d || typeof d !== "object") return;
+  let wid = null;
+  for (const [id, fr] of widgetIframes) {
+    if (fr && e.source && fr.contentWindow === e.source) { wid = id; break; }
+  }
+  if (wid == null) return;
+  if (d.type === "widget-api") widgetBridgeInvoke(wid, e.source, d);
+  else if (d.type === "widget-notify") widgetNotify(String(d.message || ""));
+  else if (d.type === "widget-resize") {
+    const fr = widgetIframes.get(wid);
+    const h = Math.max(120, Math.min(1200, Number(d.height) || 240));
+    if (fr && fr.style) fr.style.height = h + "px";
+  }
+}
+async function widgetBridgeInvoke(wid, source, d) {
+  const reply = (payload) => {
+    try {
+      source.postMessage(Object.assign({ type: "widget-api-result", reqId: d.reqId }, payload), "*");
+    } catch { /* frame gone */ }
+  };
+  try {
+    // invoke proxies the allowlisted endpoint's status/body; api() throws on
+    // non-2xx, so permission denials surface as errors to the widget.
+    const res = await POST(`/api/widgets/${wid}/invoke`, {
+      method: d.method, path: d.path, body: d.body,
+    });
+    reply({ ok: true, data: res });
+  } catch (err) {
+    reply({ ok: false, error: (err && err.message) || "widget api call failed" });
+  }
+}
+// Client-side mirror of the server's manifest validation (the server
+// re-validates authoritatively on install). Returns an error string or null.
+function widgetCheckManifest(m) {
+  if (!m || typeof m !== "object" || Array.isArray(m)) return "manifest must be a JSON object";
+  if (!/^[a-z0-9][a-z0-9_-]{1,47}$/.test(String(m.name || "")))
+    return "name must be a slug: lowercase letters, digits, - and _, 2–48 chars";
+  const title = String(m.title || "").trim();
+  if (!title || title.length > 80) return "title is required (max 80 chars)";
+  if (!/^\d+\.\d+\.\d+$/.test(String(m.version || ""))) return "version must be semver, e.g. 1.0.0";
+  if (String(m.mount || "") !== "dashboard") return "mount must be \"dashboard\"";
+  const perms = m.permissions;
+  if (!Array.isArray(perms) || !perms.length) return "permissions must be a non-empty array";
+  for (const p of perms) {
+    if (!WIDGET_PERMS_CLIENT.includes(p)) return `unknown permission "${p}"`;
+  }
+  if (new Set(perms).size !== perms.length) return "duplicate permissions";
+  if (String(m.description || "").length > 280) return "description too long (max 280 chars)";
+  return null;
+}
+// Permission chips: reads neutral, writes in muted terracotta — ordinary
+// urgency. Red stays reserved for destructive actions (uninstall).
+function widgetPermChips(perms) {
+  return (perms || []).map((p) => {
+    const i = String(p).indexOf(":");
+    const res = i < 0 ? String(p) : String(p).slice(0, i);
+    const mode = i < 0 ? "" : String(p).slice(i + 1);
+    const write = mode === "write";
+    return `<span class="perm${write ? " write" : ""}" title="${write ? "can modify" : "can read"} ${esc(res)}">${esc(res)} · ${esc(mode)}</span>`;
+  }).join("");
+}
+// Pure function: the install review step. Lists reads and writes separately
+// with writes called out plainly — the user sees this before confirming.
+function widgetReviewHtml(m) {
+  const perms = m.permissions || [];
+  const reads = perms.filter((p) => String(p).endsWith(":read"));
+  const writes = perms.filter((p) => String(p).endsWith(":write"));
+  const chip = (p, write) =>
+    `<span class="perm${write ? " write" : ""}">${esc(String(p).split(":")[0])} · ${write ? "write" : "read"}</span>`;
+  return `<div class="wreview">
+    <div class="wreview-id"><b>${esc(m.title)}</b> <span class="wver">v${esc(m.version)}</span>
+      <div class="muted mono">${esc(m.name)} · mounts on ${esc(m.mount)}</div></div>
+    ${m.description ? `<div class="wreview-desc">${esc(m.description)}</div>` : ""}
+    <div class="wreview-perms">
+      <div class="wreview-sec"><div class="wreview-label">Can read</div>
+        <div>${reads.map((p) => chip(p, false)).join("") || `<span class="muted">nothing</span>`}</div></div>
+      <div class="wreview-sec"><div class="wreview-label">Can write <span class="wreview-warn">— changes your CRM data</span></div>
+        <div>${writes.map((p) => chip(p, true)).join("") || `<span class="muted">nothing</span>`}</div></div>
+    </div>
+    <div class="wreview-note">Grants apply to this workspace only. The widget runs sandboxed and can only use the permissions listed above.</div>
+  </div>`;
+}
+function widgetCardHtml(w) {
+  const perms = (w.manifest && w.manifest.permissions) || [];
+  return `<div class="panel wm-card">
+    <div class="wm-card-head">
+      <div><b>${esc(w.title)}</b> <span class="wver">v${esc(w.version)}</span>
+        <div class="muted mono">${esc(w.name)}</div></div>
+      <span class="spacer"></span>
+      <label class="wm-toggle"><input type="checkbox" data-w-toggle="${w.id}"${w.enabled ? " checked" : ""}> Enabled</label>
+    </div>
+    <div class="wm-perms">${widgetPermChips(perms) || `<span class="muted">no permissions</span>`}</div>
+    <div class="wm-card-actions">
+      <button class="btn ghost sm" data-w-update="${w.id}">Update</button>
+      ${w.versions > 0 ? `<button class="btn ghost sm" data-w-rollback="${w.id}" data-w-name="${esc(w.title)}">Roll back (${w.versions})</button>` : ""}
+      <button class="btn danger sm" data-w-del="${w.id}" data-w-name="${esc(w.title)}">Uninstall</button>
+    </div>
+  </div>`;
+}
+/* Widgets manager — reached from the Dashboard gear, not the nav (stays 4 items). */
+async function vWidgetManager() {
+  let widgets = [];
+  try {
+    widgets = (await GET("/api/widgets")).widgets || [];
+  } catch (e) {
+    view.innerHTML = `<div class="empty">Couldn't load widgets: ${esc(e.message)}</div>`;
+    return;
+  }
+  view.innerHTML = `
+    <div class="wm-head">
+      <button class="btn ghost sm" id="wm-back">← Dashboard</button>
+      <div class="wm-title"><h2>Widgets</h2>
+        <div class="muted">Deployable dashboard widgets. Install them yourself, or ask Milton to build one — proposals come only from you two.</div></div>
+      <span class="spacer"></span>
+      <button class="btn" id="wm-install">Install widget</button>
+    </div>
+    <div class="wm-list">${widgets.map(widgetCardHtml).join("") || `<div class="panel"><div class="empty">No widgets installed yet.</div></div>`}</div>
+    <div class="panel wm-dev">
+      <h2>Develop locally</h2>
+      <div class="muted">Drop a folder into <code>widgets/</code> next to the server (gitignored) containing
+      <code>manifest.json</code>, <code>widget.js</code> and optional <code>widget.css</code> — it's picked up
+      on server restart into the first workspace. Same sandbox, same permission model.</div>
+    </div>`;
+  $("#wm-back").onclick = () => { location.hash = "#/dashboard"; };
+  $("#wm-install").onclick = () => widgetInstallModal(null, () => vWidgetManager());
+  view.querySelectorAll("[data-w-toggle]").forEach((t) => {
+    t.onchange = async () => {
+      await PATCH(`/api/widgets/${t.dataset.wToggle}`, { enabled: t.checked });
+      vWidgetManager();
+    };
+  });
+  view.querySelectorAll("[data-w-update]").forEach((b) => {
+    b.onclick = async () => {
+      const full = await GET(`/api/widgets/${b.dataset.wUpdate}`);
+      widgetInstallModal(full.widget, () => vWidgetManager());
+    };
+  });
+  view.querySelectorAll("[data-w-rollback]").forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm(`Roll back "${b.dataset.wName}" to its previous version?`)) return;
+      await POST(`/api/widgets/${b.dataset.wRollback}/rollback`);
+      vWidgetManager();
+    };
+  });
+  view.querySelectorAll("[data-w-del]").forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm(`Uninstall widget "${b.dataset.wName}"? This removes it from the Dashboard.`)) return;
+      await DEL(`/api/widgets/${b.dataset.wDel}`);
+      vWidgetManager();
+    };
+  });
+}
+/* Install/update modal: paste or upload a bundle, review the requested
+   permissions, then confirm. The server re-validates everything. */
+function widgetInstallModal(existing, onDone) {
+  const root = $("#modal-root");
+  const pre = existing || {};
+  const manText = pre.manifest ? JSON.stringify(pre.manifest, null, 2) :
+`{
+  "name": "my-widget",
+  "title": "My Widget",
+  "version": "1.0.0",
+  "mount": "dashboard",
+  "permissions": ["deals:read"],
+  "description": ""
+}`;
+  root.innerHTML = `
+    <div class="overlay" id="wovl"><div class="modal wmodal">
+      <h2>${existing ? "Update widget" : "Install widget"}</h2>
+      <div id="winstall-form">
+        <div class="field"><label>Bundle file — optional JSON with {manifest, js, css}</label>
+          <input type="file" id="wbundle-file" accept=".json,application/json"></div>
+        <div class="field"><label>manifest.json</label>
+          <textarea id="w-manifest" rows="9" spellcheck="false" class="code">${esc(manText)}</textarea></div>
+        <div class="field"><label>widget.js</label>
+          <textarea id="w-js" rows="8" spellcheck="false" class="code">${esc(pre.js || "// the host bridge is available as execrm:\n// execrm.api.get('/api/deals').then(d => console.log(d));")}</textarea></div>
+        <div class="field"><label>widget.css (optional)</label>
+          <textarea id="w-css" rows="4" spellcheck="false" class="code">${esc(pre.css || "")}</textarea></div>
+        <div class="werr" id="w-err" hidden></div>
+      </div>
+      <div id="winstall-review" hidden></div>
+      <div class="actions">
+        <button class="btn ghost" id="w-cancel">Cancel</button>
+        <button class="btn ghost" id="w-back" hidden>Back</button>
+        <button class="btn" id="w-next">Review permissions</button>
+        <button class="btn" id="w-install" hidden>${existing ? "Update widget" : "Install widget"}</button>
+      </div>
+    </div></div>`;
+  const close = () => (root.innerHTML = "");
+  const showErr = (m) => { const el = $("#w-err"); el.textContent = m; el.hidden = false; };
+  $("#w-cancel").onclick = close;
+  $("#wovl").addEventListener("mousedown", (e) => { if (e.target.id === "wovl") close(); });
+  $("#wbundle-file").addEventListener("change", async (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    try {
+      const j = JSON.parse(await f.text());
+      if (j.manifest) $("#w-manifest").value = JSON.stringify(j.manifest, null, 2);
+      if (typeof j.js === "string") $("#w-js").value = j.js;
+      if (typeof j.css === "string") $("#w-css").value = j.css;
+    } catch (err) { showErr("Couldn't read that bundle file: " + err.message); }
+  });
+  const collect = () => {
+    let m;
+    try { m = JSON.parse($("#w-manifest").value); }
+    catch { return { error: "manifest.json is not valid JSON" }; }
+    const err = widgetCheckManifest(m);
+    if (err) return { error: err };
+    const js = $("#w-js").value;
+    if (!js.trim()) return { error: "widget.js is empty" };
+    return { manifest: m, js, css: $("#w-css").value || "" };
+  };
+  let staged = null;
+  const showForm = () => {
+    staged = null;
+    $("#winstall-form").hidden = false;
+    $("#winstall-review").hidden = true;
+    $("#w-next").hidden = false;
+    $("#w-back").hidden = true;
+    $("#w-install").hidden = true;
+  };
+  $("#w-next").onclick = () => {
+    const r = collect();
+    if (r.error) { showErr(r.error); return; }
+    staged = r;
+    $("#winstall-form").hidden = true;
+    const rev = $("#winstall-review");
+    rev.innerHTML = widgetReviewHtml(r.manifest);
+    rev.hidden = false;
+    $("#w-next").hidden = true;
+    $("#w-back").hidden = false;
+    $("#w-install").hidden = false;
+    $("#w-err").hidden = true;
+  };
+  $("#w-back").onclick = showForm;
+  $("#w-install").onclick = async () => {
+    if (!staged) return;
+    try {
+      await POST("/api/widgets", { manifest: staged.manifest, js: staged.js, css: staged.css });
+      close();
+      onDone();
+    } catch (e) { showErr(e.message); showForm(); }
+  };
+}
+
 async function vDashboard() {
   const now = new Date();
   const dow = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][now.getDay()];
@@ -581,6 +874,17 @@ async function vDashboard() {
   const take = feed && feed.milton && feed.milton.available && feed.milton.take
     ? esc(feed.milton.take).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/\n/g, "<br>")
     : null;
+  // deployable widgets: enabled dashboard widgets mount into sandboxed slots
+  let widgets = null;
+  try {
+    const wj = await GET("/api/widgets");
+    widgets = (wj.widgets || [])
+      .filter((x) => x.enabled && ((x.manifest && x.manifest.mount) || "dashboard") === "dashboard");
+  } catch { widgets = null; }
+  const widgetGridHtml = widgets == null
+    ? `<div class="empty">Widgets unavailable.</div>`
+    : widgets.length ? widgets.map(widgetSlotHtml).join("")
+    : `<div class="empty">No widgets yet. <button class="link" id="widgets-empty-manage">Install one</button> — or ask Milton to build one.</div>`;
   view.innerHTML = `
     <div class="feed-head">
       <div>
@@ -601,6 +905,13 @@ async function vDashboard() {
       <h2>Today's stream <span class="count">${items.length}</span></h2>
       ${items.length ? items.map(feedItemHtml).join("") : `<div class="empty">Nothing due — a clear runway. Add a task above to seed it.</div>`}
     </div>
+    <div class="panel widget-panel">
+      <div class="widget-panel-head">
+        <h2>Widgets <span class="count">${widgets == null ? "" : widgets.length}</span></h2>
+        <button class="btn ghost sm" id="widgets-manage">⚙ Manage</button>
+      </div>
+      <div class="widget-grid" id="widget-grid">${widgetGridHtml}</div>
+    </div>
     <div id="dash-insights"></div>`;
   // task items: shared checkbox/edit wiring (same flow as the old feed)
   wireTaskRows(items.filter((i) => i.type === "task" && i.task).map((i) => i.task), []);
@@ -617,6 +928,17 @@ async function vDashboard() {
   };
   $("#qa-add").onclick = add;
   $("#qa-title").addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
+  // register the mounted widget frames with the postMessage bridge
+  const goManage = () => { location.hash = "#/dashboard/widgets"; };
+  const manageBtn = $("#widgets-manage");
+  if (manageBtn) manageBtn.onclick = goManage;
+  const emptyManage = $("#widgets-empty-manage");
+  if (emptyManage) emptyManage.onclick = goManage;
+  widgetIframes.clear();
+  view.querySelectorAll("iframe[data-widget-frame]").forEach((fr) => {
+    widgetIframes.set(Number(fr.dataset.widgetFrame), fr);
+    fr.style.height = "240px";
+  });
   renderMiltonInsights($("#dash-insights"), hyg, hygErr);
 }
 
@@ -2455,6 +2777,10 @@ async function route() {
     } else if (name === "workshop") {
       $("#page-title").textContent = TITLES[name];
       await vWorkshop(parts[1]);
+    } else if (name === "dashboard" && parts[1] === "widgets") {
+      // Widgets manager — reached from the Dashboard gear, not the nav.
+      $("#page-title").textContent = "Widgets";
+      await vWidgetManager();
     } else {
       $("#page-title").textContent = TITLES[name];
       await { dashboard: vDashboard, outreach: vOutreach, contacts: vContacts,
@@ -2470,6 +2796,8 @@ async function route() {
   await initWorkspaces();
   initMiltonDock();
   initPalette();
+  // host side of the widget postMessage bridge (phase 1 scaffold)
+  window.addEventListener("message", widgetOnMessage);
   window.addEventListener("hashchange", route);
   if (!location.hash) location.hash = "#/dashboard";
   route();

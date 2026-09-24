@@ -1,3 +1,5 @@
 crm.db*
 node_modules/
 uploads/
+data/
+widgets/

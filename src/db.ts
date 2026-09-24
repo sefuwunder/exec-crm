@@ -230,6 +230,34 @@ CREATE TABLE IF NOT EXISTS outreach (
   happened_at TEXT DEFAULT '',
   created_at TEXT DEFAULT (datetime('now'))
 );
+-- Widget scaffold (phase 1): deployable dashboard widgets. A widget is a
+-- manifest + JS + CSS bundle installed by the user or proposed by Milton;
+-- proposals come only from those two sources, never a third-party registry.
+-- widget_versions keeps the prior bundle on every update so rollback can
+-- restore it. Both tables are workspace-scoped like every other record.
+CREATE TABLE IF NOT EXISTS widgets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER REFERENCES workspaces(id),
+  name TEXT NOT NULL,
+  title TEXT NOT NULL,
+  version TEXT NOT NULL DEFAULT '1.0.0',
+  manifest TEXT NOT NULL DEFAULT '{}',
+  js TEXT NOT NULL DEFAULT '',
+  css TEXT NOT NULL DEFAULT '',
+  enabled INTEGER DEFAULT 1,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now')),
+  UNIQUE(workspace_id, name)
+);
+CREATE TABLE IF NOT EXISTS widget_versions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  widget_id INTEGER REFERENCES widgets(id),
+  version TEXT NOT NULL,
+  manifest TEXT NOT NULL DEFAULT '{}',
+  js TEXT NOT NULL DEFAULT '',
+  css TEXT NOT NULL DEFAULT '',
+  created_at TEXT DEFAULT (datetime('now'))
+);
 `;
 
 export function openDb(path: string): Database {

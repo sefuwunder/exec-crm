@@ -75,7 +75,8 @@ function bootApp(canned: Record<string, any>, widgets = WIDGETS) {
   };
   const factory = new Function("document", "fetch", "location", "localStorage", "confirm", "window",
     appSrc + `\nreturn { route, vDashboard, vWidgetManager, widgetCheckManifest, widgetPermChips,
-      widgetReviewHtml, widgetSlotHtml, widgetCardHtml, widgetOnMessage, widgetIframes, widgetNotify };`);
+      widgetReviewHtml, widgetSlotHtml, widgetCardHtml, widgetOnMessage, widgetIframes, widgetNotify,
+      widgetHostContext, widgetCheckSetDef, widgetSetReviewHtml, widgetSetCardHtml, widgetBridgeReset };`);
   const app = factory(documentStub, fetchStub, locationStub, localStorageStub, () => true, { addEventListener() {} });
   const view = () => documentStub.querySelector("#view").innerHTML as string;
   const waitFor = async (pred: (h: string) => boolean, label: string) => {
@@ -98,6 +99,7 @@ const BOOT_CANNED = {
   "/api/milton/hygiene": { error: "down" },
   "/api/milton/status": { ok: false, reachable: false },
   "/api/widgets": WIDGETS,
+  "/api/widget-sets": { sets: [] },
 };
 
 describe("widget dashboard slots (DOM-stubbed)", () => {
@@ -239,5 +241,241 @@ describe("widgets manager view", () => {
     expect(h).toContain("← Dashboard");
     // destructive action wears the danger style
     expect(h).toContain("btn danger sm");
+  });
+});
+
+const SET_DEF = {
+  manifest: { name: "morning-briefing", title: "Morning Briefing", version: "1.0.0", description: "Starter set." },
+  members: [
+    { manifest: { name: "briefing-greeting", title: "Greeting", version: "1.0.0", mount: "dashboard", permissions: ["feed:read"] }, js: "1;", css: "" },
+    { manifest: { name: "briefing-actions", title: "Actions", version: "2.0.0", mount: "dashboard", permissions: ["deals:read", "deals:write"] }, js: "2;", css: "" },
+  ],
+};
+const SET_ROW = {
+  id: 3, name: "morning-briefing", title: "Morning Briefing", version: "1.0.0",
+  description: "Starter set.", members: [
+    { widget_id: 7, name: "briefing-greeting", title: "Greeting", version: "1.0.0", snapshot_version: "1.0.0", diverged: false },
+    { widget_id: 8, name: "briefing-actions", title: "Actions", version: "2.0.0", snapshot_version: "2.0.0", diverged: false },
+  ],
+  snapshots: 1, diverged: false, created_at: "2026-09-24 10:00:00", updated_at: "2026-09-24 10:00:00",
+};
+
+function twoFrames(app: any) {
+  const a: any[] = [], b: any[] = [];
+  const cwA = { postMessage: (m: any) => a.push(m) };
+  const cwB = { postMessage: (m: any) => b.push(m) };
+  app.widgetIframes.set(7, { contentWindow: cwA, style: {} });
+  app.widgetIframes.set(8, { contentWindow: cwB, style: {} });
+  return { cwA, cwB, a, b };
+}
+function resetContext(app: any) {
+  for (const k of Object.keys(app.widgetHostContext)) app.widgetHostContext[k] = null;
+}
+
+describe("phase 2: shared context bridge (host-mediated)", () => {
+  test("context set/get round-trips a slot value through the bridge", async () => {
+    const { app } = bootApp(BOOT_CANNED);
+    resetContext(app);
+    const { cwA, a } = twoFrames(app);
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-context-set", reqId: "c1", slot: "selectedDeal", value: { id: 5, label: "Acme" } } });
+    expect(a[0]).toMatchObject({ type: "widget-context-result", reqId: "c1", ok: true, value: { id: 5, label: "Acme" } });
+    expect(app.widgetHostContext.selectedDeal).toEqual({ id: 5, label: "Acme" });
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-context-get", reqId: "c2", slot: "selectedDeal" } });
+    expect(a[1]).toMatchObject({ type: "widget-context-result", reqId: "c2", ok: true, value: { id: 5, label: "Acme" } });
+    // clearing back to null works too
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-context-set", reqId: "c3", slot: "selectedDeal", value: null } });
+    expect(a[2]).toMatchObject({ ok: true, value: null });
+  });
+  test("unknown context slots are rejected — the host owns the slot list", async () => {
+    const { app } = bootApp(BOOT_CANNED);
+    const { cwA, a } = twoFrames(app);
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-context-set", reqId: "c1", slot: "evilSlot", value: { id: 1 } } });
+    expect(a[0]).toMatchObject({ ok: false });
+    expect(String(a[0].error)).toMatch(/unknown context slot/);
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-context-get", reqId: "c2", slot: "evilSlot" } });
+    expect(a[1]).toMatchObject({ ok: false });
+  });
+  test("context values must be small JSON objects or null", async () => {
+    const { app } = bootApp(BOOT_CANNED);
+    const { cwA, a } = twoFrames(app);
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-context-set", reqId: "c1", slot: "selectedDeal", value: [1, 2] } });
+    expect(a[0]).toMatchObject({ ok: false });
+    expect(String(a[0].error)).toMatch(/object or null/);
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-context-set", reqId: "c2", slot: "selectedDeal", value: "just a string" } });
+    expect(a[1]).toMatchObject({ ok: false });
+    const big: any = { id: 1 };
+    big.blob = "x".repeat(70000);
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-context-set", reqId: "c3", slot: "selectedDeal", value: big } });
+    expect(a[2]).toMatchObject({ ok: false });
+    expect(String(a[2].error)).toMatch(/64KB/);
+  });
+  test("subscribed widgets get change broadcasts; others don't", async () => {
+    const { app } = bootApp(BOOT_CANNED);
+    resetContext(app);
+    const { cwA, cwB, a, b } = twoFrames(app);
+    app.widgetOnMessage({ source: cwB, data: { type: "widget-context-subscribe", slot: "selectedDeal" } });
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-context-set", reqId: "c1", slot: "selectedDeal", value: { id: 9, label: "Nine" } } });
+    const changeB = b.find((m: any) => m.type === "widget-context-change");
+    expect(changeB).toMatchObject({ slot: "selectedDeal", value: { id: 9, label: "Nine" } });
+    // a change to another slot does not notify the selectedDeal subscriber
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-context-set", reqId: "c2", slot: "selectedContact", value: { id: 2 } } });
+    expect(b.filter((m: any) => m.type === "widget-context-change")).toHaveLength(1);
+    // unsubscribe stops the broadcasts
+    app.widgetOnMessage({ source: cwB, data: { type: "widget-context-unsubscribe", slot: "selectedDeal" } });
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-context-set", reqId: "c3", slot: "selectedDeal", value: null } });
+    expect(b.filter((m: any) => m.type === "widget-context-change")).toHaveLength(1);
+    void a;
+  });
+  test("context bridge ignores messages from unknown sources", async () => {
+    const { app } = bootApp(BOOT_CANNED);
+    resetContext(app);
+    app.widgetOnMessage({ source: {}, data: { type: "widget-context-set", reqId: "x", slot: "selectedDeal", value: { id: 1 } } });
+    expect(app.widgetHostContext.selectedDeal).toBeNull();
+  });
+});
+
+describe("phase 2: open pub/sub (host-mediated)", () => {
+  test("publish routes to subscribers, never back to the publisher", async () => {
+    const { app } = bootApp(BOOT_CANNED);
+    const { cwA, cwB, a, b } = twoFrames(app);
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-event-subscribe", topic: "deal.selected" } });
+    app.widgetOnMessage({ source: cwB, data: { type: "widget-event-subscribe", topic: "deal.selected" } });
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-event-publish", reqId: "e1", topic: "deal.selected", payload: { id: 4 } } });
+    expect(a[0]).toMatchObject({ type: "widget-event-result", reqId: "e1", ok: true });
+    // publisher got no event back; the other subscriber did
+    expect(a.filter((m: any) => m.type === "widget-event")).toHaveLength(0);
+    const ev = b.find((m: any) => m.type === "widget-event");
+    expect(ev).toMatchObject({ topic: "deal.selected", payload: { id: 4 } });
+  });
+  test("reserved host.* topics and malformed topics are rejected", async () => {
+    const { app } = bootApp(BOOT_CANNED);
+    const { cwA, a } = twoFrames(app);
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-event-publish", reqId: "e1", topic: "host.context", payload: {} } });
+    expect(a[0]).toMatchObject({ ok: false });
+    expect(String(a[0].error)).toMatch(/reserved/);
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-event-publish", reqId: "e2", topic: "host", payload: {} } });
+    expect(a[1]).toMatchObject({ ok: false });
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-event-publish", reqId: "e3", topic: "bad topic!", payload: {} } });
+    expect(a[2]).toMatchObject({ ok: false });
+    // subscribing to a reserved topic silently does nothing — no route exists
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-event-subscribe", topic: "host.context" } });
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-event-unsubscribe", topic: "deal.selected" } });
+  });
+  test("event payloads obey the same object-or-null, 64KB rules", async () => {
+    const { app } = bootApp(BOOT_CANNED);
+    const { cwA, a } = twoFrames(app);
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-event-publish", reqId: "e1", topic: "t", payload: [1] } });
+    expect(a[0]).toMatchObject({ ok: false });
+    const big: any = {};
+    big.blob = "y".repeat(70000);
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-event-publish", reqId: "e2", topic: "t", payload: big } });
+    expect(a[1]).toMatchObject({ ok: false });
+  });
+});
+
+describe("phase 2: set definition validation (client mirror)", () => {
+  test("accepts a valid set definition", () => {
+    const { app } = bootApp(BOOT_CANNED);
+    expect(app.widgetCheckSetDef(SET_DEF)).toBeNull();
+  });
+  test("rejects bad set shapes with plain-language errors", () => {
+    const { app } = bootApp(BOOT_CANNED);
+    expect(app.widgetCheckSetDef(null)).toMatch(/object/);
+    expect(app.widgetCheckSetDef({ ...SET_DEF, manifest: { name: "Bad", title: "T", version: "1.0.0" } })).toMatch(/slug/);
+    expect(app.widgetCheckSetDef({ ...SET_DEF, manifest: { name: "ss", title: "T", version: "1" } })).toMatch(/semver/);
+    expect(app.widgetCheckSetDef({ ...SET_DEF, members: [] })).toMatch(/non-empty/);
+    expect(app.widgetCheckSetDef({ ...SET_DEF, members: undefined })).toMatch(/non-empty/);
+    const dup = JSON.parse(JSON.stringify(SET_DEF));
+    dup.members.push(JSON.parse(JSON.stringify(SET_DEF.members[0])));
+    expect(app.widgetCheckSetDef(dup)).toMatch(/duplicate member/);
+    const badJs = JSON.parse(JSON.stringify(SET_DEF));
+    badJs.members[0].js = "   ";
+    expect(app.widgetCheckSetDef(badJs)).toMatch(/widget js is required/);
+    const badPerm = JSON.parse(JSON.stringify(SET_DEF));
+    badPerm.members[1].manifest.permissions = ["nope:read"];
+    expect(app.widgetCheckSetDef(badPerm)).toMatch(/unknown permission/);
+    const tooMany = JSON.parse(JSON.stringify(SET_DEF));
+    tooMany.members = Array.from({ length: 13 }, (_, i) => ({
+      manifest: { name: `m${i}`, title: `M${i}`, version: "1.0.0", mount: "dashboard", permissions: ["feed:read"] }, js: "x;", css: "",
+    }));
+    expect(app.widgetCheckSetDef(tooMany)).toMatch(/max 12/);
+  });
+});
+
+describe("phase 2: one-grant install review", () => {
+  test("review shows the union of member permissions, reads and writes apart", () => {
+    const { app } = bootApp(BOOT_CANNED);
+    const html = app.widgetSetReviewHtml(SET_DEF);
+    expect(html).toContain("Morning Briefing");
+    expect(html).toContain("2 widgets");
+    expect(html).toContain("Greeting");
+    expect(html).toContain("Actions");
+    expect(html).toContain("briefing-actions");
+    // union: feed:read + deals:read + deals:write, deduped
+    expect(html).toContain("feed · read");
+    expect(html).toContain("deals · read");
+    expect(html).toContain("deals · write");
+    expect(html).toContain('class="perm write"');
+    expect(html).toContain("One grant");
+    expect(html).toContain("stays pinned");
+  });
+  test("set card shows members, pin state, and divergence", () => {
+    const { app } = bootApp(BOOT_CANNED);
+    const html = app.widgetSetCardHtml(SET_ROW);
+    expect(html).toContain("Morning Briefing");
+    expect(html).toContain("v1.0.0 · pinned");
+    expect(html).toContain("Greeting");
+    expect(html).toContain("v1.0.0");
+    expect(html).toContain('data-ws-rollback="3"');
+    expect(html).toContain('data-ws-del="3"');
+    expect(html).not.toContain("diverged");
+    const div = { ...SET_ROW, diverged: true, members: SET_ROW.members.map((m: any) => ({ ...m, diverged: m.name === "briefing-actions", version: m.name === "briefing-actions" ? "9.9.9" : m.version })) };
+    const html2 = app.widgetSetCardHtml(div);
+    expect(html2).toContain("diverged");
+    expect(html2).toContain("wdiverged");
+  });
+});
+
+describe("phase 2: sets manager section", () => {
+  test("manager renders the sets section with an install-set action", async () => {
+    const canned = { ...BOOT_CANNED, "/api/widget-sets": { sets: [SET_ROW] } };
+    const { app, view, waitFor } = bootApp(canned);
+    await app.vWidgetManager();
+    await waitFor((h) => h.includes("Widget sets"), "sets section");
+    const h = view();
+    expect(h).toContain("Widget sets");
+    expect(h).toContain("Morning Briefing");
+    expect(h).toContain('id="wm-install-set"');
+    expect(h).toContain("Install set");
+    expect(h).toContain("Individual widgets");
+    expect(h).toContain("one permission grant");
+  });
+  test("manager shows the empty sets state when none are installed", async () => {
+    const { app, view, waitFor } = bootApp(BOOT_CANNED);
+    await app.vWidgetManager();
+    await waitFor((h) => h.includes("Widget sets"), "sets section");
+    expect(view()).toContain("No sets installed yet");
+  });
+});
+
+describe("phase 2: workspace isolation of bridge state", () => {
+  test("bridge reset clears context, subscriptions, and frame registry", async () => {
+    const { app } = bootApp(BOOT_CANNED);
+    const { cwA, cwB, b } = twoFrames(app);
+    app.widgetOnMessage({ source: cwB, data: { type: "widget-context-subscribe", slot: "selectedDeal" } });
+    app.widgetOnMessage({ source: cwB, data: { type: "widget-event-subscribe", topic: "deal.selected" } });
+    app.widgetOnMessage({ source: cwA, data: { type: "widget-context-set", reqId: "c1", slot: "selectedDeal", value: { id: 1 } } });
+    expect(app.widgetHostContext.selectedDeal).toEqual({ id: 1 });
+    expect(b.some((m: any) => m.type === "widget-context-change")).toBe(true);
+    app.widgetBridgeReset();
+    expect(app.widgetHostContext.selectedDeal).toBeNull();
+    expect(app.widgetHostContext.selectedContact).toBeNull();
+    expect(app.widgetIframes.size).toBe(0);
+    // after reset, re-registered frames get no stale broadcasts
+    const msgs: any[] = [];
+    const cw = { postMessage: (m: any) => msgs.push(m) };
+    app.widgetIframes.set(8, { contentWindow: cw, style: {} });
+    app.widgetOnMessage({ source: cw, data: { type: "widget-context-set", reqId: "c2", slot: "selectedDeal", value: { id: 2 } } });
+    expect(msgs.filter((m: any) => m.type === "widget-context-change")).toHaveLength(0);
   });
 });

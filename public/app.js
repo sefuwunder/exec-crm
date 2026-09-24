@@ -199,6 +199,7 @@ async function initWorkspaces() {
 function setWorkspace(id) {
   wsId = id;
   localStorage.setItem(WS_KEY, String(id));
+  widgetBridgeReset();
   paletteBust();
   renderWsSwitcher();
   route();
@@ -570,7 +571,8 @@ function renderMiltonInsights(el, data, err) {
    The bridge forwards API calls to POST /api/widgets/:id/invoke, which
    enforces the manifest permissions the user granted at install —
    server-side, per call. Reads AND writes are available from day 1.
-   (Phase 2 will add inter-widget messages on this same bridge.) */
+   (Phase 2 adds inter-widget messages on this same bridge: host-defined
+   shared context + open pub/sub, both host-mediated.) */
 const widgetIframes = new Map(); // widget id -> iframe element
 const WIDGET_PERMS_CLIENT = [
   "deals:read", "deals:write",
@@ -623,6 +625,118 @@ function widgetOnMessage(e) {
     const h = Math.max(120, Math.min(1200, Number(d.height) || 240));
     if (fr && fr.style) fr.style.height = h + "px";
   }
+  else if (d.type === "widget-context-get") widgetContextGet(wid, e.source, d);
+  else if (d.type === "widget-context-set") widgetContextSet(wid, e.source, d);
+  else if (d.type === "widget-context-subscribe") widgetContextSubscribe(wid, d);
+  else if (d.type === "widget-context-unsubscribe") widgetContextUnsubscribe(wid, d);
+  else if (d.type === "widget-event-publish") widgetEventPublish(wid, e.source, d);
+  else if (d.type === "widget-event-subscribe") widgetEventSubscribe(wid, d);
+  else if (d.type === "widget-event-unsubscribe") widgetEventUnsubscribe(wid, d);
+}
+/* ---------- widget sets (phase 2): shared context + pub/sub, host-mediated ----------
+   Widgets in a set work together through the host, never directly:
+   - Shared context: a small registry of host-defined slots (selectedDeal,
+     selectedContact, selectedCompany). Widgets read/set/subscribe; the host
+     owns the slot list and validates every write.
+   - Pub/sub: widgets publish to any topic except the reserved "host.*"
+     prefix and subscribe to any topic. The host routes; the publisher never
+     receives its own event back (no echo loops).
+   Both ride the same postMessage bridge, and both are scoped to the current
+   Dashboard page — context resets on reload. */
+// Context and subscriptions are workspace-scoped: switching workspaces
+// resets them so a selected deal (or a stale subscription) never leaks from
+// one workspace into another.
+function widgetBridgeReset() {
+  for (const k of Object.keys(widgetHostContext)) widgetHostContext[k] = null;
+  widgetContextSubs.clear();
+  widgetEventSubs.clear();
+  widgetIframes.clear();
+}
+const HOST_CONTEXT_SLOTS = ["selectedDeal", "selectedContact", "selectedCompany"];
+const widgetHostContext = { selectedDeal: null, selectedContact: null, selectedCompany: null };
+const widgetContextSubs = new Map(); // slot -> Set(widget id)
+const widgetEventSubs = new Map(); // topic -> Set(widget id)
+const WIDGET_EVENT_TOPIC_RE = /^[A-Za-z0-9._-]{1,120}$/;
+const WIDGET_BRIDGE_VALUE_MAX = 64 * 1024;
+function widgetPostTo(wid, msg) {
+  const fr = widgetIframes.get(wid);
+  try {
+    if (fr && fr.contentWindow) fr.contentWindow.postMessage(msg, "*");
+  } catch { /* frame gone */ }
+}
+function widgetSubSet(map, key) {
+  let s = map.get(key);
+  if (!s) { s = new Set(); map.set(key, s); }
+  return s;
+}
+function widgetBridgeOk(source, type, reqId, extra) {
+  widgetPostToReq(source, Object.assign({ type, reqId, ok: true }, extra || {}));
+}
+function widgetBridgeErr(source, type, reqId, error) {
+  widgetPostToReq(source, { type, reqId, ok: false, error });
+}
+function widgetPostToReq(source, msg) {
+  try { source.postMessage(msg, "*"); } catch { /* frame gone */ }
+}
+function widgetBridgeValue(v) {
+  // Context values and event payloads must be small, plain JSON: null or an
+  // object. Arrays and primitives are rejected so slots keep their
+  // { id, label, ... } shape by convention.
+  if (v === null || v === undefined) return { value: null };
+  if (typeof v !== "object" || Array.isArray(v)) return { error: "value must be a JSON object or null" };
+  let s;
+  try { s = JSON.stringify(v); } catch { return { error: "value is not JSON-serializable" }; }
+  if (s.length > WIDGET_BRIDGE_VALUE_MAX) return { error: "value too large (max 64KB)" };
+  return { value: JSON.parse(s) };
+}
+function widgetContextGet(wid, source, d) {
+  const slot = String(d.slot || "");
+  if (!HOST_CONTEXT_SLOTS.includes(slot))
+    return widgetBridgeErr(source, "widget-context-result", d.reqId, `unknown context slot "${slot}"`);
+  widgetBridgeOk(source, "widget-context-result", d.reqId, { value: widgetHostContext[slot] });
+}
+function widgetContextSet(wid, source, d) {
+  const slot = String(d.slot || "");
+  if (!HOST_CONTEXT_SLOTS.includes(slot))
+    return widgetBridgeErr(source, "widget-context-result", d.reqId, `unknown context slot "${slot}"`);
+  const v = widgetBridgeValue(d.value);
+  if (v.error) return widgetBridgeErr(source, "widget-context-result", d.reqId, v.error);
+  widgetHostContext[slot] = v.value;
+  widgetBridgeOk(source, "widget-context-result", d.reqId, { value: v.value });
+  const subs = widgetContextSubs.get(slot);
+  if (subs) for (const id of subs) widgetPostTo(id, { type: "widget-context-change", slot, value: v.value });
+}
+function widgetContextSubscribe(wid, d) {
+  const slot = String(d.slot || "");
+  if (HOST_CONTEXT_SLOTS.includes(slot)) widgetSubSet(widgetContextSubs, slot).add(wid);
+}
+function widgetContextUnsubscribe(wid, d) {
+  const s = widgetContextSubs.get(String(d.slot || ""));
+  if (s) s.delete(wid);
+}
+function widgetEventTopicOk(topic) {
+  if (typeof topic !== "string" || !WIDGET_EVENT_TOPIC_RE.test(topic)) return "topic must be 1-120 chars of letters, digits, . _ -";
+  if (topic === "host" || topic.startsWith("host.")) return 'topics under "host.*" are reserved';
+  return null;
+}
+function widgetEventPublish(wid, source, d) {
+  const err = widgetEventTopicOk(d.topic);
+  if (err) return widgetBridgeErr(source, "widget-event-result", d.reqId, err);
+  const v = widgetBridgeValue(d.payload);
+  if (v.error) return widgetBridgeErr(source, "widget-event-result", d.reqId, v.error);
+  widgetBridgeOk(source, "widget-event-result", d.reqId, {});
+  const subs = widgetEventSubs.get(d.topic);
+  if (subs) for (const id of subs) {
+    if (id === wid) continue; // never echo back to the publisher
+    widgetPostTo(id, { type: "widget-event", topic: d.topic, payload: v.value });
+  }
+}
+function widgetEventSubscribe(wid, d) {
+  if (!widgetEventTopicOk(d.topic)) widgetSubSet(widgetEventSubs, String(d.topic)).add(wid);
+}
+function widgetEventUnsubscribe(wid, d) {
+  const s = widgetEventSubs.get(String(d.topic || ""));
+  if (s) s.delete(wid);
 }
 async function widgetBridgeInvoke(wid, source, d) {
   const reply = (payload) => {
@@ -712,8 +826,10 @@ function widgetCardHtml(w) {
 /* Widgets manager — reached from the Dashboard gear, not the nav (stays 4 items). */
 async function vWidgetManager() {
   let widgets = [];
+  let sets = [];
   try {
     widgets = (await GET("/api/widgets")).widgets || [];
+    sets = (await GET("/api/widget-sets")).sets || [];
   } catch (e) {
     view.innerHTML = `<div class="empty">Couldn't load widgets: ${esc(e.message)}</div>`;
     return;
@@ -724,9 +840,16 @@ async function vWidgetManager() {
       <div class="wm-title"><h2>Widgets</h2>
         <div class="muted">Deployable dashboard widgets. Install them yourself, or ask Milton to build one — proposals come only from you two.</div></div>
       <span class="spacer"></span>
+      <button class="btn ghost" id="wm-install-set">Install set</button>
       <button class="btn" id="wm-install">Install widget</button>
     </div>
-    <div class="wm-list">${widgets.map(widgetCardHtml).join("") || `<div class="panel"><div class="empty">No widgets installed yet.</div></div>`}</div>
+    <div class="wm-sec"><div class="wm-sec-head"><h2>Widget sets</h2>
+      <div class="muted">Bundles of widgets that work together — one install, one permission grant, one rollback.</div></div>
+      <div class="wm-list">${sets.map(widgetSetCardHtml).join("") || `<div class="panel"><div class="empty">No sets installed yet. A set installs several widgets at once and lets them share context and events.</div></div>`}</div>
+    </div>
+    <div class="wm-sec"><div class="wm-sec-head"><h2>Individual widgets</h2></div>
+      <div class="wm-list">${widgets.map(widgetCardHtml).join("") || `<div class="panel"><div class="empty">No widgets installed yet.</div></div>`}</div>
+    </div>
     <div class="panel wm-dev">
       <h2>Develop locally</h2>
       <div class="muted">Drop a folder into <code>widgets/</code> next to the server (gitignored) containing
@@ -735,6 +858,7 @@ async function vWidgetManager() {
     </div>`;
   $("#wm-back").onclick = () => { location.hash = "#/dashboard"; };
   $("#wm-install").onclick = () => widgetInstallModal(null, () => vWidgetManager());
+  $("#wm-install-set").onclick = () => widgetSetInstallModal(() => vWidgetManager());
   view.querySelectorAll("[data-w-toggle]").forEach((t) => {
     t.onchange = async () => {
       await PATCH(`/api/widgets/${t.dataset.wToggle}`, { enabled: t.checked });
@@ -758,6 +882,20 @@ async function vWidgetManager() {
     b.onclick = async () => {
       if (!confirm(`Uninstall widget "${b.dataset.wName}"? This removes it from the Dashboard.`)) return;
       await DEL(`/api/widgets/${b.dataset.wDel}`);
+      vWidgetManager();
+    };
+  });
+  view.querySelectorAll("[data-ws-rollback]").forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm(`Roll back the whole set "${b.dataset.wName}" to its previous snapshot? Every member widget is restored at once.`)) return;
+      await POST(`/api/widget-sets/${b.dataset.wsRollback}/rollback`);
+      vWidgetManager();
+    };
+  });
+  view.querySelectorAll("[data-ws-del]").forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm(`Uninstall the set "${b.dataset.wName}"? The set record is removed; member widgets stay installed.`)) return;
+      await DEL(`/api/widget-sets/${b.dataset.wsDel}`);
       vWidgetManager();
     };
   });
@@ -852,6 +990,166 @@ function widgetInstallModal(existing, onDone) {
       close();
       onDone();
     } catch (e) { showErr(e.message); showForm(); }
+  };
+}
+
+/* ---------- widget sets (phase 2): installable bundles that work together ----------
+   A set installs its member widgets in one shot and grants the union of
+   their permissions in a single review. The set version is pinned; members
+   may still be updated independently afterward (the card flags divergence).
+   Set rollback restores every member bundle from the snapshot at once. */
+function widgetCheckSetDef(def) {
+  if (!def || typeof def !== "object" || Array.isArray(def)) return "set bundle must be a JSON object";
+  const m = def.manifest;
+  if (!m || typeof m !== "object" || Array.isArray(m)) return "set bundle needs a manifest object";
+  if (!/^[a-z0-9][a-z0-9_-]{1,47}$/.test(String(m.name || "")))
+    return "set manifest.name must be a slug: lowercase letters, digits, - and _, 2-48 chars";
+  const title = String(m.title || "").trim();
+  if (!title || title.length > 80) return "set manifest.title is required (max 80 chars)";
+  if (!/^\d+\.\d+\.\d+$/.test(String(m.version || ""))) return "set manifest.version must be semver, e.g. 1.0.0";
+  if (String(m.description || "").length > 280) return "set manifest.description too long (max 280 chars)";
+  const members = def.members;
+  if (!Array.isArray(members) || !members.length || members.length > 12)
+    return "members must be a non-empty array (max 12)";
+  const seen = new Set();
+  for (const mem of members) {
+    if (!mem || typeof mem !== "object") return "each member must be an object with manifest, js, css";
+    const err = widgetCheckManifest(mem.manifest);
+    if (err) return `member: ${err}`;
+    if (seen.has(mem.manifest.name)) return `duplicate member "${mem.manifest.name}"`;
+    seen.add(mem.manifest.name);
+    if (typeof mem.js !== "string" || !mem.js.trim()) return `member "${mem.manifest.name}": widget js is required`;
+  }
+  return null;
+}
+function widgetSetUnionPerms(def) {
+  const s = new Set();
+  for (const mem of def.members || [])
+    for (const p of (mem.manifest && mem.manifest.permissions) || []) s.add(p);
+  return [...s];
+}
+function widgetSetReviewHtml(def) {
+  const perms = widgetSetUnionPerms(def);
+  const reads = perms.filter((p) => String(p).endsWith(":read"));
+  const writes = perms.filter((p) => String(p).endsWith(":write"));
+  const chip = (p, write) =>
+    `<span class="perm${write ? " write" : ""}">${esc(String(p).split(":")[0])} · ${write ? "write" : "read"}</span>`;
+  const memRows = (def.members || []).map((mem) => {
+    const mp = (mem.manifest && mem.manifest.permissions) || [];
+    return `<div class="wset-member"><b>${esc(mem.manifest.title)}</b> <span class="wver">v${esc(mem.manifest.version)}</span>
+      <span class="muted mono">${esc(mem.manifest.name)}</span>
+      <div>${mp.map((p) => chip(p, String(p).endsWith(":write"))).join("")}</div></div>`;
+  }).join("");
+  return `<div class="wreview">
+    <div class="wreview-id"><b>${esc(def.manifest.title)}</b> <span class="wver">v${esc(def.manifest.version)}</span>
+      <div class="muted mono">${esc(def.manifest.name)} · installs ${def.members.length} widget${def.members.length > 1 ? "s" : ""} as one set</div></div>
+    ${def.manifest.description ? `<div class="wreview-desc">${esc(def.manifest.description)}</div>` : ""}
+    <div class="wreview-label">One grant — every permission the set needs</div>
+    <div class="wreview-perms">
+      <div class="wreview-sec"><div class="wreview-label">Can read</div>
+        <div>${reads.map((p) => chip(p, false)).join("") || `<span class="muted">nothing</span>`}</div></div>
+      <div class="wreview-sec"><div class="wreview-label">Can write <span class="wreview-warn">— changes your CRM data</span></div>
+        <div>${writes.map((p) => chip(p, true)).join("") || `<span class="muted">nothing</span>`}</div></div>
+    </div>
+    <div class="wreview-label">Member widgets</div>
+    ${memRows}
+    <div class="wreview-note">Grants apply to this workspace only. Members also land as ordinary widgets — update or uninstall them individually later; the set's version stays pinned.</div>
+  </div>`;
+}
+function widgetSetCardHtml(s) {
+  const memRows = (s.members || []).map((m) =>
+    `<div class="wset-member"><b>${esc(m.title)}</b> <span class="wver">v${esc(m.version)}</span>
+     ${m.diverged ? `<span class="wdiverged" title="updated on its own after the set install — no longer matches the set snapshot">diverged</span>` : ""}</div>`
+  ).join("");
+  return `<div class="panel wm-card">
+    <div class="wm-card-head">
+      <div><b>${esc(s.title)}</b> <span class="wver">v${esc(s.version)} · pinned</span>
+        <div class="muted mono">${esc(s.name)} · ${s.members.length} widget${s.members.length === 1 ? "" : "s"}${s.diverged ? ` · <span class="wdiverged">diverged from snapshot</span>` : ""}</div></div>
+    </div>
+    ${s.description ? `<div class="muted">${esc(s.description)}</div>` : ""}
+    <div class="wset-members">${memRows}</div>
+    <div class="wm-card-actions">
+      ${s.snapshots > 0 ? `<button class="btn ghost sm" data-ws-rollback="${s.id}" data-ws-name="${esc(s.title)}">Roll back set (${s.snapshots})</button>` : ""}
+      <button class="btn danger sm" data-ws-del="${s.id}" data-ws-name="${esc(s.title)}">Uninstall set</button>
+    </div>
+  </div>`;
+}
+function widgetSetInstallModal(onDone) {
+  const root = $("#modal-root");
+  const setText = `{
+  "manifest": {
+    "name": "morning-briefing",
+    "title": "Morning Briefing",
+    "version": "1.0.0",
+    "description": "A starter set: greeting, action feed, and hygiene."
+  },
+  "members": [
+    {
+      "manifest": {
+        "name": "briefing-greeting",
+        "title": "Briefing Greeting",
+        "version": "1.0.0",
+        "mount": "dashboard",
+        "permissions": ["feed:read"],
+        "description": ""
+      },
+      "js": "// the host bridge is available as execrm:\\n// execrm.context.on('selectedDeal', d => console.log(d));",
+      "css": ""
+    }
+  ]
+}`;
+  root.innerHTML = `
+    <div class="overlay" id="wsovl"><div class="modal wmodal">
+      <h2>Install widget set</h2>
+      <div id="wsinstall-form">
+        <div class="field"><label>Set bundle JSON — {manifest, members: [{manifest, js, css}]}</label>
+          <textarea id="ws-bundle" rows="16" spellcheck="false" class="code">${esc(setText)}</textarea></div>
+        <div class="werr" id="ws-err" hidden></div>
+      </div>
+      <div id="wsinstall-review" hidden></div>
+      <div class="actions">
+        <button class="btn ghost" id="ws-cancel">Cancel</button>
+        <button class="btn ghost" id="ws-back" hidden>Back</button>
+        <button class="btn" id="ws-next">Review permissions</button>
+        <button class="btn" id="ws-install" hidden>Install set</button>
+      </div>
+    </div></div>`;
+  const close = () => (root.innerHTML = "");
+  const showErr = (m) => { const el = $("#ws-err"); el.textContent = m; el.hidden = false; };
+  $("#ws-cancel").onclick = close;
+  $("#wsovl").addEventListener("mousedown", (e) => { if (e.target.id === "wsovl") close(); });
+  let staged = null;
+  $("#ws-next").onclick = () => {
+    let def;
+    try { def = JSON.parse($("#ws-bundle").value); }
+    catch { showErr("Set bundle is not valid JSON"); return; }
+    const err = widgetCheckSetDef(def);
+    if (err) { showErr(err); return; }
+    staged = def;
+    $("#wsinstall-form").hidden = true;
+    const rev = $("#wsinstall-review");
+    rev.innerHTML = widgetSetReviewHtml(def);
+    rev.hidden = false;
+    $("#ws-next").hidden = true;
+    $("#ws-back").hidden = false;
+    $("#ws-install").hidden = false;
+    $("#ws-err").hidden = true;
+  };
+  $("#ws-back").onclick = () => {
+    staged = null;
+    $("#wsinstall-form").hidden = false;
+    $("#wsinstall-review").hidden = true;
+    $("#ws-next").hidden = false;
+    $("#ws-back").hidden = true;
+    $("#ws-install").hidden = true;
+  };
+  $("#ws-install").onclick = async () => {
+    if (!staged) return;
+    try {
+      await POST("/api/widget-sets", staged);
+      close();
+      onDone();
+    } catch (e) { showErr(e.message); $("#ws-back").onclick(); }
   };
 }
 

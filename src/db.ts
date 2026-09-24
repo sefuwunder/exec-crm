@@ -258,6 +258,32 @@ CREATE TABLE IF NOT EXISTS widget_versions (
   css TEXT NOT NULL DEFAULT '',
   created_at TEXT DEFAULT (datetime('now'))
 );
+-- Widget SETS (phase 2): installable bundles of widgets that work together.
+-- One install grants the union of the member widgets' permissions in a single
+-- review; one version is pinned for the set while member widgets may still be
+-- updated independently afterward (the manager flags a diverged set when a
+-- member no longer matches the snapshot). widget_set_versions keeps prior
+-- member-bundle snapshots so set rollback can restore the whole set at once.
+-- Like widgets, sets are workspace-scoped scaffold — not business data.
+CREATE TABLE IF NOT EXISTS widget_sets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER REFERENCES workspaces(id),
+  name TEXT NOT NULL,
+  title TEXT NOT NULL,
+  version TEXT NOT NULL DEFAULT '1.0.0',
+  description TEXT NOT NULL DEFAULT '',
+  members TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now')),
+  UNIQUE(workspace_id, name)
+);
+CREATE TABLE IF NOT EXISTS widget_set_versions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  set_id INTEGER REFERENCES widget_sets(id),
+  version TEXT NOT NULL,
+  members TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT DEFAULT (datetime('now'))
+);
 `;
 
 export function openDb(path: string): Database {

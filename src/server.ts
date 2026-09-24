@@ -387,6 +387,113 @@ function widgetUpsert(w: number, manifest: any, js: string, css: string) {
   return { widget: widgetRow(Number(r.lastInsertRowid), w), updated: false };
 }
 
+// ---- widget SETS (phase 2): installable bundles of widgets that work together ----
+// A set installs its member widgets in one shot and grants the union of their
+// permissions in a single review. The set version is pinned at install/update;
+// member widgets may still be updated independently afterward — the manager
+// flags the set as diverged when a member no longer matches the snapshot.
+// Set rollback restores every member bundle from the snapshot at once.
+const WIDGET_SET_MAX_MEMBERS = 12;
+const WIDGET_SET_MAX_SNAPSHOTS = 10;
+
+function validateWidgetSetManifest(input: unknown): { manifest?: any; error?: string } {
+  if (!input || typeof input !== "object" || Array.isArray(input))
+    return { error: "set manifest must be an object" };
+  const m = input as Record<string, unknown>;
+  const name = String(m.name || "");
+  if (!/^[a-z0-9][a-z0-9_-]{1,47}$/.test(name))
+    return { error: "set manifest.name must be a slug: lowercase letters, digits, - and _, 2-48 chars" };
+  const title = String(m.title || "").trim();
+  if (!title || title.length > 80)
+    return { error: "set manifest.title is required (max 80 chars)" };
+  const version = String(m.version || "");
+  if (!/^\d+\.\d+\.\d+$/.test(version))
+    return { error: "set manifest.version must be semver (e.g. 1.0.0)" };
+  const description = String(m.description || "");
+  if (description.length > 280) return { error: "set manifest.description is too long (max 280 chars)" };
+  return { manifest: { name, title, version, description } };
+}
+
+function setRow(id: number, w: number) {
+  return db
+    .query(
+      `SELECT widget_sets.*, (SELECT COUNT(*) FROM widget_set_versions WHERE set_id = widget_sets.id) AS snapshot_count
+       FROM widget_sets WHERE id = ? AND workspace_id = ?`
+    )
+    .get(id, w) as any;
+}
+
+// Full member-bundle snapshot: everything rollback needs to restore a member.
+function setMembersSnapshot(w: number, members: any[]) {
+  const out: any[] = [];
+  for (const m of members) {
+    const row = db
+      .query("SELECT * FROM widgets WHERE workspace_id = ? AND name = ?")
+      .get(w, m.name) as any;
+    if (!row) continue;
+    out.push({
+      widget_id: row.id, name: row.name, title: row.title, version: row.version,
+      manifest: row.manifest || "{}", js: row.js || "", css: row.css || "",
+    });
+  }
+  return out;
+}
+
+function snapshotSetVersion(set: any) {
+  db.prepare(
+    "INSERT INTO widget_set_versions (set_id, version, members) VALUES (?, ?, ?)"
+  ).run(set.id, set.version, set.members || "[]");
+  db.exec(
+    `DELETE FROM widget_set_versions WHERE set_id = ${Number(set.id)} AND id NOT IN
+     (SELECT id FROM widget_set_versions WHERE set_id = ${Number(set.id)} ORDER BY id DESC LIMIT ${WIDGET_SET_MAX_SNAPSHOTS})`
+  );
+}
+
+// Rollback variant: snapshot the ACTUAL current member bundles from the
+// registry (not the pinned JSON on the set row), so a rollback can undo even
+// after members diverged independently — it restores exactly what was there
+// before the rollback ran.
+function snapshotSetActual(set: any, w: number) {
+  let pinned: any[] = [];
+  try { pinned = JSON.parse(set.members || "[]"); } catch {}
+  const actual = setMembersSnapshot(w, pinned);
+  db.prepare(
+    "INSERT INTO widget_set_versions (set_id, version, members) VALUES (?, ?, ?)"
+  ).run(set.id, set.version, JSON.stringify(actual));
+  db.exec(
+    `DELETE FROM widget_set_versions WHERE set_id = ${Number(set.id)} AND id NOT IN
+     (SELECT id FROM widget_set_versions WHERE set_id = ${Number(set.id)} ORDER BY id DESC LIMIT ${WIDGET_SET_MAX_SNAPSHOTS})`
+  );
+}
+
+function setPublic(row: any, w: number) {
+  let members: any[] = [];
+  try { members = JSON.parse(row.members || "[]"); } catch {}
+  const pubMembers = members.map((m: any) => {
+    const cur = db
+      .query("SELECT id, name, title, version FROM widgets WHERE workspace_id = ? AND name = ?")
+      .get(w, m.name) as any;
+    return {
+      widget_id: cur ? cur.id : m.widget_id,
+      name: m.name,
+      title: cur ? cur.title : m.title,
+      version: cur ? cur.version : m.version,
+      snapshot_version: m.version,
+      // The set version stays pinned while members may be updated on their
+      // own — a mismatch here means the set has diverged from its snapshot.
+      diverged: !cur || cur.version !== m.version,
+    };
+  });
+  return {
+    id: row.id, name: row.name, title: row.title, version: row.version,
+    description: row.description || "",
+    members: pubMembers,
+    snapshots: Number(row.snapshot_count || 0),
+    diverged: pubMembers.some((m: any) => m.diverged),
+    created_at: row.created_at, updated_at: row.updated_at,
+  };
+}
+
 // The sandboxed document a widget iframe loads. Bridge stub first (postMessage
 // to the parent only — no network: the CSP below blocks connect-src), then
 // the widget's own JS. </script> inside widget code is escaped so the bundle
@@ -402,6 +509,9 @@ function widgetBundleHtml(row: any, wsName: string): string {
     workspaceId: row.workspace_id,
     workspaceName: wsName,
     permissions: Array.isArray(manifest.permissions) ? manifest.permissions : [],
+    // Phase 2: host-defined shared-context slots. Widgets read/subscribe via
+    // execrm.context; the host owns the registry — widgets cannot invent slots.
+    contextSlots: ["selectedDeal", "selectedContact", "selectedCompany"],
   }).replace(/</g, "\\u003c");
   const escScript = (s: string) => String(s || "").replace(/<\/script/gi, "<\\/script");
   const escStyle = (s: string) => String(s || "").replace(/<\/style/gi, "<\\/style");
@@ -422,10 +532,23 @@ ${escStyle(row.css || "")}</style>
     for (var k in payload) msg[k] = payload[k];
     parent.postMessage(msg, "*");
   }
+  var contextHandlers = {}; // slot -> [fn]
+  var eventHandlers = {}; // topic -> [fn]
+  function eachHandler(map, key, arg1, arg2) {
+    var list = map[key] || [];
+    for (var i = 0; i < list.length; i++) {
+      try { list[i](arg1, arg2); } catch (err) {}
+    }
+  }
   window.addEventListener("message", function (e) {
     var d = e.data || {};
-    if (d.type === "widget-api-result" && pending[d.reqId]) {
+    if ((d.type === "widget-api-result" || d.type === "widget-context-result" ||
+         d.type === "widget-event-result") && pending[d.reqId]) {
       var cb = pending[d.reqId]; delete pending[d.reqId]; cb(d);
+    } else if (d.type === "widget-context-change") {
+      eachHandler(contextHandlers, d.slot, d.value, d.slot);
+    } else if (d.type === "widget-event") {
+      eachHandler(eventHandlers, d.topic, d.payload, d.topic);
     }
   });
   function call(method, path, body) {
@@ -437,6 +560,32 @@ ${escStyle(row.css || "")}</style>
       };
       send("widget-api", { reqId: reqId, method: method, path: path, body: body });
     });
+  }
+  function bridgeCall(type, payload) {
+    return new Promise(function (resolve, reject) {
+      var reqId = "r" + (++seq) + "-" + Date.now().toString(36);
+      pending[reqId] = function (res) {
+        if (res.ok) resolve(res.value !== undefined ? res.value : res.data);
+        else reject(new Error(res.error || "widget bridge call failed"));
+      };
+      payload = payload || {};
+      payload.reqId = reqId;
+      send(type, payload);
+    });
+  }
+  function onOff(map, key, fn, wireType, wirePayload) {
+    map[key] = map[key] || [];
+    map[key].push(fn);
+    if (map[key].length === 1) send(wireType, wirePayload);
+    var removed = false;
+    return function () {
+      if (removed) return;
+      removed = true;
+      var list = map[key] || [];
+      var i = list.indexOf(fn);
+      if (i >= 0) list.splice(i, 1);
+      if (!list.length) send(wireType.replace("-subscribe", "-unsubscribe"), wirePayload);
+    };
   }
   // Host bridge: the only way a widget touches exec-crm. Reads AND writes
   // are available from day 1, gated by the manifest permissions the user
@@ -450,6 +599,26 @@ ${escStyle(row.css || "")}</style>
       post: function (p, b) { return call("POST", p, b); },
       patch: function (p, b) { return call("PATCH", p, b); },
       del: function (p) { return call("DELETE", p); }
+    },
+    // Phase 2: shared host context. Slots are host-defined (see
+    // ctx.contextSlots); values are null or small JSON objects by convention
+    // { id, label, ... }. Setting a slot notifies every subscribed widget.
+    context: {
+      slots: (ctx.contextSlots || []).slice(),
+      get: function (slot) { return bridgeCall("widget-context-get", { slot: slot }); },
+      set: function (slot, value) { return bridgeCall("widget-context-set", { slot: slot, value: value }); },
+      on: function (slot, fn) {
+        return onOff(contextHandlers, String(slot), fn, "widget-context-subscribe", { slot: slot });
+      }
+    },
+    // Phase 2: open pub/sub between widgets, host-mediated. Any topic is
+    // allowed except the reserved "host.*" prefix; the host routes to
+    // subscribed widgets (never back to the publisher, to avoid echo loops).
+    events: {
+      publish: function (topic, payload) { return bridgeCall("widget-event-publish", { topic: topic, payload: payload }); },
+      subscribe: function (topic, fn) {
+        return onOff(eventHandlers, String(topic), fn, "widget-event-subscribe", { topic: topic });
+      }
     },
     notify: function (msg) { send("widget-notify", { message: String(msg).slice(0, 200) }); },
     resize: function (h) {
@@ -978,6 +1147,11 @@ const server = Bun.serve({
       if (widgetIds.length) {
         db.query(`DELETE FROM widget_versions WHERE widget_id IN (${widgetIds.map(() => "?").join(",")})`).run(...widgetIds);
       }
+      const setIds = (db.query("SELECT id FROM widget_sets WHERE workspace_id = ?").all(ws.id) as any[]).map((x) => x.id);
+      if (setIds.length) {
+        db.query(`DELETE FROM widget_set_versions WHERE set_id IN (${setIds.map(() => "?").join(",")})`).run(...setIds);
+      }
+      db.prepare("DELETE FROM widget_sets WHERE workspace_id = ?").run(ws.id);
       db.prepare("DELETE FROM widgets WHERE workspace_id = ?").run(ws.id);
       for (const t of ["outreach", "activities", "captures", "tasks", "deals", "contacts", "campaigns", "companies", "stages", "sandbox_rows", "sandbox_batches"]) {
         db.prepare(`DELETE FROM ${t} WHERE workspace_id = ?`).run(ws.id);
@@ -2464,6 +2638,143 @@ const server = Bun.serve({
         status: inner.status,
         headers: { "Content-Type": "application/json" },
       });
+    }
+
+    // ---- widget sets: deployable bundles of widgets that work together (phase 2) ----
+    // One install grants the union of the member widgets' permissions in a
+    // single review. The set version is pinned; members may be updated
+    // independently afterward. Rollback restores every member bundle at once.
+    const widgetSetIdMatch = path.match(/^\/api\/widget-sets\/(\d+)(\/[\w-]+)?$/);
+    if (path === "/api/widget-sets" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const rows = db
+        .query(
+          `SELECT widget_sets.*, (SELECT COUNT(*) FROM widget_set_versions WHERE set_id = widget_sets.id) AS snapshot_count
+           FROM widget_sets WHERE workspace_id = ? ORDER BY name`
+        )
+        .all(w) as any[];
+      return json({ sets: rows.map((r) => setPublic(r, w)) });
+    }
+    if (path === "/api/widget-sets" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const b = await readBody(req);
+      const sv = validateWidgetSetManifest(b.manifest);
+      if (sv.error) return json({ error: sv.error }, 400);
+      const members = b.members;
+      if (!Array.isArray(members) || !members.length || members.length > WIDGET_SET_MAX_MEMBERS)
+        return json({ error: `members must be a non-empty array (max ${WIDGET_SET_MAX_MEMBERS})` }, 400);
+      const seen = new Set<string>();
+      const validated: { manifest: any; js: string; css: string }[] = [];
+      for (const m of members) {
+        const v = validateWidgetManifest(m && m.manifest);
+        if (v.error) return json({ error: `member: ${v.error}` }, 400);
+        if (seen.has(v.manifest.name)) return json({ error: `duplicate member "${v.manifest.name}"` }, 400);
+        seen.add(v.manifest.name);
+        const js = typeof m.js === "string" ? m.js : "";
+        const css = typeof m.css === "string" ? m.css : "";
+        if (!js.trim()) return json({ error: `member "${v.manifest.name}": widget js is required` }, 400);
+        if (Buffer.byteLength(js, "utf8") > WIDGET_MAX_JS)
+          return json({ error: `member "${v.manifest.name}": widget js too large` }, 400);
+        if (Buffer.byteLength(css, "utf8") > WIDGET_MAX_CSS)
+          return json({ error: `member "${v.manifest.name}": widget css too large` }, 400);
+        validated.push({ manifest: v.manifest, js, css });
+      }
+      // install/update the member widgets first — they become ordinary
+      // registry widgets, manageable on their own after the set install.
+      for (const m of validated) widgetUpsert(w, m.manifest, m.js, m.css);
+      const snapshot = setMembersSnapshot(w, validated.map((m) => ({ name: m.manifest.name })));
+      const existing = db
+        .query("SELECT * FROM widget_sets WHERE workspace_id = ? AND name = ?")
+        .get(w, sv.manifest.name) as any;
+      const now = new Date().toISOString().slice(0, 19).replace("T", " ");
+      let set: any;
+      let installed = false;
+      if (existing) {
+        // pop semantics, like widget rollback: the prior set state goes into
+        // history first so a rollback can restore it.
+        snapshotSetVersion(existing);
+        db.prepare(
+          `UPDATE widget_sets SET title = ?, version = ?, description = ?, members = ?,
+           updated_at = ? WHERE id = ?`
+        ).run(sv.manifest.title, sv.manifest.version, sv.manifest.description,
+          JSON.stringify(snapshot), now, existing.id);
+        set = setRow(existing.id, w);
+      } else {
+        const r = db
+          .prepare(
+            `INSERT INTO widget_sets (workspace_id, name, title, version, description, members)
+             VALUES (?, ?, ?, ?, ?, ?)`
+          )
+          .run(w, sv.manifest.name, sv.manifest.title, sv.manifest.version,
+            sv.manifest.description, JSON.stringify(snapshot));
+        set = setRow(Number(r.lastInsertRowid), w);
+        installed = true;
+      }
+      return json({ set: setPublic(set, w), installed }, installed ? 201 : 200);
+    }
+    if (widgetSetIdMatch && !widgetSetIdMatch[2] && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const row = setRow(Number(widgetSetIdMatch[1]), w);
+      if (!row) return json({ error: "widget set not found" }, 404);
+      return json({ set: setPublic(row, w) });
+    }
+    if (widgetSetIdMatch && !widgetSetIdMatch[2] && method === "DELETE") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const row = setRow(Number(widgetSetIdMatch[1]), w);
+      if (!row) return json({ error: "widget set not found" }, 404);
+      // Uninstalling a set removes the set record and its snapshots. Member
+      // widgets stay installed — uninstall them individually if unwanted.
+      db.prepare("DELETE FROM widget_set_versions WHERE set_id = ?").run(row.id);
+      db.prepare("DELETE FROM widget_sets WHERE id = ?").run(row.id);
+      return json({ ok: true });
+    }
+    if (widgetSetIdMatch && widgetSetIdMatch[2] === "/snapshots" && method === "GET") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const row = setRow(Number(widgetSetIdMatch[1]), w);
+      if (!row) return json({ error: "widget set not found" }, 404);
+      const snaps = db
+        .query("SELECT id, version, created_at FROM widget_set_versions WHERE set_id = ? ORDER BY id DESC")
+        .all(row.id);
+      return json({ snapshots: snaps });
+    }
+    if (widgetSetIdMatch && widgetSetIdMatch[2] === "/rollback" && method === "POST") {
+      const w = needWs(req, url);
+      if (w instanceof Response) return w;
+      const row = setRow(Number(widgetSetIdMatch[1]), w);
+      if (!row) return json({ error: "widget set not found" }, 404);
+      const snap = db
+        .query("SELECT * FROM widget_set_versions WHERE set_id = ? ORDER BY id DESC LIMIT 1")
+        .get(row.id) as any;
+      if (!snap) return json({ error: "no prior set snapshot to roll back to" }, 400);
+      // pop semantics: the current member bundles are snapshotted first, so
+      // a second rollback restores the newer state.
+      snapshotSetActual(row, w);
+      let members: any[] = [];
+      try { members = JSON.parse(snap.members || "[]"); } catch {}
+      const now = new Date().toISOString().slice(0, 19).replace("T", " ");
+      for (const m of members) {
+        const cur = db
+          .query("SELECT * FROM widgets WHERE workspace_id = ? AND (id = ? OR name = ?)")
+          .get(w, m.widget_id, m.name) as any;
+        if (!cur) continue; // member was deleted on its own — skip it
+        snapshotWidgetVersion(cur);
+        let manifest: any = {};
+        try { manifest = JSON.parse(m.manifest || "{}"); } catch {}
+        db.prepare(
+          `UPDATE widgets SET title = ?, version = ?, manifest = ?, js = ?, css = ?,
+           updated_at = ? WHERE id = ?`
+        ).run(m.title, m.version, m.manifest || "{}", m.js || "", m.css || "", now, cur.id);
+      }
+      db.prepare("DELETE FROM widget_set_versions WHERE id = ?").run(snap.id);
+      const restored = setMembersSnapshot(w, members.map((m: any) => ({ name: m.name })));
+      db.prepare("UPDATE widget_sets SET members = ?, updated_at = ? WHERE id = ?")
+        .run(JSON.stringify(restored), now, row.id);
+      return json({ set: setPublic(setRow(row.id, w), w) });
     }
 
     // ---- milton bridge: insights + daily feed for the Dashboard, agent for the floating chat dock ---

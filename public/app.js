@@ -1486,6 +1486,16 @@ function miltonCardHtml(c) {
   for (const o of c.options || [])
     h += `<button class="mopt" data-send="${o.n}"><b>${o.n}.</b> ${esc(o.label)}${o.sub ? ` <span class="sub">${esc(o.sub)}</span>` : ""}</button>`;
   for (const it of c.items || []) {
+    if (c.kind === "suggestions") {
+      // "Did you mean…" command suggestions: tappable buttons that send the
+      // example command ("/"-prefixed, like the suggestion chips — Milton's
+      // parser strips the slash). Name + description; usage is the payload.
+      const cmd = it.usage || it.name || "";
+      const cmdLabel = it.name || it.label || it.title || cmd;
+      if (cmd)
+        h += `<button class="mopt" data-send="/${esc(cmd)}"><b>›</b> ${esc(cmdLabel)}${it.description ? ` <span class="sub">${esc(it.description)}</span>` : ""}</button>`;
+      continue;
+    }
     const label = it.title || it.name || it.label || it.text || "";
     const sub = it.stage || it.value != null ? ` <span class="sub">${esc(it.stage || "")}${it.value != null ? " · " + money(it.value) : ""}</span>` : "";
     if (label) h += `<div class="mitem">• ${esc(String(label))}${sub}</div>`;

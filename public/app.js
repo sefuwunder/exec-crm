@@ -1458,6 +1458,26 @@ const miltonSetSession = (sid) =>
 
 const miltonTextHtml = (t) => esc(t).replace(/\n/g, "<br>");
 
+/* A card row can be a string, an array of cells, or an object (e.g. Milton's
+   pipeline-by-stage rows: { label, count, value }). Objects never render as
+   "[object Object]": label/count/value shapes become stat rows, anything else
+   joins its scalar fields. */
+function miltonRowHtml(r) {
+  if (Array.isArray(r)) return `<div class="mitem">• ${esc(r.join(" · "))}</div>`;
+  if (r && typeof r === "object") {
+    const label = r.label || r.title || r.name || "";
+    const val = [];
+    if (r.count != null && r.count !== "") val.push(String(r.count));
+    if (r.value != null && r.value !== "") val.push(money(r.value));
+    if (label || val.length)
+      return `<div class="mstat"><span>${esc(label || "—")}</span><b>${esc(val.join(" · "))}</b></div>`;
+    const parts = [];
+    for (const k in r) { const v = r[k]; if (v != null && typeof v !== "object") parts.push(String(v)); }
+    return `<div class="mitem">• ${esc(parts.join(" · ") || JSON.stringify(r))}</div>`;
+  }
+  return `<div class="mitem">• ${esc(String(r))}</div>`;
+}
+
 function miltonCardHtml(c) {
   let h = `<div class="mcard">`;
   if (c.title) h += `<div class="mcard-title">${esc(c.title)}</div>`;
@@ -1470,8 +1490,7 @@ function miltonCardHtml(c) {
     const sub = it.stage || it.value != null ? ` <span class="sub">${esc(it.stage || "")}${it.value != null ? " · " + money(it.value) : ""}</span>` : "";
     if (label) h += `<div class="mitem">• ${esc(String(label))}${sub}</div>`;
   }
-  for (const r of c.rows || [])
-    h += `<div class="mitem">• ${esc(Array.isArray(r) ? r.join(" · ") : String(r))}</div>`;
+  for (const r of c.rows || []) h += miltonRowHtml(r);
   if (c.ocrText) h += `<pre class="mocr">${esc(c.ocrText)}</pre>`;
   return h + `</div>`;
 }
